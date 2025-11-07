@@ -30,9 +30,11 @@ task agentJar(type: Jar) {
     description = 'Builds the ByteBuf Flow Tracker agent JAR with all dependencies'
     group = 'build'
 
-    // Set archive name
+    // Set archive name and output location
     archiveBaseName = 'bytebuf-tracker'
     archiveClassifier = 'agent'
+    // Remove version from JAR name for consistent path
+    archiveVersion = ''
 
     manifest {
         attributes(
@@ -56,15 +58,8 @@ task agentJar(type: Jar) {
     exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
 }
 
-// Conditionally build the agent JAR
-if (byteBufTrackingEnabled) {
-    build.dependsOn agentJar
-    assemble.dependsOn agentJar
-
-    logger.lifecycle("ByteBuf tracking enabled - agent JAR will be built")
-} else {
-    logger.info("ByteBuf tracking disabled - use -PwithByteBufTracking to enable")
-}
+// Always make the agent JAR task available
+// It will be called explicitly when needed via dependsOn from root build.gradle
 
 // Make the agent JAR available to other projects
 artifacts {
