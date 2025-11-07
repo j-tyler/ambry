@@ -23,8 +23,10 @@ Compares the performance of Apache Commons Base64 vs Java 8's built-in `java.uti
 - 4 MB (4,194,304 bytes) - Large blobs
 
 **Metrics Measured:**
-- **Throughput**: Operations per millisecond
-- **Average Time**: Average execution time per operation
+- **Throughput**: Operations per millisecond (higher is better)
+- **Average Time**: Average execution time per operation (lower is better)
+- **Memory Allocations**: Bytes allocated per operation (lower is better)
+- **Allocation Rate**: MB/sec allocated during benchmark
 
 **Benchmark Configuration (optimized for fast feedback):**
 - **Warmup**: 1 iteration × 5 seconds
@@ -63,6 +65,14 @@ To run only specific benchmark methods, use the `includes` parameter:
 ./gradlew :ambry-benchmarks:jmh -Pjmh.includes='.*java8Encode.*'
 ```
 
+### Run Without Profilers (Faster)
+
+The default configuration includes GC profiling which adds overhead. To run faster without profilers:
+
+```bash
+./gradlew jmh -Pjmh.profilers=
+```
+
 ### Run with Custom Parameters
 
 You can customize benchmark parameters:
@@ -83,6 +93,24 @@ You can customize benchmark parameters:
 
 **Note**: The JMH configuration automatically picks up all benchmarks in the `com.github.ambry` package, so any new benchmarks you add will be included automatically.
 
+### Available Profilers
+
+JMH includes several profilers. To use them:
+
+```bash
+# GC profiler (default) - memory allocations
+./gradlew jmh -Pjmh.profilers='gc'
+
+# Stack profiler - hotspot analysis
+./gradlew jmh -Pjmh.profilers='stack'
+
+# Multiple profilers
+./gradlew jmh -Pjmh.profilers='gc,stack'
+
+# List all available profilers
+./gradlew jmh -Pjmh.help='prof'
+```
+
 ## Results
 
 ### Output Location
@@ -94,29 +122,45 @@ Benchmark results are saved to:
 
 ### Interpreting Results
 
-The benchmark produces two types of metrics:
+The benchmark produces several metrics:
 
+**Performance Metrics:**
 1. **Throughput (ops/ms)**: Higher is better
-   - Indicates how many operations can be performed per millisecond
+   - How many operations can be performed per millisecond
    - Useful for understanding maximum processing capacity
 
 2. **Average Time (ms/op)**: Lower is better
-   - Indicates the average time taken for a single operation
+   - Average time taken for a single operation
    - Useful for understanding latency characteristics
+
+**Memory Metrics (from GC profiler):**
+3. **Allocation Rate (MB/sec)**: Lower is better
+   - Memory allocation speed during the benchmark
+   - High rates indicate more GC pressure
+
+4. **Normalized Allocation (B/op)**: Lower is better
+   - **Most important metric for memory profiling**
+   - Shows exact bytes allocated per operation
+   - Example: 2048 B/op means each operation allocates 2KB
+   - Critical for comparing Apache vs Java 8 Base64 memory efficiency
 
 ### Example Output
 
+**Performance Results:**
 ```
-Benchmark                                    (blobSize)   Mode  Cnt     Score     Error   Units
-Base64Benchmark.apacheCommonsEncode               1024  thrpt   10  1234.567 ±  12.345  ops/ms
-Base64Benchmark.java8Encode                       1024  thrpt   10  2345.678 ±  23.456  ops/ms
-Base64Benchmark.apacheCommonsEncode             131072  thrpt   10    12.345 ±   0.123  ops/ms
-Base64Benchmark.java8Encode                     131072  thrpt   10    23.456 ±   0.234  ops/ms
+Benchmark                         (blobSize)   Mode  Cnt    Score   Units
+Base64Benchmark.java8Encode             1024  thrpt    2  9418.272  ops/ms
+Base64Benchmark.apacheCommonsEncode     1024  thrpt    2   252.171  ops/ms
 ```
+→ Java 8 is **37x faster** for 1KB encoding
 
-In this example:
-- Java 8 Base64 is ~90% faster than Apache Commons for 1KB blobs
-- Java 8 Base64 is ~90% faster than Apache Commons for 128KB blobs
+**Memory Allocation Results (GC profiler):**
+```
+Benchmark                         (blobSize)  Mode  Cnt  Score  Units  Alloc (B/op)
+Base64Benchmark.java8Encode             1024  thrpt   2  9418   ops/ms    1400
+Base64Benchmark.apacheCommonsEncode     1024  thrpt   2   252   ops/ms    3200
+```
+→ Java 8 allocates **56% less memory** per operation (1.4KB vs 3.2KB)
 
 ## Expected Performance Improvements
 

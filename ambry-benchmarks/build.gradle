@@ -27,7 +27,15 @@ jmh {
     timeOnIteration = '5s'
     fork = 1
     include = 'com\\.github\\.ambry\\..*'
+
+    // Enable GC profiler by default to track memory allocations
+    // Shows allocation rate (MB/sec) and normalized allocation (B/op)
+    profilers = ['gc']
 }
+
+// To run without profilers (faster): ./gradlew jmh -Pjmh.profilers=
+// To add more profilers: ./gradlew jmh -Pjmh.profilers='gc,stack'
+
 
 tasks.withType(Test) {
     exclude '**/*Benchmark*'
