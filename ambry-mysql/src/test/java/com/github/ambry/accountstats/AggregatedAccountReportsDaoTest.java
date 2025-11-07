@@ -147,12 +147,53 @@ public class AggregatedAccountReportsDaoTest {
   }
 
   @Test
+  @org.junit.Ignore("Replaced by testInsertCopyWithException_Mockito5")
   public void testInsertCopyWithException() throws Exception {
     when(mockInsertCopyStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
     assertEquals("Copy failure count should be 1", 1, metrics.copyFailureCount.getCount());
   }
+
+  /**
+   * Test that copyAggregatedUsageToMonthlyAggregatedTableForCluster properly handles SQLException
+   * and increments the failure metric. Rewritten for Mockito 5 compatibility.
+   */
+  @Test
+  public void testInsertCopyWithException_Mockito5() throws Exception {
+    // Create fresh mocks for this test to avoid interaction with constructor setup
+    Connection testConnection = mock(Connection.class);
+    PreparedStatement testCopyStatement = mock(PreparedStatement.class);
+    DataSource testDataSource = mock(DataSource.class);
+
+    // Set up the mock chain: dataSource -> connection -> preparedStatement
+    when(testDataSource.getConnection()).thenReturn(testConnection);
+    when(testConnection.prepareStatement(anyString())).thenReturn(testCopyStatement);
+
+    // Configure the statement to throw SQLException when executeUpdate is called
+    when(testCopyStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException("Test exception"));
+
+    // Create a new DAO instance with the test datasource
+    AggregatedAccountReportsDao testDao = new AggregatedAccountReportsDao(testDataSource, metrics);
+
+    // Record metrics before the test
+    long copyFailureCountBefore = metrics.copyFailureCount.getCount();
+
+    // Execute and verify the exception is thrown
+    TestUtils.assertException(SQLTransientConnectionException.class,
+        () -> testDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
+
+    // Verify the failure metric was incremented
+    assertEquals("Copy failure count should increment by 1",
+        copyFailureCountBefore + 1, metrics.copyFailureCount.getCount());
+
+    // Verify the interactions occurred in the expected order
+    verify(testDataSource).getConnection();
+    verify(testConnection).prepareStatement(anyString());
+    verify(testCopyStatement).setString(1, clusterName);
+    verify(testCopyStatement).executeUpdate();
+  }
+
 
   @Test
   public void testInsertMonth() throws Exception {
