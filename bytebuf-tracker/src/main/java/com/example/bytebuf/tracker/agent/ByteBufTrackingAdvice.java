@@ -57,15 +57,14 @@ public class ByteBufTrackingAdvice {
     }
 
     /**
-     * Method exit advice - tracks objects in return values and final state
-     * Note: readOnly=false and typing=DYNAMIC allows handling void methods
+     * Method exit advice - tracks final state of objects in parameters
+     * Note: Return value tracking removed for ByteBuddy 1.10.x compatibility (void method issues)
      */
     @Advice.OnMethodExit(onThrowable = Throwable.class)
     public static void onMethodExit(
             @Advice.Origin Class<?> clazz,
             @Advice.Origin("#m") String methodName,
             @Advice.AllArguments Object[] arguments,
-            @Advice.Return(readOnly = false, typing = Advice.Assigner.Typing.DYNAMIC) Object returnValue,
             @Advice.Thrown Throwable thrown) {
 
         // Prevent re-entrant calls
@@ -83,7 +82,7 @@ public class ByteBufTrackingAdvice {
                 for (Object arg : arguments) {
                     if (handler.shouldTrack(arg)) {
                         int metric = handler.getMetric(arg);
-                        // Record the exit state
+                        // Record the exit state (e.g., ByteBuf refCount after method completes)
                         tracker.recordMethodCall(
                             arg,
                             clazz.getSimpleName(),
@@ -92,17 +91,6 @@ public class ByteBufTrackingAdvice {
                         );
                     }
                 }
-            }
-
-            // Track return values
-            if (handler.shouldTrack(returnValue)) {
-                int metric = handler.getMetric(returnValue);
-                tracker.recordMethodCall(
-                    returnValue,
-                    clazz.getSimpleName(),
-                    methodName + "_return",
-                    metric
-                );
             }
         } finally {
             IS_TRACKING.set(false);
