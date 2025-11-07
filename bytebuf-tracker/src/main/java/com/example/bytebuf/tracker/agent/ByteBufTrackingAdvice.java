@@ -4,7 +4,6 @@ import com.example.bytebuf.tracker.ByteBufFlowTracker;
 import com.example.bytebuf.tracker.ObjectTrackerHandler;
 import com.example.bytebuf.tracker.ObjectTrackerRegistry;
 import net.bytebuddy.asm.Advice;
-import net.bytebuddy.implementation.bytecode.assign.Assigner;
 
 /**
  * ByteBuddy advice for tracking object flow through methods.
@@ -59,14 +58,13 @@ public class ByteBufTrackingAdvice {
 
     /**
      * Method exit advice - tracks final state of objects in parameters and return values
-     * Note: Using DYNAMIC typing for ByteBuddy 1.14.9+ to handle void methods
      */
     @Advice.OnMethodExit(onThrowable = Throwable.class)
     public static void onMethodExit(
             @Advice.Origin Class<?> clazz,
             @Advice.Origin("#m") String methodName,
             @Advice.AllArguments Object[] arguments,
-            @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC) Object returnValue,
+            @Advice.Return Object returnValue,
             @Advice.Thrown Throwable thrown) {
 
         // Prevent re-entrant calls

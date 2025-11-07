@@ -8,7 +8,6 @@ import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.utility.JavaModule;
 
 import java.lang.instrument.Instrumentation;
-import java.security.ProtectionDomain;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
@@ -49,9 +48,13 @@ public class ByteBufFlowAgent {
                 .or(nameStartsWith("com.sun."))
                 .or(nameStartsWith("jdk."))
                 .or(nameStartsWith("com.example.bytebuf.tracker.")) // Don't instrument ourselves
+                .or(isSynthetic()) // Don't instrument compiler-generated classes
             )
             // Transform regular methods (non-constructors)
-            .type(config.getTypeMatcher())
+            // Filter out interfaces and abstract classes (can't instrument abstract methods)
+            .type(config.getTypeMatcher()
+                .and(not(isInterface()))
+                .and(not(isAbstract())))
             .transform(new ByteBufTransformer());
 
         // Add constructor tracking for specified classes
@@ -59,7 +62,9 @@ public class ByteBufFlowAgent {
             System.out.println("[ByteBufFlowAgent] Constructor tracking enabled for: " +
                 config.getConstructorTrackingClasses());
             agentBuilder = agentBuilder
-                .type(config.getConstructorTrackingMatcher())
+                .type(config.getConstructorTrackingMatcher()
+                    .and(not(isInterface()))
+                    .and(not(isAbstract())))
                 .transform(new ConstructorTrackingTransformer());
         }
 
@@ -70,7 +75,6 @@ public class ByteBufFlowAgent {
     
     /**
      * Transformer that applies advice to methods
-     * Note: Using 5-parameter signature for ByteBuddy 1.14.9+ (used by Mockito 5.x)
      */
     static class ByteBufTransformer implements AgentBuilder.Transformer {
         @Override
@@ -78,15 +82,16 @@ public class ByteBufFlowAgent {
                 DynamicType.Builder<?> builder,
                 TypeDescription typeDescription,
                 ClassLoader classLoader,
-                JavaModule module,
-                ProtectionDomain protectionDomain) {
+                JavaModule module) {
 
             return builder
                 .method(
                     // Match methods that might handle ByteBufs (including static methods)
+                    // Skip abstract methods (they have no bytecode to instrument)
                     isPublic()
                     .or(isProtected())
                     .and(not(isConstructor()))
+                    .and(not(isAbstract()))
                 )
                 .intercept(Advice.to(ByteBufTrackingAdvice.class));
         }
@@ -94,7 +99,6 @@ public class ByteBufFlowAgent {
 
     /**
      * Transformer that applies advice to constructors for specified classes
-     * Note: Using 5-parameter signature for ByteBuddy 1.14.9+ (used by Mockito 5.x)
      */
     static class ConstructorTrackingTransformer implements AgentBuilder.Transformer {
         @Override
@@ -102,8 +106,7 @@ public class ByteBufFlowAgent {
                 DynamicType.Builder<?> builder,
                 TypeDescription typeDescription,
                 ClassLoader classLoader,
-                JavaModule module,
-                ProtectionDomain protectionDomain) {
+                JavaModule module) {
 
             return builder
                 .constructor(
