@@ -76,6 +76,7 @@ public class ByteBufFlowAgent {
     
     /**
      * Transformer that applies advice to methods
+     * Only instruments methods that have ByteBuf parameters or return values
      */
     static class ByteBufTransformer implements AgentBuilder.Transformer {
         @Override
@@ -94,9 +95,45 @@ public class ByteBufFlowAgent {
                     .or(isProtected())
                     .and(not(isConstructor()))
                     .and(not(isAbstract()))
+                    // CRITICAL: Only instrument methods that have ByteBuf in signature
+                    .and(hasByteBufInSignature())
                 )
                 .intercept(Advice.to(ByteBufTrackingAdvice.class));
         }
+    }
+
+    /**
+     * Matcher that checks if a method has ByteBuf in its signature
+     * (parameters or return type)
+     */
+    private static ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription> hasByteBufInSignature() {
+        return new ElementMatcher.Junction.AbstractBase<net.bytebuddy.description.method.MethodDescription>() {
+            @Override
+            public boolean matches(net.bytebuddy.description.method.MethodDescription method) {
+                // Check return type
+                TypeDescription returnType = method.getReturnType().asErasure();
+                if (isByteBufType(returnType)) {
+                    return true;
+                }
+
+                // Check all parameters
+                for (TypeDescription.Generic paramType : method.getParameters().asTypeList()) {
+                    if (isByteBufType(paramType.asErasure())) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private boolean isByteBufType(TypeDescription type) {
+                String typeName = type.getName();
+                // Check for ByteBuf or any subclass
+                return typeName.equals("io.netty.buffer.ByteBuf") ||
+                       typeName.startsWith("io.netty.buffer.") && type.getInterfaces().stream()
+                           .anyMatch(iface -> iface.asErasure().getName().equals("io.netty.buffer.ByteBuf"));
+            }
+        };
     }
 
     /**
