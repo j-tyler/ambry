@@ -69,6 +69,7 @@ public class ByteBufFlowAgent {
     
     /**
      * Transformer that applies advice to methods
+     * Note: Using 4-parameter signature for ByteBuddy 1.10.x compatibility (used by Mockito 2.x)
      */
     static class ByteBufTransformer implements AgentBuilder.Transformer {
         @Override
@@ -76,8 +77,7 @@ public class ByteBufFlowAgent {
                 DynamicType.Builder<?> builder,
                 TypeDescription typeDescription,
                 ClassLoader classLoader,
-                JavaModule module,
-                java.security.ProtectionDomain protectionDomain) {
+                JavaModule module) {
 
             return builder
                 .method(
@@ -92,6 +92,7 @@ public class ByteBufFlowAgent {
 
     /**
      * Transformer that applies advice to constructors for specified classes
+     * Note: Using 4-parameter signature for ByteBuddy 1.10.x compatibility (used by Mockito 2.x)
      */
     static class ConstructorTrackingTransformer implements AgentBuilder.Transformer {
         @Override
@@ -99,8 +100,7 @@ public class ByteBufFlowAgent {
                 DynamicType.Builder<?> builder,
                 TypeDescription typeDescription,
                 ClassLoader classLoader,
-                JavaModule module,
-                java.security.ProtectionDomain protectionDomain) {
+                JavaModule module) {
 
             return builder
                 .constructor(
