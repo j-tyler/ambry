@@ -118,7 +118,8 @@ class CompactionManager {
   void awaitTermination() {
     if (compactionExecutor != null && compactionThread != null) {
       try {
-        compactionThread.join(2000);
+        // Increased timeout to 30s to accommodate ByteBuddy instrumentation overhead during tests
+        compactionThread.join(30000);
       } catch (InterruptedException e) {
         metrics.compactionManagerTerminateErrorCount.inc();
         logger.error("Compaction thread join wait for {} was interrupted", mountPath);

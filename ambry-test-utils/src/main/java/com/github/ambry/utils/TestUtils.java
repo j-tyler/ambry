@@ -109,6 +109,38 @@ public class TestUtils {
   }
 
   /**
+   * Wait for the number of threads with names matching the pattern to reach the expected count.
+   * This method polls every 100ms and returns as soon as the expected count is reached, or when
+   * the timeout expires.
+   * @param pattern the pattern to match thread names
+   * @param expectedCount the expected number of threads
+   * @param timeoutMs maximum time to wait in milliseconds
+   * @return true if the expected count was reached within the timeout, false otherwise
+   */
+  public static boolean waitForThreadCount(String pattern, int expectedCount, long timeoutMs) {
+    long deadline = System.currentTimeMillis() + timeoutMs;
+    while (System.currentTimeMillis() < deadline) {
+      int currentCount = numThreadsByThisName(pattern);
+      if (currentCount == expectedCount) {
+        return true;
+      }
+      try {
+        Thread.sleep(CHECK_INTERVAL_IN_MS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        logger.warn("Interrupted while waiting for thread count. Pattern: {}, Expected: {}, Current: {}",
+            pattern, expectedCount, currentCount);
+        return false;
+      }
+    }
+    // Timeout expired
+    int finalCount = numThreadsByThisName(pattern);
+    logger.warn("Timeout waiting for thread count. Pattern: {}, Expected: {}, Final: {}, Timeout: {}ms",
+        pattern, expectedCount, finalCount, timeoutMs);
+    return false;
+  }
+
+  /**
    * Gets a byte array of length {@code size} with random bytes.
    * @param size the required length of the random byte array.
    * @return a byte array of length {@code size} with random bytes.
