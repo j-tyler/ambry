@@ -8,10 +8,19 @@
 // under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 // CONDITIONS OF ANY KIND, either express or implied.
 
-plugins {
-    id 'java'
-    id 'me.champeau.jmh' version '0.5.3'
+buildscript {
+    repositories {
+        maven {
+            url "https://plugins.gradle.org/m2/"
+        }
+    }
+    dependencies {
+        classpath "me.champeau.gradle:jmh-gradle-plugin:0.5.3"
+    }
 }
+
+apply plugin: "me.champeau.gradle.jmh"
+apply plugin: 'java'
 
 sourceCompatibility = 1.8
 targetCompatibility = 1.8
