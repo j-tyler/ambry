@@ -118,11 +118,6 @@ subprojects {
         testCompile "org.apache.logging.log4j:log4j-slf4j-impl:$log4jVersion"
         testCompile "junit:junit:$junitVersion"
         testCompile "org.mockito:mockito-core:$mockitoVersion"
-        // Add PowerMock to support more unit test scenarios.
-        // See https://github.com/powermock/powermock/wiki/Mockito for detail about PowerMock.
-        testCompile "org.powermock:powermock-api-mockito2:$powermockVersion"
-        testCompile "org.powermock:powermock-core:$powermockVersion"
-        testCompile "org.powermock:powermock-module-junit4:$powermockVersion"
         testRuntime project(':log4j-test-config')
     }
 
@@ -158,53 +153,6 @@ subprojects {
         systemProperty 'io.netty.allocator.smallCacheSize', '0'
         systemProperty 'io.netty.allocator.normalCacheSize', '0'
         systemProperty 'io.netty.allocator.maxCachedBufferCapacity', '0'
-
-        // ByteBuf Flow Tracker configuration
-        def byteBufTrackingEnabled = project.hasProperty('withByteBufTracking') ||
-                                     project.hasProperty('enableByteBufTracking') ||
-                                     System.getProperty('enableByteBufTracking') == 'true'
-
-        if (byteBufTrackingEnabled) {
-            // Ensure the tracker is built before tests run
-            dependsOn ':bytebuf-tracker:agentJar'
-
-            // Add the tracker agent
-            def trackerJar = file("${rootProject.projectDir}/bytebuf-tracker/build/libs/bytebuf-tracker-agent.jar")
-            doFirst {
-                if (!trackerJar.exists()) {
-                    throw new GradleException(
-                        "ByteBuf tracker agent JAR not found at ${trackerJar}. " +
-                        "Ensure bytebuf-tracker module is built."
-                    )
-                }
-                logger.lifecycle("Using ByteBuf Flow Tracker agent: ${trackerJar}")
-            }
-
-            // Configure ByteBuf tracking with constructor tracking for all wrapper classes
-            // trackConstructors enables tracking ByteBufs passed to constructors and stored as fields
-            // Based on codebase analysis, these classes wrap ByteBuf in constructors:
-            jvmArgs "-javaagent:${trackerJar.absolutePath}=include=com.github.ambry;trackConstructors=" +
-                "com.github.ambry.protocol.*," +                                    // PutRequest (and other protocol messages)
-                "com.github.ambry.messageformat.BlobData," +                       // Blob data wrapper
-                "com.github.ambry.network.SocketServerRequest," +                  // Socket-based request wrapper
-                "com.github.ambry.network.NettyServerRequest," +                   // Netty-based request wrapper
-                "com.github.ambry.network.ResponseInfo," +                         // Network response wrapper
-                "com.github.ambry.router.EncryptJob," +                            // Encryption job with blob content
-                "com.github.ambry.router.EncryptJob\$EncryptJobResult," +          // Encryption result (inner class)
-                "com.github.ambry.router.DecryptJob," +                            // Decryption job with blob content
-                "com.github.ambry.rest.NettyResponseChannel\$Chunk," +             // Response chunk (inner class)
-                "com.github.ambry.utils.NettyByteBufDataInputStream"               // ByteBuf to InputStream wrapper
-            systemProperty 'bytebuf.tracker.enabled', 'true'
-
-            // Add test listener to print tracker output at end
-            systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
-        }
-
-        // make sure Powermockito would be happy
-        if (JavaVersion.current().java9Compatible) {
-            jvmArgs '--add-exports=java.xml/jdk.xml.internal=ALL-UNNAMED'
-        }
-
     }
 
     task intTest(type: Test) {
