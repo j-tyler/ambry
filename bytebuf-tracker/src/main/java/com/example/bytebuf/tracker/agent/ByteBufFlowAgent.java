@@ -8,6 +8,7 @@ import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.utility.JavaModule;
 
 import java.lang.instrument.Instrumentation;
+import java.security.ProtectionDomain;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
@@ -69,7 +70,7 @@ public class ByteBufFlowAgent {
     
     /**
      * Transformer that applies advice to methods
-     * Note: Using 4-parameter signature for ByteBuddy 1.10.x compatibility (used by Mockito 2.x)
+     * Note: Using 5-parameter signature for ByteBuddy 1.14.9+ (used by Mockito 5.x)
      */
     static class ByteBufTransformer implements AgentBuilder.Transformer {
         @Override
@@ -77,7 +78,8 @@ public class ByteBufFlowAgent {
                 DynamicType.Builder<?> builder,
                 TypeDescription typeDescription,
                 ClassLoader classLoader,
-                JavaModule module) {
+                JavaModule module,
+                ProtectionDomain protectionDomain) {
 
             return builder
                 .method(
@@ -92,7 +94,7 @@ public class ByteBufFlowAgent {
 
     /**
      * Transformer that applies advice to constructors for specified classes
-     * Note: Using 4-parameter signature for ByteBuddy 1.10.x compatibility (used by Mockito 2.x)
+     * Note: Using 5-parameter signature for ByteBuddy 1.14.9+ (used by Mockito 5.x)
      */
     static class ConstructorTrackingTransformer implements AgentBuilder.Transformer {
         @Override
@@ -100,7 +102,8 @@ public class ByteBufFlowAgent {
                 DynamicType.Builder<?> builder,
                 TypeDescription typeDescription,
                 ClassLoader classLoader,
-                JavaModule module) {
+                JavaModule module,
+                ProtectionDomain protectionDomain) {
 
             return builder
                 .constructor(
