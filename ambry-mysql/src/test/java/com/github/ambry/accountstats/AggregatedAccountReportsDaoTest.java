@@ -26,7 +26,6 @@ import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.junit.MockitoJUnitRunner;
-import org.mockito.quality.Strictness;
 
 import static org.junit.Assert.*;
 import static org.mockito.Mockito.*;
@@ -35,8 +34,7 @@ import static org.mockito.Mockito.*;
 /**
  * Unit test for {@link AggregatedAccountReportsDao}.
  */
-@RunWith(MockitoJUnitRunner.class)
-@org.mockito.junit.MockitoSettings(strictness = Strictness.LENIENT)
+@RunWith(MockitoJUnitRunner.Silent.class)
 public class AggregatedAccountReportsDaoTest {
   private final MySqlMetrics metrics;
   private final Connection mockConnection;
