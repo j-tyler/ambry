@@ -8,6 +8,7 @@ import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.utility.JavaModule;
 
 import java.lang.instrument.Instrumentation;
+import java.security.ProtectionDomain;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
@@ -82,7 +83,8 @@ public class ByteBufFlowAgent {
                 DynamicType.Builder<?> builder,
                 TypeDescription typeDescription,
                 ClassLoader classLoader,
-                JavaModule module) {
+                JavaModule module,
+                ProtectionDomain protectionDomain) {
 
             return builder
                 .method(
@@ -106,7 +108,8 @@ public class ByteBufFlowAgent {
                 DynamicType.Builder<?> builder,
                 TypeDescription typeDescription,
                 ClassLoader classLoader,
-                JavaModule module) {
+                JavaModule module,
+                ProtectionDomain protectionDomain) {
 
             return builder
                 .constructor(
@@ -205,7 +208,7 @@ class AgentConfig {
      * Get type matcher based on configuration
      */
     @SuppressWarnings("unchecked")
-    public ElementMatcher<TypeDescription> getTypeMatcher() {
+    public ElementMatcher.Junction<TypeDescription> getTypeMatcher() {
         ElementMatcher.Junction<TypeDescription> matcher = none();
 
         // Include packages
@@ -225,7 +228,7 @@ class AgentConfig {
      * Get matcher for classes that should have constructor tracking
      */
     @SuppressWarnings("unchecked")
-    public ElementMatcher<TypeDescription> getConstructorTrackingMatcher() {
+    public ElementMatcher.Junction<TypeDescription> getConstructorTrackingMatcher() {
         ElementMatcher.Junction<TypeDescription> matcher = none();
 
         for (String className : constructorTrackingClasses) {
