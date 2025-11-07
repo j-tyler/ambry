@@ -14,11 +14,11 @@ def byteBufTrackingEnabled = project.hasProperty('withByteBufTracking') ||
                              System.getProperty('enableByteBufTracking') == 'true'
 
 dependencies {
-    // ByteBuddy should be provided by the runtime (from Mockito/PowerMock)
+    // ByteBuddy should be provided by the runtime (from Mockito)
     // Using compileOnly ensures we compile against an API but don't bundle it in the agent JAR
     // This prevents version conflicts with the runtime ByteBuddy version
-    compileOnly "net.bytebuddy:byte-buddy:1.10.22"  // Match Mockito 2.x's ByteBuddy version
-    compileOnly "net.bytebuddy:byte-buddy-agent:1.10.22"
+    compileOnly "net.bytebuddy:byte-buddy:1.14.9"  // Match Mockito 5.x's ByteBuddy version
+    compileOnly "net.bytebuddy:byte-buddy-agent:1.14.9"
 
     // These dependencies WILL be bundled in the agent JAR
     compile "io.netty:netty-all:$nettyVersion"
@@ -27,7 +27,7 @@ dependencies {
     // Test dependencies
     testCompile "junit:junit:4.12"
     testCompile "io.netty:netty-all:$nettyVersion"
-    testCompile "net.bytebuddy:byte-buddy:1.10.22"  // For tests
+    testCompile "net.bytebuddy:byte-buddy:1.14.9"  // For tests
 }
 
 // Task to build the fat agent JAR with all dependencies
