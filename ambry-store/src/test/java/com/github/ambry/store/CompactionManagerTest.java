@@ -69,6 +69,10 @@ public class CompactionManagerTest {
     if (compactionManager != null) {
       compactionManager.disable();
       compactionManager.awaitTermination();
+      // Wait for compaction threads to actually terminate (up to 30 seconds)
+      // This ensures test isolation even with ByteBuddy instrumentation overhead
+      assertTrue("Compaction threads did not terminate in time",
+          TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, 0, 30000));
     }
   }
 
@@ -79,9 +83,9 @@ public class CompactionManagerTest {
   public void testEnableDisable() {
     // without compaction enabled.
     compactionManager.enable();
-    // functions should work ok
-    assertNull("Compaction thread should not be created",
-        TestUtils.getThreadByThisName(CompactionManager.THREAD_NAME_PREFIX));
+    // functions should work ok - wait for thread count to stabilize at 0
+    assertTrue("Compaction thread count did not reach 0",
+        TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, 0, 30000));
     assertFalse("Compaction Executor should not be running", compactionManager.isCompactionExecutorRunning());
     assertFalse("Compactions should not be scheduled after termination",
         compactionManager.scheduleNextForCompaction(blobStore));
@@ -94,8 +98,9 @@ public class CompactionManagerTest {
     StorageManagerMetrics metrics = new StorageManagerMetrics(new MetricRegistry());
     compactionManager = new CompactionManager(MOUNT_PATH, config, Collections.singleton(blobStore), metrics, time);
     compactionManager.enable();
-    assertNotNull("Compaction thread should be created",
-        TestUtils.getThreadByThisName(CompactionManager.THREAD_NAME_PREFIX));
+    // Wait for exactly 1 compaction thread to be created (up to 30s)
+    assertTrue("Compaction thread count did not reach 1",
+        TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, 1, 30000));
     compactionManager.disable();
     compactionManager.awaitTermination();
     assertFalse("Compaction thread should not be running", compactionManager.isCompactionExecutorRunning());
@@ -483,11 +488,13 @@ public class CompactionManagerTest {
     compactionManager = new CompactionManager(MOUNT_PATH, config, Collections.singleton(blobStore), metrics, time);
     compactionManager.enable();
     if (config.storeCompactionTriggers[0].isEmpty()) {
-      assertNull("Compaction thread should not be created",
-          TestUtils.getThreadByThisName(CompactionManager.THREAD_NAME_PREFIX));
+      // Wait for thread count to stabilize at 0 (no compaction enabled)
+      assertTrue("Compaction thread count did not reach 0",
+          TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, 0, 30000));
     } else {
-      assertNotNull("Compaction thread should be created",
-          TestUtils.getThreadByThisName(CompactionManager.THREAD_NAME_PREFIX));
+      // Wait for exactly 1 compaction thread to be created (up to 30s)
+      assertTrue("Compaction thread count did not reach 1",
+          TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, 1, 30000));
     }
     for (Runnable triggerRunner : triggerRunners) {
       blobStore.compactCallsCountdown = new CountDownLatch(1);

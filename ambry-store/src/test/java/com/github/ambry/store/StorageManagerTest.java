@@ -198,9 +198,11 @@ public class StorageManagerTest {
     assertEquals("There should be no unexpected partitions reported", 0, getNumUnrecognizedPartitionsReported());
     checkStoreAccessibility(replicas, mountPathToDelete, storageManager);
 
-    assertEquals("Compaction thread count is incorrect", mountPaths.size() - 1,
-        TestUtils.numThreadsByThisName(CompactionManager.THREAD_NAME_PREFIX));
-    verifyCompactionThreadCount(storageManager, mountPaths.size() - 1);
+    // Wait for compaction threads to reach expected count (up to 30s)
+    int expectedCount = mountPaths.size() - 1;
+    assertTrue("Compaction thread count did not reach " + expectedCount,
+        TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, expectedCount, 30000));
+    verifyCompactionThreadCount(storageManager, expectedCount);
     shutdownAndAssertStoresInaccessible(storageManager, replicas);
     assertEquals("Compaction thread count is incorrect", 0, storageManager.getCompactionThreadCount());
   }
@@ -1692,9 +1694,11 @@ public class StorageManagerTest {
         assertTrue("Compaction should be scheduled", storageManager.scheduleNextForCompaction(id));
       }
     }
-    assertEquals("Compaction thread count is incorrect", dataNode.getMountPaths().size(),
-        TestUtils.numThreadsByThisName(CompactionManager.THREAD_NAME_PREFIX));
-    verifyCompactionThreadCount(storageManager, dataNode.getMountPaths().size());
+    // Wait for compaction threads to reach expected count (up to 30s)
+    int expectedThreadCount = dataNode.getMountPaths().size();
+    assertTrue("Compaction thread count did not reach " + expectedThreadCount,
+        TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, expectedThreadCount, 30000));
+    verifyCompactionThreadCount(storageManager, expectedThreadCount);
     shutdownAndAssertStoresInaccessible(storageManager, replicas);
     assertEquals("Compaction thread count is incorrect", 0, storageManager.getCompactionThreadCount());
   }
@@ -1726,9 +1730,11 @@ public class StorageManagerTest {
     assertEquals(downReplicaCount, getCounterValue(counters, DiskManager.class.getName(), "TotalStoreStartFailures"));
     assertEquals(0, getCounterValue(counters, DiskManager.class.getName(), "DiskMountPathFailures"));
     checkStoreAccessibility(replicas, badDiskMountPath, storageManager);
-    assertEquals("Compaction thread count is incorrect", mountPaths.size(),
-        TestUtils.numThreadsByThisName(CompactionManager.THREAD_NAME_PREFIX));
-    verifyCompactionThreadCount(storageManager, mountPaths.size());
+    // Wait for compaction threads to reach expected count (up to 30s)
+    int expectedThreadCount = mountPaths.size();
+    assertTrue("Compaction thread count did not reach " + expectedThreadCount,
+        TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, expectedThreadCount, 30000));
+    verifyCompactionThreadCount(storageManager, expectedThreadCount);
     shutdownAndAssertStoresInaccessible(storageManager, replicas);
     assertEquals("Compaction thread count is incorrect", 0, storageManager.getCompactionThreadCount());
   }
@@ -1998,9 +2004,11 @@ public class StorageManagerTest {
         new MockPartitionId(Long.MAX_VALUE, MockClusterMap.DEFAULT_PARTITION_CLASS, Collections.emptyList(), 0);
     assertNull("Should not have found a store for an invalid partition.",
         storageManager.getStore(invalidPartition, false));
-    assertEquals("Compaction thread count is incorrect", dataNode.getMountPaths().size(),
-        TestUtils.numThreadsByThisName(CompactionManager.THREAD_NAME_PREFIX));
-    verifyCompactionThreadCount(storageManager, dataNode.getMountPaths().size());
+    // Wait for compaction threads to reach expected count (up to 30s)
+    int expectedThreadCount = dataNode.getMountPaths().size();
+    assertTrue("Compaction thread count did not reach " + expectedThreadCount,
+        TestUtils.waitForThreadCount(CompactionManager.THREAD_NAME_PREFIX, expectedThreadCount, 30000));
+    verifyCompactionThreadCount(storageManager, expectedThreadCount);
     shutdownAndAssertStoresInaccessible(storageManager, replicas);
     assertEquals("Compaction thread count is incorrect", 0, storageManager.getCompactionThreadCount());
     assertEquals(0, getCounterValue(counters, DiskManager.class.getName(), "TotalStoreShutdownFailures"));
