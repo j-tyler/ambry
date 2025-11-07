@@ -231,10 +231,8 @@ subprojects {
 
         if (byteBufTrackingEnabled) {
             // Ensure the tracker is built before tests run
-            // Use explicit task reference to guarantee the agentJar task completes
-            def agentJarTask = project(':bytebuf-tracker').tasks.named('agentJar')
-            dependsOn agentJarTask
-            mustRunAfter agentJarTask
+            // Use string-based task path - Gradle resolves this lazily at execution time
+            dependsOn ':bytebuf-tracker:agentJar'
 
             // Add the tracker agent
             def trackerJar = file("${rootProject.projectDir}/bytebuf-tracker/build/libs/bytebuf-tracker-agent.jar")
@@ -245,7 +243,7 @@ subprojects {
                 } else {
                     throw new GradleException(
                         "ByteBuf tracker agent JAR not found at ${trackerJar}. " +
-                        "The agentJar task should have built it. This may indicate a build configuration issue."
+                        "The :bytebuf-tracker:agentJar task should have built it."
                     )
                 }
             }
