@@ -127,6 +127,7 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertAggregatedStatsWithException() throws Exception {
+    reset(mockInsertAggregatedStatement);
     when(mockInsertAggregatedStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.updateStorageUsage(clusterName, (short) 1, (short) 1000, 100000), null);
@@ -147,6 +148,7 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertCopyWithException() throws Exception {
+    reset(mockInsertCopyStatement);
     when(mockInsertCopyStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
@@ -170,6 +172,7 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testInsertMonthWithException() throws Exception {
     long writeFailureCountBefore = metrics.writeFailureCount.getCount();
+    reset(mockInsertMonthStatement);
     when(mockInsertMonthStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.updateMonth(clusterName, "2020-01"), null);
@@ -195,6 +198,7 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryAggregatedStatsWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
+    reset(mockQueryAggregatedStatement);
     when(mockQueryAggregatedStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.queryContainerUsageForCluster(clusterName, null), null);
@@ -220,6 +224,7 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryMonthlyAggregatedStatsWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
+    reset(mockQueryAggregatedStatement);
     when(mockQueryAggregatedStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.queryMonthlyContainerUsageForCluster(clusterName, null), null);
@@ -240,6 +245,7 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryMonthWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
+    reset(mockQueryMonthStatement);
     when(mockQueryMonthStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.queryMonthForCluster(clusterName), null);
