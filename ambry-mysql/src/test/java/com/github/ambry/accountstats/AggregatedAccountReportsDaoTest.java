@@ -55,8 +55,13 @@ public class AggregatedAccountReportsDaoTest {
   public void setUp() throws SQLException {
     // Create fresh mocks for each test to ensure test isolation
     mockInsertAggregatedStatement = mock(PreparedStatement.class);
+    when(mockInsertAggregatedStatement.executeUpdate()).thenReturn(1);  // Default: success
+
     mockInsertCopyStatement = mock(PreparedStatement.class);
+    when(mockInsertCopyStatement.executeUpdate()).thenReturn(1);  // Default: success
+
     mockInsertMonthStatement = mock(PreparedStatement.class);
+    when(mockInsertMonthStatement.executeUpdate()).thenReturn(1);  // Default: success
 
     // Mock select statement for aggregated queries
     mockQueryAggregatedStatement = mock(PreparedStatement.class);
@@ -115,7 +120,6 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertAggregatedStats() throws Exception {
-    when(mockInsertAggregatedStatement.executeUpdate()).thenReturn(1);
     short accountId = 10;
     short containerId = 1;
     long storageUsage = 1000;
@@ -137,7 +141,6 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertCopy() throws Exception {
-    when(mockInsertCopyStatement.executeUpdate()).thenReturn(1);
     aggregatedAccountReportsDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName);
     verify(mockConnection).prepareStatement(anyString());
     assertEquals("Copy success count should be 1", 1, metrics.copySuccessCount.getCount());
@@ -157,7 +160,6 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertMonth() throws Exception {
-    when(mockInsertMonthStatement.executeUpdate()).thenReturn(1);
     long writeSuccessCountBefore = metrics.writeSuccessCount.getCount();
     aggregatedAccountReportsDao.updateMonth(clusterName, "2020-01");
     verify(mockConnection).prepareStatement(anyString());
