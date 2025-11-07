@@ -22,12 +22,16 @@ import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
 /**
  * Contains utils methods for MySqlAccountService
  */
 public class MySqlUtils {
+
+  private static final Logger logger = LoggerFactory.getLogger(MySqlUtils.class);
 
   static final String URL_STR = "url";
   static final String DATACENTER_STR = "datacenter";
@@ -91,6 +95,15 @@ public class MySqlUtils {
    * @return The new url with ssl settings
    */
   public static String addSslSettingsToUrl(String url, SSLConfig sslConfig, DbEndpoint.SSLMode sslMode) {
+
+    logger.info("=== SSL URL Debug ===");
+    logger.info("Original URL: " + url);
+    logger.info("SSL Mode: " + sslMode);
+    logger.info("Keystore Path: " + sslConfig.sslKeystorePath);
+    logger.info("Keystore Type: " + sslConfig.sslKeystoreType);
+    logger.info("Truststore Path: " + sslConfig.sslTruststorePath);
+    logger.info("Truststore Type: " + sslConfig.sslTruststoreType);
+
     //@formatter:off
     String delimiter = url.contains("?") ? "&" : "?";
     String sslSuffix = delimiter + SSL_SETTING_USE_SSL
@@ -101,8 +114,11 @@ public class MySqlUtils {
         + SSL_SETTING_TRUST_CERTIFICATE_KEY_STORE_TYPE + sslConfig.sslTruststoreType
         + SSL_SETTING_TRUST_CERTIFICATE_KEY_STORE_URL + sslConfig.sslTruststorePath
         + SSL_SETTING_TRUST_CERTIFICATE_KEY_STORE_PASSWORD + sslConfig.sslTruststorePassword;
-    return url + sslSuffix;
-    //@formatter:on
+
+    String finalUrl = url + sslSuffix;
+    logger.info("Final SSL URL: " + finalUrl);
+    logger.info("=====================");
+    return finalUrl;
   }
 
   /**
