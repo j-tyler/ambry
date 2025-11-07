@@ -1,0 +1,80 @@
+// Copyright (C) 2014-2025 LinkedIn Corp. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+// this file except in compliance with the License. You may obtain a copy of the
+// License at  http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+// CONDITIONS OF ANY KIND, either express or implied.
+
+plugins {
+    id 'java'
+    id 'me.champeau.jmh' version '0.7.1'
+}
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+dependencies {
+    // Apache Commons Codec for comparison
+    jmh 'commons-codec:commons-codec:1.15'
+
+    // JMH dependencies are automatically added by the plugin
+}
+
+jmh {
+    // JMH version
+    jmhVersion = '1.37'
+
+    // Benchmark mode: throughput, average time, sample time, etc.
+    // We'll set this in the benchmark annotations
+
+    // Number of warmup iterations
+    warmupIterations = 3
+
+    // Number of measurement iterations
+    iterations = 5
+
+    // Number of forks
+    fork = 2
+
+    // Results format
+    resultFormat = 'JSON'
+
+    // Results file location
+    resultsFile = project.file("${project.buildDir}/reports/jmh/results.json")
+
+    // Human-readable output
+    humanOutputFile = project.file("${project.buildDir}/reports/jmh/human.txt")
+
+    // Include only Base64 benchmarks by default
+    includes = ['.*Base64Benchmark.*']
+}
+
+// Make sure the jmh task doesn't run during normal builds
+tasks.withType(Test) {
+    // Exclude JMH benchmarks from normal test runs
+    exclude '**/*Benchmark*'
+}
+
+// Don't build this module as part of regular builds
+tasks.build.enabled = false
+tasks.check.enabled = false
+tasks.assemble.enabled = false
+
+// Create a custom task that only runs on explicit invocation
+task runBenchmarks {
+    group = 'benchmark'
+    description = 'Run JMH benchmarks'
+    dependsOn jmh
+}
+
+// For convenience, make 'gradle jmh' work at the root level
+if (project == rootProject) {
+    task jmh {
+        group = 'benchmark'
+        description = 'Run JMH benchmarks'
+        dependsOn ':ambry-benchmarks:jmh'
+    }
+}
