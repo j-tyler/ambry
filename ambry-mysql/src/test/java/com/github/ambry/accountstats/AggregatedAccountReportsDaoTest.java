@@ -127,7 +127,7 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertAggregatedStatsWithException() throws Exception {
-    doThrow(new SQLTransientConnectionException()).when(mockInsertAggregatedStatement).executeUpdate();
+    when(mockInsertAggregatedStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.updateStorageUsage(clusterName, (short) 1, (short) 1000, 100000), null);
     assertEquals("Write failure count should be 1", 1, metrics.writeFailureCount.getCount());
@@ -147,7 +147,7 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertCopyWithException() throws Exception {
-    doThrow(new SQLTransientConnectionException()).when(mockInsertCopyStatement).executeUpdate();
+    when(mockInsertCopyStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
     assertEquals("Copy failure count should be 1", 1, metrics.copyFailureCount.getCount());
@@ -170,7 +170,7 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testInsertMonthWithException() throws Exception {
     long writeFailureCountBefore = metrics.writeFailureCount.getCount();
-    doThrow(new SQLTransientConnectionException()).when(mockInsertMonthStatement).executeUpdate();
+    when(mockInsertMonthStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.updateMonth(clusterName, "2020-01"), null);
     assertEquals("Write failure count should be " + (writeFailureCountBefore + 1), writeFailureCountBefore + 1,
@@ -195,7 +195,7 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryAggregatedStatsWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
-    doThrow(new SQLTransientConnectionException()).when(mockQueryAggregatedStatement).executeQuery();
+    when(mockQueryAggregatedStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.queryContainerUsageForCluster(clusterName, null), null);
     assertEquals("Read failure count should be " + (readFailureCountBefore + 1), readFailureCountBefore + 1,
@@ -220,7 +220,7 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryMonthlyAggregatedStatsWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
-    doThrow(new SQLTransientConnectionException()).when(mockQueryAggregatedStatement).executeQuery();
+    when(mockQueryAggregatedStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.queryMonthlyContainerUsageForCluster(clusterName, null), null);
     assertEquals("Read failure count should be " + (readFailureCountBefore + 1), readFailureCountBefore + 1,
@@ -240,7 +240,7 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryMonthWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
-    doThrow(new SQLTransientConnectionException()).when(mockQueryMonthStatement).executeQuery();
+    when(mockQueryMonthStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
         () -> aggregatedAccountReportsDao.queryMonthForCluster(clusterName), null);
     assertEquals("Read failure count should be " + (readFailureCountBefore + 1), readFailureCountBefore + 1,
