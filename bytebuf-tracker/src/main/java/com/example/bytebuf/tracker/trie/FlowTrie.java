@@ -15,10 +15,19 @@ public class FlowTrie {
     
     /**
      * Get or create a root node for a method
+     * Using explicit get/putIfAbsent to avoid re-entrance issues with computeIfAbsent
      */
     public TrieNode getOrCreateRoot(String className, String methodName) {
         String key = className + "." + methodName;
-        return roots.computeIfAbsent(key, k -> new TrieNode(className, methodName, 1));
+        TrieNode node = roots.get(key);
+        if (node == null) {
+            node = new TrieNode(className, methodName, 1);
+            TrieNode existing = roots.putIfAbsent(key, node);
+            if (existing != null) {
+                node = existing;
+            }
+        }
+        return node;
     }
     
     /**
@@ -60,14 +69,21 @@ public class FlowTrie {
         
         /**
          * Record traversal through this node and get/create child
+         * Using explicit get/putIfAbsent to avoid re-entrance issues with computeIfAbsent
          */
         public TrieNode traverse(String className, String methodName, int refCount) {
             traversalCount.increment();
-            
+
             NodeKey key = new NodeKey(className, methodName, refCount);
-            return children.computeIfAbsent(key, k -> 
-                new TrieNode(className, methodName, refCount)
-            );
+            TrieNode child = children.get(key);
+            if (child == null) {
+                child = new TrieNode(className, methodName, refCount);
+                TrieNode existing = children.putIfAbsent(key, child);
+                if (existing != null) {
+                    child = existing;
+                }
+            }
+            return child;
         }
         
         /**

@@ -57,12 +57,20 @@ public class ByteBufFlowTracker {
      */
     public void recordMethodCall(Object byteBuf, String className, String methodName, int refCount) {
         if (byteBuf == null) return;
-        
+
         int objectId = System.identityHashCode(byteBuf);
-        
+
         // Get or create context for this ByteBuf
-        FlowContext context = activeFlows.computeIfAbsent(objectId, FlowContext::new);
-        
+        // Using explicit get/putIfAbsent to avoid re-entrance issues with computeIfAbsent
+        FlowContext context = activeFlows.get(objectId);
+        if (context == null) {
+            context = new FlowContext(objectId);
+            FlowContext existing = activeFlows.putIfAbsent(objectId, context);
+            if (existing != null) {
+                context = existing;
+            }
+        }
+
         if (!context.hasRoot()) {
             // First time seeing this ByteBuf - create root
             TrieNode root = trie.getOrCreateRoot(className, methodName);
@@ -76,7 +84,7 @@ public class ByteBufFlowTracker {
                 context.moveToNode(nextNode);
             }
         }
-        
+
         // If refCount is 0, ByteBuf is released - remove from tracking
         if (refCount == 0) {
             activeFlows.remove(objectId);

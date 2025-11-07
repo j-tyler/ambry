@@ -11,6 +11,11 @@ import net.bytebuddy.asm.Advice;
  */
 public class ByteBufTrackingAdvice {
 
+    // Re-entrance guard to prevent infinite recursion when tracking code
+    // triggers other instrumented methods
+    private static final ThreadLocal<Boolean> IS_TRACKING =
+        ThreadLocal.withInitial(() -> false);
+
     /**
      * Method entry advice - tracks objects in parameters
      */
@@ -20,23 +25,33 @@ public class ByteBufTrackingAdvice {
             @Advice.Origin("#m") String methodName,
             @Advice.AllArguments Object[] arguments) {
 
+        // Prevent re-entrant calls
+        if (IS_TRACKING.get()) {
+            return;
+        }
+
         if (arguments == null || arguments.length == 0) {
             return;
         }
 
-        ObjectTrackerHandler handler = ObjectTrackerRegistry.getHandler();
-        ByteBufFlowTracker tracker = ByteBufFlowTracker.getInstance();
+        try {
+            IS_TRACKING.set(true);
+            ObjectTrackerHandler handler = ObjectTrackerRegistry.getHandler();
+            ByteBufFlowTracker tracker = ByteBufFlowTracker.getInstance();
 
-        for (Object arg : arguments) {
-            if (handler.shouldTrack(arg)) {
-                int metric = handler.getMetric(arg);
-                tracker.recordMethodCall(
-                    arg,
-                    clazz.getSimpleName(),
-                    methodName,
-                    metric
-                );
+            for (Object arg : arguments) {
+                if (handler.shouldTrack(arg)) {
+                    int metric = handler.getMetric(arg);
+                    tracker.recordMethodCall(
+                        arg,
+                        clazz.getSimpleName(),
+                        methodName,
+                        metric
+                    );
+                }
             }
+        } finally {
+            IS_TRACKING.set(false);
         }
     }
 
@@ -51,34 +66,44 @@ public class ByteBufTrackingAdvice {
             @Advice.Return Object returnValue,
             @Advice.Thrown Throwable thrown) {
 
-        ObjectTrackerHandler handler = ObjectTrackerRegistry.getHandler();
-        ByteBufFlowTracker tracker = ByteBufFlowTracker.getInstance();
-
-        // Check if any tracked objects in parameters have changed state
-        if (arguments != null) {
-            for (Object arg : arguments) {
-                if (handler.shouldTrack(arg)) {
-                    int metric = handler.getMetric(arg);
-                    // Record the exit state
-                    tracker.recordMethodCall(
-                        arg,
-                        clazz.getSimpleName(),
-                        methodName + "_exit",
-                        metric
-                    );
-                }
-            }
+        // Prevent re-entrant calls
+        if (IS_TRACKING.get()) {
+            return;
         }
 
-        // Track return values
-        if (handler.shouldTrack(returnValue)) {
-            int metric = handler.getMetric(returnValue);
-            tracker.recordMethodCall(
-                returnValue,
-                clazz.getSimpleName(),
-                methodName + "_return",
-                metric
-            );
+        try {
+            IS_TRACKING.set(true);
+            ObjectTrackerHandler handler = ObjectTrackerRegistry.getHandler();
+            ByteBufFlowTracker tracker = ByteBufFlowTracker.getInstance();
+
+            // Check if any tracked objects in parameters have changed state
+            if (arguments != null) {
+                for (Object arg : arguments) {
+                    if (handler.shouldTrack(arg)) {
+                        int metric = handler.getMetric(arg);
+                        // Record the exit state
+                        tracker.recordMethodCall(
+                            arg,
+                            clazz.getSimpleName(),
+                            methodName + "_exit",
+                            metric
+                        );
+                    }
+                }
+            }
+
+            // Track return values
+            if (handler.shouldTrack(returnValue)) {
+                int metric = handler.getMetric(returnValue);
+                tracker.recordMethodCall(
+                    returnValue,
+                    clazz.getSimpleName(),
+                    methodName + "_return",
+                    metric
+                );
+            }
+        } finally {
+            IS_TRACKING.set(false);
         }
     }
 }
