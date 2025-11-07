@@ -13,7 +13,8 @@ public class ByteBufTrackingAdvice {
 
     // Re-entrance guard to prevent infinite recursion when tracking code
     // triggers other instrumented methods
-    private static final ThreadLocal<Boolean> IS_TRACKING =
+    // PUBLIC: Must be accessible from instrumented classes in different packages
+    public static final ThreadLocal<Boolean> IS_TRACKING =
         ThreadLocal.withInitial(() -> false);
 
     /**
@@ -57,13 +58,14 @@ public class ByteBufTrackingAdvice {
 
     /**
      * Method exit advice - tracks objects in return values and final state
+     * Note: readOnly=false and typing=DYNAMIC allows handling void methods
      */
     @Advice.OnMethodExit(onThrowable = Throwable.class)
     public static void onMethodExit(
             @Advice.Origin Class<?> clazz,
             @Advice.Origin("#m") String methodName,
             @Advice.AllArguments Object[] arguments,
-            @Advice.Return Object returnValue,
+            @Advice.Return(readOnly = false, typing = Advice.Assigner.Typing.DYNAMIC) Object returnValue,
             @Advice.Thrown Throwable thrown) {
 
         // Prevent re-entrant calls
