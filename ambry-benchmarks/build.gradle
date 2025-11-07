@@ -15,7 +15,7 @@ buildscript {
         }
     }
     dependencies {
-        classpath "me.champeau.gradle:jmh-gradle-plugin:0.5.3"
+        classpath "me.champeau.gradle:jmh-gradle-plugin:0.4.8"
     }
 }
 
@@ -33,8 +33,8 @@ dependencies {
 }
 
 jmh {
-    // JMH version
-    jmhVersion = '1.35'
+    // JMH version compatible with plugin 0.4.8
+    jmhVersion = '1.21'
 
     // Number of warmup iterations
     warmupIterations = 1
@@ -52,10 +52,9 @@ jmh {
     fork = 2
 
     // Include all benchmarks in com.github.ambry package
-    includes = ['com\\.github\\.ambry\\..*']
+    include = 'com\\.github\\.ambry\\..*'
 
     // Results in build/reports/jmh/results.txt by default
-    // Can be overridden with -Pjmh.resultFile=<path>
 }
 
 // Make sure the jmh task doesn't run during normal builds
