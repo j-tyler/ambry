@@ -21,9 +21,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.ambry.frontend.PutBlobMetaInfo;
 import com.github.ambry.utils.Pair;
 import java.io.IOException;
+import java.util.Base64;
 import java.util.List;
 import java.util.Objects;
-import org.apache.commons.codec.binary.Base64;
 
 
 /**
@@ -93,7 +93,7 @@ public class S3MultipartETag {
     rootObject.put(DATA_CHUNK_LIST, chunks);
     rootObject.put(VERSION, CURRENT_VERSION);
 
-    return Base64.encodeBase64URLSafeString(rootObject.toString().getBytes());
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(rootObject.toString().getBytes());
   }
 
   /**
@@ -101,7 +101,7 @@ public class S3MultipartETag {
    * @return the {@link S3MultipartETag}
    */
   public static S3MultipartETag deserialize(String encodedETagStr) throws IOException {
-    String eTagStr = new String(Base64.decodeBase64(encodedETagStr));
+    String eTagStr = new String(Base64.getUrlDecoder().decode(encodedETagStr));
     JsonNode rootNode;
     try {
       rootNode = objectMapper.readTree(eTagStr);
