@@ -4,6 +4,7 @@ import com.example.bytebuf.tracker.ByteBufFlowTracker;
 import com.example.bytebuf.tracker.ObjectTrackerHandler;
 import com.example.bytebuf.tracker.ObjectTrackerRegistry;
 import net.bytebuddy.asm.Advice;
+import net.bytebuddy.implementation.bytecode.assign.Assigner;
 
 /**
  * ByteBuddy advice for tracking object flow through methods.
@@ -65,7 +66,7 @@ public class ByteBufTrackingAdvice {
             @Advice.Origin Class<?> clazz,
             @Advice.Origin("#m") String methodName,
             @Advice.AllArguments Object[] arguments,
-            @Advice.Return(readOnly = false, typing = Advice.Assigner.Typing.DYNAMIC) Object returnValue,
+            @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC) Object returnValue,
             @Advice.Thrown Throwable thrown) {
 
         // Prevent re-entrant calls
