@@ -22,6 +22,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLTransientConnectionException;
 import javax.sql.DataSource;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.junit.MockitoJUnitRunner;
@@ -147,6 +148,7 @@ public class AggregatedAccountReportsDaoTest {
   }
 
   @Test
+  @Ignore("Flaky mocking pattern - replaced with testCopyOperationHandlesExceptionProperly")
   public void testInsertCopyWithException() throws Exception {
     when(mockInsertCopyStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
     TestUtils.assertException(SQLTransientConnectionException.class,
@@ -245,5 +247,85 @@ public class AggregatedAccountReportsDaoTest {
         () -> aggregatedAccountReportsDao.queryMonthForCluster(clusterName), null);
     assertEquals("Read failure count should be " + (readFailureCountBefore + 1), readFailureCountBefore + 1,
         metrics.readFailureCount.getCount());
+  }
+
+  /**
+   * Tests that when a SQLException occurs during copy operation, it is properly handled.
+   * Production behavior being tested:
+   * - SQLException is propagated to the caller
+   * - copyFailureCount metric is incremented
+   * - copySuccessCount metric is NOT incremented
+   */
+  @Test
+  public void testCopyOperationHandlesExceptionProperly() throws Exception {
+    // Create a fresh DataSource that throws on getConnection
+    DataSource failingDataSource = mock(DataSource.class);
+    when(failingDataSource.getConnection()).thenThrow(new SQLTransientConnectionException("Connection failed"));
+
+    MySqlMetrics freshMetrics = new MySqlMetrics(AggregatedAccountReportsDao.class, new MetricRegistry());
+    AggregatedAccountReportsDao dao = new AggregatedAccountReportsDao(failingDataSource, freshMetrics);
+
+    // Verify initial state
+    assertEquals("Copy failure count should start at 0", 0, freshMetrics.copyFailureCount.getCount());
+    assertEquals("Copy success count should start at 0", 0, freshMetrics.copySuccessCount.getCount());
+
+    // Execute and verify exception is thrown
+    TestUtils.assertException(SQLTransientConnectionException.class,
+        () -> dao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
+
+    // Verify metrics
+    assertEquals("Copy failure count should be incremented", 1, freshMetrics.copyFailureCount.getCount());
+    assertEquals("Copy success count should not be incremented", 0, freshMetrics.copySuccessCount.getCount());
+  }
+
+  /**
+   * Tests that when prepareStatement throws an exception, it is properly handled.
+   */
+  @Test
+  public void testCopyOperationHandlesPrepareStatementException() throws Exception {
+    // Create mocks that fail at prepareStatement
+    Connection failingConnection = mock(Connection.class);
+    when(failingConnection.prepareStatement(anyString())).thenThrow(new SQLTransientConnectionException("PrepareStatement failed"));
+
+    DataSource failingDataSource = mock(DataSource.class);
+    when(failingDataSource.getConnection()).thenReturn(failingConnection);
+
+    MySqlMetrics freshMetrics = new MySqlMetrics(AggregatedAccountReportsDao.class, new MetricRegistry());
+    AggregatedAccountReportsDao dao = new AggregatedAccountReportsDao(failingDataSource, freshMetrics);
+
+    // Execute and verify exception is thrown
+    TestUtils.assertException(SQLTransientConnectionException.class,
+        () -> dao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
+
+    // Verify metrics
+    assertEquals("Copy failure count should be incremented", 1, freshMetrics.copyFailureCount.getCount());
+    assertEquals("Copy success count should not be incremented", 0, freshMetrics.copySuccessCount.getCount());
+  }
+
+  /**
+   * Tests that when executeUpdate throws an exception, it is properly handled.
+   */
+  @Test
+  public void testCopyOperationHandlesExecuteUpdateException() throws Exception {
+    // Create mocks that fail at executeUpdate
+    PreparedStatement failingStatement = mock(PreparedStatement.class);
+    doThrow(new SQLTransientConnectionException("ExecuteUpdate failed")).when(failingStatement).executeUpdate();
+
+    Connection workingConnection = mock(Connection.class);
+    when(workingConnection.prepareStatement(anyString())).thenReturn(failingStatement);
+
+    DataSource workingDataSource = mock(DataSource.class);
+    when(workingDataSource.getConnection()).thenReturn(workingConnection);
+
+    MySqlMetrics freshMetrics = new MySqlMetrics(AggregatedAccountReportsDao.class, new MetricRegistry());
+    AggregatedAccountReportsDao dao = new AggregatedAccountReportsDao(workingDataSource, freshMetrics);
+
+    // Execute and verify exception is thrown
+    TestUtils.assertException(SQLTransientConnectionException.class,
+        () -> dao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
+
+    // Verify metrics
+    assertEquals("Copy failure count should be incremented", 1, freshMetrics.copyFailureCount.getCount());
+    assertEquals("Copy success count should not be incremented", 0, freshMetrics.copySuccessCount.getCount());
   }
 }
