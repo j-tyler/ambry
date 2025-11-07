@@ -1,16 +1,3 @@
-/*
- * Copyright 2025 LinkedIn Corp. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- */
 package com.github.ambry.benchmarks;
 
 import java.util.Random;
@@ -30,23 +17,11 @@ import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
 
 /**
- * Benchmark comparing Apache Commons Base64 vs Java 8 java.util.Base64
- * for encoding and decoding operations across different blob sizes.
- * <p>
- * This benchmark measures:
- * - Throughput (operations per second)
- * - Average execution time
- * <p>
- * Tested blob sizes:
- * - 1 KB (typical small metadata or identifier)
- * - 128 KB (medium-sized blob)
- * - 4 MB (large blob)
- * <p>
- * Configuration (optimized for fast feedback):
- * - Warmup: 1 iteration × 5 seconds
- * - Measurement: 2 iterations × 5 seconds
- * - Forks: 1
- * - Total runtime: ~6 minutes for all tests
+ * Compares Apache Commons Base64 vs Java 8 Base64 across 1KB, 128KB, and 4MB blobs.
+ * Measures throughput (ops/ms) and average time (ms/op).
+ * Runtime: ~6 minutes with default config (1 warmup, 2 iterations, 1 fork).
+ *
+ * For higher precision: ./gradlew jmh -Pjmh.fork=2 -Pjmh.iterations=3 -Pjmh.timeOnIteration='10s'
  */
 @BenchmarkMode({Mode.Throughput, Mode.AverageTime})
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
@@ -56,12 +31,6 @@ import org.openjdk.jmh.infra.Blackhole;
 @State(Scope.Thread)
 public class Base64Benchmark {
 
-  /**
-   * Size of the blob to test.
-   * 1024 = 1 KB
-   * 131072 = 128 KB
-   * 4194304 = 4 MB
-   */
   @Param({"1024", "131072", "4194304"})
   private int blobSize;
 
@@ -71,82 +40,50 @@ public class Base64Benchmark {
 
   @Setup(Level.Trial)
   public void setup() {
-    // Generate random binary data for testing
     randomData = new byte[blobSize];
-    new Random(42).nextBytes(randomData); // Use fixed seed for reproducibility
+    new Random(42).nextBytes(randomData);
 
-    // Pre-encode data for decoding tests
     apacheEncodedData = org.apache.commons.codec.binary.Base64.encodeBase64URLSafeString(randomData);
     java8EncodedData = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(randomData);
   }
 
-  //
-  // Apache Commons Base64 Benchmarks
-  //
-
   @Benchmark
   public void apacheCommonsEncode(Blackhole blackhole) {
-    String encoded = org.apache.commons.codec.binary.Base64.encodeBase64URLSafeString(randomData);
-    blackhole.consume(encoded);
+    blackhole.consume(org.apache.commons.codec.binary.Base64.encodeBase64URLSafeString(randomData));
   }
 
   @Benchmark
   public void apacheCommonsDecode(Blackhole blackhole) {
-    byte[] decoded = org.apache.commons.codec.binary.Base64.decodeBase64(apacheEncodedData);
-    blackhole.consume(decoded);
+    blackhole.consume(org.apache.commons.codec.binary.Base64.decodeBase64(apacheEncodedData));
   }
-
-  //
-  // Java 8 Base64 Benchmarks
-  //
 
   @Benchmark
   public void java8Encode(Blackhole blackhole) {
-    String encoded = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(randomData);
-    blackhole.consume(encoded);
+    blackhole.consume(java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(randomData));
   }
 
   @Benchmark
   public void java8Decode(Blackhole blackhole) {
-    byte[] decoded = java.util.Base64.getUrlDecoder().decode(java8EncodedData);
-    blackhole.consume(decoded);
+    blackhole.consume(java.util.Base64.getUrlDecoder().decode(java8EncodedData));
   }
-
-  //
-  // Standard (non-URL-safe) encoding benchmarks for comparison
-  //
 
   @Benchmark
   public void apacheCommonsEncodeStandard(Blackhole blackhole) {
-    String encoded = org.apache.commons.codec.binary.Base64.encodeBase64String(randomData);
-    blackhole.consume(encoded);
+    blackhole.consume(org.apache.commons.codec.binary.Base64.encodeBase64String(randomData));
   }
 
   @Benchmark
   public void java8EncodeStandard(Blackhole blackhole) {
-    String encoded = java.util.Base64.getEncoder().encodeToString(randomData);
-    blackhole.consume(encoded);
+    blackhole.consume(java.util.Base64.getEncoder().encodeToString(randomData));
   }
 
-  //
-  // Additional memory allocation benchmarks
-  //
-
-  /**
-   * Tests encoding with explicit byte array allocation to measure allocation overhead.
-   */
   @Benchmark
   public void apacheCommonsEncodeBytes(Blackhole blackhole) {
-    byte[] encoded = org.apache.commons.codec.binary.Base64.encodeBase64URLSafe(randomData);
-    blackhole.consume(encoded);
+    blackhole.consume(org.apache.commons.codec.binary.Base64.encodeBase64URLSafe(randomData));
   }
 
-  /**
-   * Tests encoding with explicit byte array allocation to measure allocation overhead.
-   */
   @Benchmark
   public void java8EncodeBytes(Blackhole blackhole) {
-    byte[] encoded = java.util.Base64.getUrlEncoder().withoutPadding().encode(randomData);
-    blackhole.consume(encoded);
+    blackhole.consume(java.util.Base64.getUrlEncoder().withoutPadding().encode(randomData));
   }
 }
