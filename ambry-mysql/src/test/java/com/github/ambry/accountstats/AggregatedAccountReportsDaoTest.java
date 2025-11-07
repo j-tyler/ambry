@@ -76,23 +76,24 @@ public class AggregatedAccountReportsDaoTest {
 
     // Set mocked statements in the mock connection
     // Order matters in Mockito 5 - more specific matchers should come first
+    // Using lenient() for shared setup that may not be used by all tests
     mockConnection = mock(Connection.class);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         startsWith("INSERT " + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + " SELECT"))).thenReturn(
         mockInsertCopyStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         startsWith("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_TABLE))).thenReturn(
         mockInsertAggregatedStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         startsWith("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE))).thenReturn(
         mockInsertMonthStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         matches("SELECT.+" + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE + ".+"))).thenReturn(
         mockQueryMonthStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         matches("SELECT.+" + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_TABLE + " .+"))).thenReturn(
         mockQueryAggregatedStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         matches("SELECT.+" + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + ".+"))).thenReturn(
         mockQueryAggregatedStatement);
 
@@ -136,7 +137,7 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertCopy() throws Exception {
-    when(mockInsertCopyStatement.executeUpdate()).thenReturn(1);
+    lenient().when(mockInsertCopyStatement.executeUpdate()).thenReturn(1);
     aggregatedAccountReportsDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName);
     verify(mockConnection).prepareStatement(anyString());
     assertEquals("Copy success count should be 1", 1, metrics.copySuccessCount.getCount());
