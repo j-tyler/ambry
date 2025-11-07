@@ -42,16 +42,17 @@ import org.openjdk.jmh.infra.Blackhole;
  * - 128 KB (medium-sized blob)
  * - 4 MB (large blob)
  * <p>
- * Configuration:
- * - Warmup: 1 iteration × 10 seconds
- * - Measurement: 3 iterations × 10 seconds
- * - Forks: 2
+ * Configuration (optimized for fast feedback):
+ * - Warmup: 1 iteration × 5 seconds
+ * - Measurement: 2 iterations × 5 seconds
+ * - Forks: 1
+ * - Total runtime: ~6 minutes for all tests
  */
 @BenchmarkMode({Mode.Throughput, Mode.AverageTime})
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
-@Warmup(iterations = 1, time = 10)
-@Measurement(iterations = 3, time = 10)
-@Fork(value = 2, jvmArgsAppend = {"-Xms2g", "-Xmx2g"})
+@Warmup(iterations = 1, time = 5)
+@Measurement(iterations = 2, time = 5)
+@Fork(value = 1, jvmArgsAppend = {"-Xms2g", "-Xmx2g"})
 @State(Scope.Thread)
 public class Base64Benchmark {
 

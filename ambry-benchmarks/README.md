@@ -26,11 +26,18 @@ Compares the performance of Apache Commons Base64 vs Java 8's built-in `java.uti
 - **Throughput**: Operations per millisecond
 - **Average Time**: Average execution time per operation
 
-**Benchmark Configuration:**
-- **Warmup**: 1 iteration × 10 seconds
-- **Measurement**: 3 iterations × 10 seconds
-- **Forks**: 2 (for JVM variability)
+**Benchmark Configuration (optimized for fast feedback):**
+- **Warmup**: 1 iteration × 5 seconds
+- **Measurement**: 2 iterations × 5 seconds
+- **Forks**: 1
 - **Heap Size**: 2GB (-Xms2g -Xmx2g)
+- **Total Runtime**: ~6 minutes for all tests
+
+**For publication-quality results**, override with:
+```bash
+./gradlew jmh -Pjmh.fork=2 -Pjmh.iterations=3 -Pjmh.timeOnIteration='10s'
+# Runtime: ~32 minutes
+```
 
 ## Running Benchmarks
 
@@ -158,12 +165,28 @@ public class MyBenchmark {
 }
 ```
 
+## Performance vs Precision Tradeoffs
+
+The default configuration is optimized for **fast feedback** during development:
+- ✅ **Quick Results**: ~6 minutes total runtime
+- ✅ **Good Enough**: Sufficient precision for comparing implementations
+- ✅ **Reasonable Confidence**: Catches major performance differences (>10%)
+- ⚠️ **Lower Precision**: May miss subtle differences (<5%)
+
+For **publication-quality results**:
+```bash
+./gradlew jmh -Pjmh.fork=2 -Pjmh.iterations=3 -Pjmh.timeOnIteration='10s'
+```
+- ✅ **High Precision**: Detects differences as small as 2-3%
+- ✅ **Statistical Significance**: Multiple forks account for JVM variability
+- ⚠️ **Slower**: ~32 minutes total runtime
+
 ## Best Practices
 
 1. **Use Blackhole**: Always consume benchmark results with `Blackhole.consume()` to prevent JIT optimization from eliminating dead code
-2. **Warmup**: Include adequate warmup iterations (default: 1 iteration of 10 seconds)
-3. **Measurement**: Use sufficient measurement iterations for statistical significance (default: 3 iterations of 10 seconds)
-4. **Fork**: Run multiple forks to account for JVM variability (default: 2 forks)
+2. **Warmup**: Include adequate warmup iterations (default: 1 iteration of 5 seconds)
+3. **Measurement**: Use sufficient measurement iterations (default: 2 iterations of 5 seconds for quick feedback)
+4. **Fork**: Run multiple forks to account for JVM variability (default: 1 for speed, use 2-3 for publication)
 5. **Fixed Seed**: Use fixed random seeds for reproducibility
 6. **Realistic Data**: Use realistic data sizes and patterns
 7. **Package Structure**: Place all benchmarks in `com.github.ambry.benchmarks` package to be automatically discovered

@@ -40,22 +40,25 @@ jmh {
     warmupIterations = 1
 
     // Warmup time per iteration (in seconds)
-    warmup = '10s'
+    warmup = '5s'
 
     // Number of measurement iterations
-    iterations = 3
+    iterations = 2
 
     // Measurement time per iteration (in seconds)
-    timeOnIteration = '10s'
+    timeOnIteration = '5s'
 
-    // Number of forks
-    fork = 2
+    // Number of forks (1 for faster feedback, increase to 2-3 for publication-quality results)
+    fork = 1
 
     // Include all benchmarks in com.github.ambry package
     include = 'com\\.github\\.ambry\\..*'
 
     // Results in build/reports/jmh/results.txt by default
 }
+
+// For more thorough benchmarking with higher precision, use:
+// ./gradlew jmh -Pjmh.fork=2 -Pjmh.iterations=3 -Pjmh.timeOnIteration='10s'
 
 // Make sure the jmh task doesn't run during normal builds
 tasks.withType(Test) {
