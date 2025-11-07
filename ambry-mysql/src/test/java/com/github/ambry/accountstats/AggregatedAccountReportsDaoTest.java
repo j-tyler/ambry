@@ -22,7 +22,6 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLTransientConnectionException;
 import javax.sql.DataSource;
-import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.junit.MockitoJUnitRunner;
@@ -36,14 +35,14 @@ import static org.mockito.Mockito.*;
  */
 @RunWith(MockitoJUnitRunner.class)
 public class AggregatedAccountReportsDaoTest {
-  private final MySqlMetrics metrics = new MySqlMetrics(AggregatedAccountReportsDao.class, new MetricRegistry());
-  private Connection mockConnection;
-  private PreparedStatement mockInsertAggregatedStatement;
-  private PreparedStatement mockInsertCopyStatement;
-  private PreparedStatement mockInsertMonthStatement;
-  private PreparedStatement mockQueryAggregatedStatement;
-  private PreparedStatement mockQueryMonthStatement;
-  private AggregatedAccountReportsDao aggregatedAccountReportsDao;
+  private final MySqlMetrics metrics;
+  private final Connection mockConnection;
+  private final PreparedStatement mockInsertAggregatedStatement;
+  private final PreparedStatement mockInsertCopyStatement;
+  private final PreparedStatement mockInsertMonthStatement;
+  private final PreparedStatement mockQueryAggregatedStatement;
+  private final PreparedStatement mockQueryMonthStatement;
+  private final AggregatedAccountReportsDao aggregatedAccountReportsDao;
   private static final String clusterName = "Ambry-test";
 
   private final int queryAccountId = 1000;
@@ -51,19 +50,16 @@ public class AggregatedAccountReportsDaoTest {
   private final long queryStorageUsage = 123456;
   private final String queryMonthValue = "2020-01";
 
-  @Before
-  public void setUp() throws SQLException {
-    // Create fresh mocks for each test to ensure test isolation
+  public AggregatedAccountReportsDaoTest() throws SQLException {
+    // Mock inserts with default behavior
     mockInsertAggregatedStatement = mock(PreparedStatement.class);
-    when(mockInsertAggregatedStatement.executeUpdate()).thenReturn(1);  // Default: success
-
+    when(mockInsertAggregatedStatement.executeUpdate()).thenReturn(1);
     mockInsertCopyStatement = mock(PreparedStatement.class);
-    when(mockInsertCopyStatement.executeUpdate()).thenReturn(1);  // Default: success
-
+    when(mockInsertCopyStatement.executeUpdate()).thenReturn(1);
     mockInsertMonthStatement = mock(PreparedStatement.class);
-    when(mockInsertMonthStatement.executeUpdate()).thenReturn(1);  // Default: success
+    when(mockInsertMonthStatement.executeUpdate()).thenReturn(1);
 
-    // Mock select statement for aggregated queries
+    // Mock select statement
     mockQueryAggregatedStatement = mock(PreparedStatement.class);
     ResultSet mockResultSet = mock(ResultSet.class);
     when(mockResultSet.next()).thenReturn(true).thenReturn(false);
@@ -75,7 +71,6 @@ public class AggregatedAccountReportsDaoTest {
     when(mockResultSet.getLong(eq(AggregatedAccountReportsDao.NUMBER_OF_BLOBS_COLUMN))).thenReturn(1L);
     when(mockQueryAggregatedStatement.executeQuery()).thenReturn(mockResultSet);
 
-    // Mock select statement for month queries
     mockQueryMonthStatement = mock(PreparedStatement.class);
     mockResultSet = mock(ResultSet.class);
     when(mockResultSet.next()).thenReturn(true).thenReturn(false);
@@ -103,6 +98,7 @@ public class AggregatedAccountReportsDaoTest {
         matches("SELECT.+" + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + ".+"))).thenReturn(
         mockQueryAggregatedStatement);
 
+    metrics = new MySqlMetrics(AggregatedAccountReportsDao.class, new MetricRegistry());
     aggregatedAccountReportsDao = new AggregatedAccountReportsDao(getDataSource(mockConnection), metrics);
   }
 
