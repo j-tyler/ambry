@@ -23,7 +23,7 @@ import org.openjdk.jmh.infra.Blackhole;
  * Uses randomized data selection to prevent JVM constant folding and CPU cache optimizations.
  * Runtime: ~3 minutes with default config. Memory profiling enabled via GC profiler.
  */
-@BenchmarkMode({Mode.Throughput, Mode.AverageTime})
+@BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @Warmup(iterations = 1, time = 5)
 @Measurement(iterations = 2, time = 5)
