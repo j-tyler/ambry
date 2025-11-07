@@ -75,15 +75,16 @@ public class AggregatedAccountReportsDaoTest {
     when(mockQueryMonthStatement.executeQuery()).thenReturn(mockResultSet);
 
     // Set mocked statements in the mock connection
+    // Order matters in Mockito 5 - more specific matchers should come first
     mockConnection = mock(Connection.class);
     when(mockConnection.prepareStatement(
-        contains("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_TABLE))).thenReturn(
-        mockInsertAggregatedStatement);
-    when(mockConnection.prepareStatement(contains(
-        "INSERT " + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + " SELECT"))).thenReturn(
+        startsWith("INSERT " + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + " SELECT"))).thenReturn(
         mockInsertCopyStatement);
     when(mockConnection.prepareStatement(
-        contains("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE))).thenReturn(
+        startsWith("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_TABLE))).thenReturn(
+        mockInsertAggregatedStatement);
+    when(mockConnection.prepareStatement(
+        startsWith("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE))).thenReturn(
         mockInsertMonthStatement);
     when(mockConnection.prepareStatement(
         matches("SELECT.+" + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE + ".+"))).thenReturn(
