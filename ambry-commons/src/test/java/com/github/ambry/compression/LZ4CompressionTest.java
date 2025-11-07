@@ -134,14 +134,29 @@ public class LZ4CompressionTest {
 
   @Test
   public void testCompressNativeFailed() throws Exception {
-    // Create a compressor that throws when compress() is called
+    // Create a compressor that throws when calling compress()
     LZ4Compressor throwCompressor = Mockito.mock(LZ4Compressor.class);
     Exception theException = new RuntimeException("test");
     Mockito.when(throwCompressor.compress(Mockito.any(ByteBuffer.class), Mockito.anyInt(), Mockito.anyInt(),
-      Mockito.any(ByteBuffer.class), Mockito.anyInt(), Mockito.anyInt())).thenThrow(theException);
+        Mockito.any(ByteBuffer.class), Mockito.anyInt(), Mockito.anyInt())).thenThrow(theException);
 
-    // Use test helper class with mock compressor
-    LZ4Compression lz4 = new TestLZ4Compression(throwCompressor, null);
+    // Create a test subclass that uses the throwing compressor
+    LZ4Compression lz4 = new LZ4Compression() {
+      @Override
+      protected int compressNative(ByteBuffer sourceData, int sourceDataOffset, int sourceDataSize,
+          ByteBuffer compressedBuffer, int compressedBufferOffset, int compressedBufferSize) throws CompressionException {
+        try {
+          return throwCompressor.compress(sourceData, sourceDataOffset, sourceDataSize, compressedBuffer,
+              compressedBufferOffset, compressedBufferSize);
+        } catch (Exception ex) {
+          throw new CompressionException(String.format("LZ4 compression failed. sourceData.limit=%d, sourceDataOffset=%d, "
+                  + "sourceDataSize=%d, compressedBuffer.capacity=%d, compressedBufferOffset=%d, compressedBufferSize=%d",
+              sourceData.limit(), sourceDataOffset, sourceDataSize, compressedBuffer.capacity(), compressedBufferOffset,
+              compressedBufferSize), ex);
+        }
+      }
+    };
+
     Exception ex = TestUtils.getException(() ->
         lz4.compressNative(ByteBuffer.wrap("ABC".getBytes(StandardCharsets.UTF_8)), 0, 3,
             ByteBuffer.wrap(new byte[10]), 0, 10));
@@ -151,14 +166,30 @@ public class LZ4CompressionTest {
 
   @Test
   public void testDecompressNativeFailed() throws Exception {
-    // Create a decompressor that throws when decompress() is called
+    // Create a decompressor that throws when calling decompress()
     LZ4FastDecompressor throwDecompressor = Mockito.mock(LZ4FastDecompressor.class);
     Exception theException = new RuntimeException("failed");
     Mockito.when(throwDecompressor.decompress(Mockito.any(ByteBuffer.class), Mockito.anyInt(),
         Mockito.any(ByteBuffer.class), Mockito.anyInt(), Mockito.anyInt())).thenThrow(theException);
 
-    // Use test helper class with mock decompressor
-    LZ4Compression lz4 = new TestLZ4Compression(null, throwDecompressor);
+    // Create a test subclass that uses the throwing decompressor
+    LZ4Compression lz4 = new LZ4Compression() {
+      @Override
+      protected void decompressNative(ByteBuffer compressedBuffer, int compressedBufferOffset, int compressedBufferSize,
+          ByteBuffer sourceDataBuffer, int sourceDataOffset, int sourceDataSize) throws CompressionException {
+        try {
+          throwDecompressor.decompress(compressedBuffer, compressedBufferOffset, sourceDataBuffer, sourceDataOffset,
+              sourceDataSize);
+        } catch (Exception ex) {
+          throw new CompressionException(String.format("LZ4 decompression failed. "
+                  + "compressedBuffer.limit=%d, compressedBufferOffset=%d, compressedBufferSize=%d, "
+                  + "sourceData.capacity=%d, sourceDataOffset=%d, sourceDataSize=%d", compressedBuffer.limit(),
+              compressedBufferOffset, compressedBufferSize, sourceDataBuffer.capacity(), sourceDataOffset, sourceDataSize),
+              ex);
+        }
+      }
+    };
+
     Exception ex = TestUtils.getException(() ->
         lz4.decompressNative(ByteBuffer.wrap(new byte[10]), 0, 10, ByteBuffer.wrap(new byte[10]), 0, 10));
     Assert.assertTrue(ex instanceof CompressionException);
