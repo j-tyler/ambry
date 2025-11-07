@@ -138,6 +138,8 @@ public class ByteBufFlowAgent {
 
     /**
      * Transformer that applies advice to constructors for specified classes
+     * Uses ConstructorTrackingAdvice which doesn't use onThrowable to avoid
+     * "Cannot catch exception during constructor call" errors
      */
     static class ConstructorTrackingTransformer implements AgentBuilder.Transformer {
         @Override
@@ -153,7 +155,7 @@ public class ByteBufFlowAgent {
                     // Match public and protected constructors
                     isPublic().or(isProtected())
                 )
-                .intercept(Advice.to(ByteBufTrackingAdvice.class));
+                .intercept(Advice.to(ConstructorTrackingAdvice.class));
         }
     }
     
