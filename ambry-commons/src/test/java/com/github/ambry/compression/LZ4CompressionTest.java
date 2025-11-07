@@ -28,41 +28,22 @@ public class LZ4CompressionTest {
    * Test helper class that allows injecting mock compressor/decompressor for testing error scenarios.
    */
   private static class TestLZ4Compression extends LZ4Compression {
-    private final LZ4Compressor testCompressor;
-    private final LZ4FastDecompressor testDecompressor;
+    private final LZ4Compressor mockCompressor;
+    private final LZ4FastDecompressor mockDecompressor;
 
     TestLZ4Compression(LZ4Compressor compressor, LZ4FastDecompressor decompressor) {
-      this.testCompressor = compressor;
-      this.testDecompressor = decompressor;
+      this.mockCompressor = compressor;
+      this.mockDecompressor = decompressor;
     }
 
     @Override
-    protected int compressNative(ByteBuffer sourceData, int sourceDataOffset, int sourceDataSize,
-        ByteBuffer compressedBuffer, int compressedBufferOffset, int compressedBufferSize) throws CompressionException {
-      try {
-        return testCompressor.compress(sourceData, sourceDataOffset, sourceDataSize, compressedBuffer,
-            compressedBufferOffset, compressedBufferSize);
-      } catch (Exception ex) {
-        throw new CompressionException(String.format("LZ4 compression failed. sourceData.limit=%d, sourceDataOffset=%d, "
-                + "sourceDataSize=%d, compressedBuffer.capacity=%d, compressedBufferOffset=%d, compressedBufferSize=%d",
-            sourceData.limit(), sourceDataOffset, sourceDataSize, compressedBuffer.capacity(), compressedBufferOffset,
-            compressedBufferSize), ex);
-      }
+    protected LZ4Compressor getCompressor() {
+      return mockCompressor;
     }
 
     @Override
-    protected void decompressNative(ByteBuffer compressedBuffer, int compressedBufferOffset, int compressedBufferSize,
-        ByteBuffer sourceDataBuffer, int sourceDataOffset, int sourceDataSize) throws CompressionException {
-      try {
-        testDecompressor.decompress(compressedBuffer, compressedBufferOffset, sourceDataBuffer, sourceDataOffset,
-            sourceDataSize);
-      } catch (Exception ex) {
-        throw new CompressionException(String.format("LZ4 decompression failed. "
-                + "compressedBuffer.limit=%d, compressedBufferOffset=%d, compressedBufferSize=%d, "
-                + "sourceData.capacity=%d, sourceDataOffset=%d, sourceDataSize=%d", compressedBuffer.limit(),
-            compressedBufferOffset, compressedBufferSize, sourceDataBuffer.capacity(), sourceDataOffset, sourceDataSize),
-            ex);
-      }
+    protected LZ4FastDecompressor getDecompressor() {
+      return mockDecompressor;
     }
   }
 

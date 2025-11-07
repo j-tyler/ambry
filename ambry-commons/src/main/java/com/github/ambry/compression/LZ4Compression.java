@@ -98,7 +98,7 @@ public class LZ4Compression extends BaseCompressionWithLevel {
    * Get the compressor based on the compressor level.
    * @return The LZ4 compressor.
    */
-  private LZ4Compressor getCompressor() {
+  protected LZ4Compressor getCompressor() {
     if (getCompressionLevel() == 0) {
       return LZ4_FACTORY.fastCompressor();
     }
@@ -109,7 +109,7 @@ public class LZ4Compression extends BaseCompressionWithLevel {
    * Get the decompressor based on the compressor level.  For LZ4, the fast decompressor works for all levels.
    * @return The decompressor.
    */
-  private LZ4FastDecompressor getDecompressor() {
+  protected LZ4FastDecompressor getDecompressor() {
     return LZ4_FACTORY.fastDecompressor();
   }
 
