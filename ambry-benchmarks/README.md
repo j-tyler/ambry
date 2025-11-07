@@ -81,8 +81,9 @@ You can customize benchmark parameters:
 ### Output Location
 
 Benchmark results are saved to:
-- **JSON Format**: `ambry-benchmarks/build/reports/jmh/results.json`
-- **Human-Readable**: `ambry-benchmarks/build/reports/jmh/human.txt`
+- **Default**: `ambry-benchmarks/build/reports/jmh/results.txt`
+- **Custom Location**: Override with `-Pjmh.resultFile=<path>`
+- **JSON Format**: Add `-Pjmh.resultFormat=JSON` to output JSON results
 
 ### Interpreting Results
 

@@ -10,7 +10,7 @@
 
 plugins {
     id 'java'
-    id 'me.champeau.jmh' version '0.7.1'
+    id 'me.champeau.jmh' version '0.5.3'
 }
 
 sourceCompatibility = 1.8
@@ -25,10 +25,7 @@ dependencies {
 
 jmh {
     // JMH version
-    jmhVersion = '1.37'
-
-    // Benchmark mode: throughput, average time, sample time, etc.
-    // We'll set this in the benchmark annotations
+    jmhVersion = '1.35'
 
     // Number of warmup iterations
     warmupIterations = 1
@@ -45,17 +42,11 @@ jmh {
     // Number of forks
     fork = 2
 
-    // Results format
-    resultFormat = 'JSON'
-
-    // Results file location
-    resultsFile = project.file("${project.buildDir}/reports/jmh/results.json")
-
-    // Human-readable output
-    humanOutputFile = project.file("${project.buildDir}/reports/jmh/human.txt")
-
     // Include all benchmarks in com.github.ambry package
     includes = ['com\\.github\\.ambry\\..*']
+
+    // Results in build/reports/jmh/results.txt by default
+    // Can be overridden with -Pjmh.resultFile=<path>
 }
 
 // Make sure the jmh task doesn't run during normal builds
