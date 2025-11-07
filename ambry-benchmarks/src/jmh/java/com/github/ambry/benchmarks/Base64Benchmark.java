@@ -19,7 +19,7 @@ import org.openjdk.jmh.infra.Blackhole;
 /**
  * Compares Apache Commons Base64 vs Java 8 Base64 across 1KB, 128KB, and 4MB blobs.
  * Tests encoding (bytes -> string) and decoding (string -> bytes) which are the primary operations.
- * Runtime: ~6 minutes with default config. Memory profiling enabled via GC profiler.
+ * Runtime: ~3 minutes with default config. Memory profiling enabled via GC profiler.
  */
 @BenchmarkMode({Mode.Throughput, Mode.AverageTime})
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
@@ -36,13 +36,19 @@ public class Base64Benchmark {
   private String apacheEncodedData;
   private String java8EncodedData;
 
+  // Cache encoder/decoder instances to avoid creating new objects on each iteration
+  private static final java.util.Base64.Encoder JAVA8_ENCODER =
+      java.util.Base64.getUrlEncoder().withoutPadding();
+  private static final java.util.Base64.Decoder JAVA8_DECODER =
+      java.util.Base64.getUrlDecoder();
+
   @Setup(Level.Trial)
   public void setup() {
     randomData = new byte[blobSize];
     new Random(42).nextBytes(randomData);
 
     apacheEncodedData = org.apache.commons.codec.binary.Base64.encodeBase64URLSafeString(randomData);
-    java8EncodedData = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(randomData);
+    java8EncodedData = JAVA8_ENCODER.encodeToString(randomData);
   }
 
   @Benchmark
@@ -57,11 +63,11 @@ public class Base64Benchmark {
 
   @Benchmark
   public void java8Encode(Blackhole blackhole) {
-    blackhole.consume(java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(randomData));
+    blackhole.consume(JAVA8_ENCODER.encodeToString(randomData));
   }
 
   @Benchmark
   public void java8Decode(Blackhole blackhole) {
-    blackhole.consume(java.util.Base64.getUrlDecoder().decode(java8EncodedData));
+    blackhole.consume(JAVA8_DECODER.decode(java8EncodedData));
   }
 }
