@@ -26,6 +26,12 @@ Compares the performance of Apache Commons Base64 vs Java 8's built-in `java.uti
 - **Throughput**: Operations per millisecond
 - **Average Time**: Average execution time per operation
 
+**Benchmark Configuration:**
+- **Warmup**: 1 iteration × 10 seconds
+- **Measurement**: 3 iterations × 10 seconds
+- **Forks**: 2 (for JVM variability)
+- **Heap Size**: 2GB (-Xms2g -Xmx2g)
+
 ## Running Benchmarks
 
 ### Run All Benchmarks
@@ -56,14 +62,19 @@ You can customize benchmark parameters:
 
 ```bash
 # Run with more iterations
-./gradlew :ambry-benchmarks:jmh -Pjmh.iterations=10
+./gradlew :ambry-benchmarks:jmh -Pjmh.iterations=5
 
 # Run with different fork count
 ./gradlew :ambry-benchmarks:jmh -Pjmh.fork=3
 
 # Run with specific blob size
 ./gradlew :ambry-benchmarks:jmh -Pjmh.params='blobSize=1024'
+
+# Run with longer iteration time
+./gradlew :ambry-benchmarks:jmh -Pjmh.timeOnIteration='20s'
 ```
+
+**Note**: The JMH configuration automatically picks up all benchmarks in the `com.github.ambry` package, so any new benchmarks you add will be included automatically.
 
 ## Results
 
@@ -149,11 +160,12 @@ public class MyBenchmark {
 ## Best Practices
 
 1. **Use Blackhole**: Always consume benchmark results with `Blackhole.consume()` to prevent JIT optimization from eliminating dead code
-2. **Warmup**: Include adequate warmup iterations (default: 3 iterations of 2 seconds each)
-3. **Measurement**: Use sufficient measurement iterations for statistical significance (default: 5 iterations)
+2. **Warmup**: Include adequate warmup iterations (default: 1 iteration of 10 seconds)
+3. **Measurement**: Use sufficient measurement iterations for statistical significance (default: 3 iterations of 10 seconds)
 4. **Fork**: Run multiple forks to account for JVM variability (default: 2 forks)
 5. **Fixed Seed**: Use fixed random seeds for reproducibility
 6. **Realistic Data**: Use realistic data sizes and patterns
+7. **Package Structure**: Place all benchmarks in `com.github.ambry.benchmarks` package to be automatically discovered
 
 ## References
 

@@ -31,10 +31,16 @@ jmh {
     // We'll set this in the benchmark annotations
 
     // Number of warmup iterations
-    warmupIterations = 3
+    warmupIterations = 1
+
+    // Warmup time per iteration (in seconds)
+    warmup = '10s'
 
     // Number of measurement iterations
-    iterations = 5
+    iterations = 3
+
+    // Measurement time per iteration (in seconds)
+    timeOnIteration = '10s'
 
     // Number of forks
     fork = 2
@@ -48,8 +54,8 @@ jmh {
     // Human-readable output
     humanOutputFile = project.file("${project.buildDir}/reports/jmh/human.txt")
 
-    // Include only Base64 benchmarks by default
-    includes = ['.*Base64Benchmark.*']
+    // Include all benchmarks in com.github.ambry package
+    includes = ['com\\.github\\.ambry\\..*']
 }
 
 // Make sure the jmh task doesn't run during normal builds

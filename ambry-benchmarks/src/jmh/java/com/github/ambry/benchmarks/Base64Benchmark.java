@@ -41,11 +41,16 @@ import org.openjdk.jmh.infra.Blackhole;
  * - 1 KB (typical small metadata or identifier)
  * - 128 KB (medium-sized blob)
  * - 4 MB (large blob)
+ * <p>
+ * Configuration:
+ * - Warmup: 1 iteration × 10 seconds
+ * - Measurement: 3 iterations × 10 seconds
+ * - Forks: 2
  */
 @BenchmarkMode({Mode.Throughput, Mode.AverageTime})
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
-@Warmup(iterations = 3, time = 2)
-@Measurement(iterations = 5, time = 2)
+@Warmup(iterations = 1, time = 10)
+@Measurement(iterations = 3, time = 10)
 @Fork(value = 2, jvmArgsAppend = {"-Xms2g", "-Xmx2g"})
 @State(Scope.Thread)
 public class Base64Benchmark {
