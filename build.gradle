@@ -185,7 +185,9 @@ subprojects {
             // Based on codebase analysis, these classes wrap ByteBuf in constructors:
             jvmArgs "-javaagent:${trackerJar.absolutePath}=" +
                 "include=com.github.ambry;" +
-                "exclude=com.github.ambry.protocol.FileCopyGetMetaDataResponse;" +
+                "exclude=com.github.ambry.protocol.FileCopyGetMetaDataResponse," +
+                "com.github.ambry.router.GetBlobOperation\$GetChunk," +
+                "com.github.ambry.router.GetBlobOperation\$FirstGetChunk;" +
                 "trackConstructors=" +
                 "com.github.ambry.messageformat.BlobData," +                       // Blob data wrapper
                 "com.github.ambry.network.SocketServerRequest," +                  // Socket-based request wrapper
@@ -259,7 +261,9 @@ subprojects {
             // Based on codebase analysis, these classes wrap ByteBuf in constructors:
             jvmArgs "-javaagent:${trackerJar.absolutePath}=" +
                 "include=com.github.ambry;" +
-                "exclude=com.github.ambry.protocol.FileCopyGetMetaDataResponse;" +
+                "exclude=com.github.ambry.protocol.FileCopyGetMetaDataResponse," +
+                "com.github.ambry.router.GetBlobOperation\$GetChunk," +
+                "com.github.ambry.router.GetBlobOperation\$FirstGetChunk;" +
                 "trackConstructors=" +
                 "com.github.ambry.messageformat.BlobData," +                       // Blob data wrapper
                 "com.github.ambry.network.SocketServerRequest," +                  // Socket-based request wrapper
