@@ -69,6 +69,15 @@ public class ByteBufFlowAgent {
                 .transform(new ConstructorTrackingTransformer());
         }
 
+        // Add ByteBuf lifecycle method tracking (release, retain)
+        // This tracks release() only when it drops refCnt to 0
+        System.out.println("[ByteBufFlowAgent] ByteBuf lifecycle tracking enabled (release/retain)");
+        agentBuilder = agentBuilder
+            .type(isSubTypeOf(io.netty.buffer.ByteBuf.class)
+                .and(not(isInterface()))
+                .and(not(isAbstract())))
+            .transform(new ByteBufLifecycleTransformer());
+
         agentBuilder.installOn(inst);
 
         System.out.println("[ByteBufFlowAgent] Instrumentation installed successfully");
@@ -158,7 +167,33 @@ public class ByteBufFlowAgent {
                 .intercept(Advice.to(ConstructorTrackingAdvice.class));
         }
     }
-    
+
+    /**
+     * Transformer that applies advice to ByteBuf lifecycle methods.
+     * Instruments release() and retain() methods to track reference count changes.
+     * Only records release() when it drops refCnt to 0, avoiding noise from
+     * intermediate release calls.
+     */
+    static class ByteBufLifecycleTransformer implements AgentBuilder.Transformer {
+        @Override
+        public DynamicType.Builder<?> transform(
+                DynamicType.Builder<?> builder,
+                TypeDescription typeDescription,
+                ClassLoader classLoader,
+                JavaModule module,
+                ProtectionDomain protectionDomain) {
+
+            return builder
+                .method(
+                    // Match release() and retain() methods
+                    (named("release").or(named("retain")))
+                    .and(isPublic())
+                    .and(not(isAbstract()))
+                )
+                .intercept(Advice.to(ByteBufLifecycleAdvice.class));
+        }
+    }
+
     /**
      * Setup JMX MBean for runtime monitoring
      */
