@@ -244,10 +244,55 @@ public class TrieRenderer {
         int pathCount = 0;
         int leakCount = 0;
     }
-    
+
+    /**
+     * Maximum recursion depth to prevent stack overflow when traversing cyclic graphs.
+     * Set to 100 levels, which is sufficient for any reasonable call chain while preventing
+     * infinite recursion on cycles.
+     */
+    private static final int MAX_PATH_DEPTH = 100;
+
+    /**
+     * Calculate path statistics for a trie node.
+     * This is the public entry point that initializes depth limiting and cycle detection.
+     */
     private PathStats calculatePathStats(TrieNode node) {
+        return calculatePathStats(node, new java.util.HashSet<>(), 0);
+    }
+
+    /**
+     * Calculate path statistics with depth limiting and cycle detection.
+     *
+     * @param node Current node to analyze
+     * @param visited Set of visited nodes for cycle detection
+     * @param depth Current recursion depth
+     * @return Statistics about paths and leaks
+     */
+    private PathStats calculatePathStats(TrieNode node, java.util.Set<TrieNode> visited, int depth) {
         PathStats stats = new PathStats();
-        
+
+        // Prevent stack overflow: stop at max depth or if we've seen this node (cycle)
+        if (depth >= MAX_PATH_DEPTH) {
+            // Truncated due to depth limit - count as single path
+            stats.pathCount = 1;
+            if (node.getRefCount() != 0) {
+                stats.leakCount = 1;
+            }
+            return stats;
+        }
+
+        if (visited.contains(node)) {
+            // Cycle detected - count as single path and stop recursion
+            stats.pathCount = 1;
+            if (node.getRefCount() != 0) {
+                stats.leakCount = 1;
+            }
+            return stats;
+        }
+
+        // Mark this node as visited for cycle detection
+        visited.add(node);
+
         if (node.isLeaf()) {
             stats.pathCount = 1;
             if (node.getRefCount() != 0) {
@@ -255,12 +300,16 @@ public class TrieRenderer {
             }
         } else {
             for (TrieNode child : node.getChildren().values()) {
-                PathStats childStats = calculatePathStats(child);
+                // Recurse with incremented depth, passing visited set
+                PathStats childStats = calculatePathStats(child, visited, depth + 1);
                 stats.pathCount += childStats.pathCount;
                 stats.leakCount += childStats.leakCount;
             }
         }
-        
+
+        // Backtrack: remove from visited to allow same node in different paths
+        visited.remove(node);
+
         return stats;
     }
 }
