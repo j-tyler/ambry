@@ -222,6 +222,62 @@ subprojects {
         }
     }
 
+    // ByteBuf Flow Tracker configuration
+    // Enable with: ./gradlew test -PwithByteBufTracking
+    def byteBufTrackingEnabled = project.hasProperty('withByteBufTracking') ||
+                                 project.hasProperty('enableByteBufTracking')
+
+    if (byteBufTrackingEnabled) {
+        // Default agent path (can be overridden with -Dbytebuf.agent.path=...)
+        def defaultAgentPath = System.getProperty('user.home') + '/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar'
+        def agentPath = System.getProperty('bytebuf.agent.path', defaultAgentPath)
+        def agentJar = file(agentPath)
+
+        // Configure test task with ByteBuf tracker
+        test {
+            doFirst {
+                if (!agentJar.exists()) {
+                    throw new GradleException(
+                        "ByteBuf tracker agent JAR not found at: ${agentJar}\n\n" +
+                        "To build the agent:\n" +
+                        "  1. Clone the repository:\n" +
+                        "     cd ~\n" +
+                        "     git clone https://github.com/j-tyler/bytebuddy-bytebuf-tracer.git\n" +
+                        "  2. Build with Maven:\n" +
+                        "     cd ~/bytebuddy-bytebuf-tracer\n" +
+                        "     mvn clean package -DskipTests\n\n" +
+                        "Or specify a custom path:\n" +
+                        "  ./gradlew test -PwithByteBufTracking -Dbytebuf.agent.path=/path/to/agent.jar"
+                    )
+                }
+                logger.lifecycle("ByteBuf Flow Tracker ENABLED")
+                logger.lifecycle("Using agent: ${agentJar}")
+            }
+
+            // Attach the Java agent with configuration
+            jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry"
+        }
+
+        // Configure intTest task with ByteBuf tracker
+        intTest {
+            doFirst {
+                if (!agentJar.exists()) {
+                    throw new GradleException(
+                        "ByteBuf tracker agent JAR not found at: ${agentJar}\n\n" +
+                        "Build it with:\n" +
+                        "  cd ~/bytebuddy-bytebuf-tracer && mvn clean package -DskipTests"
+                    )
+                }
+                logger.lifecycle("ByteBuf Flow Tracker ENABLED (integration tests)")
+                logger.lifecycle("Using agent: ${agentJar}")
+            }
+
+            jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry"
+        }
+    } else {
+        logger.info("ByteBuf Flow Tracker disabled. Enable with: -PwithByteBufTracking")
+    }
+
     task allTest {
         description = 'Runs unit and integration tests'
         group = 'verification'
