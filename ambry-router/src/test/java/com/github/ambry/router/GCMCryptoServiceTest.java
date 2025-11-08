@@ -348,4 +348,75 @@ public class GCMCryptoServiceTest {
     } catch (IllegalArgumentException e) {
     }
   }
+
+  /**
+   * Test that exposes the double-release bug in GCMCryptoService.decrypt() when decryption fails.
+   * This test simulates the exact flow in DecryptJob where:
+   * 1. DecryptJob calls decrypt() with encryptedBlobContent
+   * 2. Exception occurs during decryption
+   * 3. GCMCryptoService.decrypt() releases the INPUT buffer in catch block (BUG)
+   * 4. DecryptJob's finally block tries to release the same buffer (double-release)
+   * 5. IllegalReferenceCountException is thrown because refCnt is already 0
+   */
+  @Test
+  public void testDecryptDoubleReleaseBugOnException() throws Exception {
+    String key = TestUtils.getRandomKey(DEFAULT_KEY_SIZE_IN_CHARS);
+    Properties props = getKMSProperties(key, DEFAULT_KEY_SIZE_IN_CHARS);
+    VerifiableProperties verifiableProperties = new VerifiableProperties((props));
+    SecretKeySpec secretKeySpec = new SecretKeySpec(Hex.decode(key), "AES");
+    GCMCryptoService cryptoService =
+        (GCMCryptoService) new GCMCryptoServiceFactory(verifiableProperties, REGISTRY).getCryptoService();
+
+    // Create a valid encrypted buffer first
+    byte[] plainData = new byte[100];
+    TestUtils.RANDOM.nextBytes(plainData);
+    ByteBuf plainBuf = PooledByteBufAllocator.DEFAULT.ioBuffer(plainData.length);
+    plainBuf.writeBytes(plainData);
+    ByteBuf encryptedBlobContent = cryptoService.encrypt(plainBuf, secretKeySpec);
+    plainBuf.release();
+
+    // Corrupt the encrypted data to cause decryption failure
+    // Skip the IV (first 12 bytes) and corrupt the ciphertext
+    int corruptPosition = 20;
+    encryptedBlobContent.setByte(corruptPosition, (byte) (encryptedBlobContent.getByte(corruptPosition) ^ 0xFF));
+
+    // Verify initial reference count is 1
+    Assert.assertEquals("Initial refCnt should be 1", 1, encryptedBlobContent.refCnt());
+
+    // Simulate the exact DecryptJob flow
+    ByteBuf decryptedBlobContent = null;
+    Exception exception = null;
+    boolean doubleReleaseExceptionThrown = false;
+
+    try {
+      // This is line 84 in DecryptJob.java
+      decryptedBlobContent = cryptoService.decrypt(encryptedBlobContent, secretKeySpec);
+      Assert.fail("Decryption should have failed due to corrupted data");
+    } catch (GeneralSecurityException e) {
+      // This is line 89-94 in DecryptJob.java
+      exception = e;
+      if (decryptedBlobContent != null) {
+        decryptedBlobContent.release();
+        decryptedBlobContent = null;
+      }
+    } finally {
+      // This is line 95-99 in DecryptJob.java
+      // After decryption, we release the ByteBuf
+      if (encryptedBlobContent != null) {
+        try {
+          // BUG EXPOSED: GCMCryptoService.decrypt() already released this buffer in its catch block
+          // So refCnt is already 0, and this release() will throw IllegalReferenceCountException
+          encryptedBlobContent.release();
+        } catch (IllegalReferenceCountException e) {
+          // This exception indicates the double-release bug
+          doubleReleaseExceptionThrown = true;
+        }
+      }
+    }
+
+    // Verify the bug was exposed
+    Assert.assertNotNull("Decryption should have thrown GeneralSecurityException", exception);
+    Assert.assertTrue("Double-release bug should cause IllegalReferenceCountException",
+        doubleReleaseExceptionThrown);
+  }
 }
