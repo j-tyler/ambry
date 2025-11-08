@@ -269,7 +269,8 @@ subprojects {
             }
 
             // Attach the Java agent with configuration
-            jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry"
+            // Exclude Mockito internals to avoid ByteBuddy conflicts (Mockito uses ByteBuddy internally)
+            jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry;exclude=org.mockito"
 
             // Register test listener to print tracker output
             systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
@@ -289,7 +290,8 @@ subprojects {
                 logger.lifecycle("Using agent: ${agentJar}")
             }
 
-            jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry"
+            // Exclude Mockito internals to avoid ByteBuddy conflicts
+            jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry;exclude=org.mockito"
 
             // Register test listener to print tracker output
             systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
