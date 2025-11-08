@@ -95,7 +95,7 @@ class GetBlobOperation extends GetOperation {
   // whether the operationCallback has been called already.
   private final AtomicBoolean operationCallbackInvoked = new AtomicBoolean(false);
   // The first chunk may be a metadata chunk if the blob is composite, or the only data chunk if the blob is simple.
-  private final FirstGetChunk firstChunk;
+  final FirstGetChunk firstChunk;
   // the factory to use to deserialize keys in a metadata chunk.
   private final BlobIdFactory blobIdFactory;
   // To find the GetChunk to hand over the response quickly.
@@ -683,7 +683,7 @@ class GetBlobOperation extends GetOperation {
    * to retrieve one data chunk at a time. Once the associated chunk is successfully retrieved, this object can be
    * reinitialized and used to retrieve a subsequent chunk.
    */
-  private class GetChunk {
+  class GetChunk {
     // map of correlation id to the request metadata for every request issued for this operation.
     protected final Map<Integer, RequestInfo> correlationIdToGetRequestInfo = new LinkedHashMap<>();
     // progress tracker used to track whether the operation is completed or not and whether it succeeded or failed on complete
@@ -1484,7 +1484,7 @@ class GetBlobOperation extends GetOperation {
    * could either be a metadata chunk of a composite blob, or the single chunk of a simple blob,
    * and whether a chunk is composite or simple can only be determined after the first chunk is fetched.
    */
-  private class FirstGetChunk extends GetChunk {
+  class FirstGetChunk extends GetChunk {
 
     // refers to the blob type.
     protected BlobType blobType;

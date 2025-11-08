@@ -2064,8 +2064,8 @@ public class GetBlobOperationTest {
         new GetBlobOperation(routerConfig, routerMetrics, mockClusterMap, responseHandler, blobId, options, null,
             routerCallback, blobIdFactory, kms, cryptoService, cryptoJobHandler, time, false, quotaChargeCallback,
             this.blobMetadataCache, router, compressionService);
-    Object firstChunk = FieldUtils.readField(op, "firstChunk", true);
-    FieldUtils.writeField(firstChunk, "isChunkCompressed", true, true);
+    // Access firstChunk directly (now package-private for testing)
+    op.firstChunk.isChunkCompressed = true;
 
     // Generate the test compressed buffer.
     ByteBuffer sourceBuffer =
@@ -2076,8 +2076,7 @@ public class GetBlobOperationTest {
 
     // Invoke the decompressContent method on the compressed buffer.
     ByteBuf compressedByteBuf = Unpooled.wrappedBuffer((ByteBuffer) compressedBuffer.flip());
-    ByteBuf decompressedByteBuf =
-        (ByteBuf) MethodUtils.invokeMethod(firstChunk, true, "decompressContent", compressedByteBuf);
+    ByteBuf decompressedByteBuf = op.firstChunk.decompressContent(compressedByteBuf);
     byte[] decompressedData = new byte[decompressedByteBuf.readableBytes()];
     decompressedByteBuf.readBytes(decompressedData);
     decompressedByteBuf.release();
