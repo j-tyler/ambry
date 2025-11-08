@@ -229,8 +229,20 @@ subprojects {
 
     if (byteBufTrackingEnabled) {
         // Default agent path (can be overridden with -Dbytebuf.agent.path=...)
-        def defaultAgentPath = System.getProperty('user.home') + '/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar'
-        def agentPath = System.getProperty('bytebuf.agent.path', defaultAgentPath)
+        // Try multiple common locations
+        def agentPath = System.getProperty('bytebuf.agent.path')
+        if (agentPath == null) {
+            def possiblePaths = [
+                System.getProperty('user.home') + '/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar',
+                System.getProperty('user.home') + '/personal-ws/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar',
+                System.getProperty('user.home') + '/workspace/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar'
+            ]
+            // Find the first path that exists
+            agentPath = possiblePaths.find { file(it).exists() }
+            if (agentPath == null) {
+                agentPath = possiblePaths[0] // Use first as default for error message
+            }
+        }
         def agentJar = file(agentPath)
 
         // Configure test task with ByteBuf tracker
@@ -240,14 +252,16 @@ subprojects {
                     throw new GradleException(
                         "ByteBuf tracker agent JAR not found at: ${agentJar}\n\n" +
                         "To build the agent:\n" +
-                        "  1. Clone the repository:\n" +
-                        "     cd ~\n" +
+                        "  1. Clone the repository (if not already cloned):\n" +
                         "     git clone https://github.com/j-tyler/bytebuddy-bytebuf-tracer.git\n" +
                         "  2. Build with Maven:\n" +
-                        "     cd ~/bytebuddy-bytebuf-tracer\n" +
+                        "     cd /path/to/bytebuddy-bytebuf-tracer\n" +
                         "     mvn clean package -DskipTests\n\n" +
-                        "Or specify a custom path:\n" +
-                        "  ./gradlew test -PwithByteBufTracking -Dbytebuf.agent.path=/path/to/agent.jar"
+                        "IMPORTANT: Use the agent JAR from bytebuf-flow-tracker module:\n" +
+                        "  .../bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar\n" +
+                        "  (NOT bytebuf-flow-integration-tests or other modules)\n\n" +
+                        "Or specify the correct path:\n" +
+                        "  ./gradlew test -PwithByteBufTracking -Dbytebuf.agent.path=/path/to/bytebuf-flow-tracker-agent.jar"
                     )
                 }
                 logger.lifecycle("ByteBuf Flow Tracker ENABLED")
