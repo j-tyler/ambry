@@ -180,11 +180,12 @@ subprojects {
 
             // Configure ByteBuf tracking with constructor tracking for all wrapper classes
             // trackConstructors enables tracking ByteBufs passed to constructors and stored as fields
-            // exclude prevents instrumentation of packages that are frequently mocked in tests (avoids Mockito conflicts)
+            // exclude prevents instrumentation of specific classes that conflict with Mockito inline mocking
+            // Add classes here as Mockito conflicts are discovered during testing
             // Based on codebase analysis, these classes wrap ByteBuf in constructors:
             jvmArgs "-javaagent:${trackerJar.absolutePath}=" +
                 "include=com.github.ambry;" +
-                "exclude=com.github.ambry.protocol,com.github.ambry.filetransfer,com.github.ambry.store;" +
+                "exclude=com.github.ambry.protocol.FileCopyGetMetaDataResponse;" +
                 "trackConstructors=" +
                 "com.github.ambry.messageformat.BlobData," +                       // Blob data wrapper
                 "com.github.ambry.network.SocketServerRequest," +                  // Socket-based request wrapper
@@ -253,11 +254,12 @@ subprojects {
 
             // Configure ByteBuf tracking with constructor tracking for all wrapper classes
             // trackConstructors enables tracking ByteBufs passed to constructors and stored as fields
-            // exclude prevents instrumentation of packages that are frequently mocked in tests (avoids Mockito conflicts)
+            // exclude prevents instrumentation of specific classes that conflict with Mockito inline mocking
+            // Add classes here as Mockito conflicts are discovered during testing
             // Based on codebase analysis, these classes wrap ByteBuf in constructors:
             jvmArgs "-javaagent:${trackerJar.absolutePath}=" +
                 "include=com.github.ambry;" +
-                "exclude=com.github.ambry.protocol,com.github.ambry.filetransfer,com.github.ambry.store;" +
+                "exclude=com.github.ambry.protocol.FileCopyGetMetaDataResponse;" +
                 "trackConstructors=" +
                 "com.github.ambry.messageformat.BlobData," +                       // Blob data wrapper
                 "com.github.ambry.network.SocketServerRequest," +                  // Socket-based request wrapper
