@@ -48,6 +48,10 @@ public class ByteBufFlowAgent {
                 .or(nameStartsWith("com.sun."))
                 .or(nameStartsWith("jdk."))
                 .or(nameStartsWith("com.example.bytebuf.tracker.")) // Don't instrument ourselves
+                .or(nameStartsWith("org.mockito."))                  // Don't instrument Mockito
+                .or(nameContains("$$EnhancerByMockito$$"))            // Don't instrument Mockito-enhanced classes
+                .or(nameContains("$MockitoMock$"))                    // Don't instrument Mockito mocks
+                .or(nameContains("$ByteBuddy$"))                      // Don't instrument ByteBuddy-generated classes
             )
             // Transform regular methods (non-constructors)
             .type(config.getTypeMatcher())
