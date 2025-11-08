@@ -48,6 +48,7 @@ public class ByteBufFlowAgent {
                 .or(nameStartsWith("sun."))
                 .or(nameStartsWith("com.sun."))
                 .or(nameStartsWith("jdk."))
+                .or(nameStartsWith("org.mockito.")) // Don't instrument Mockito internal classes
                 .or(nameStartsWith("com.example.bytebuf.tracker.")) // Don't instrument ourselves
                 .or(isSynthetic()) // Don't instrument compiler-generated classes
             )

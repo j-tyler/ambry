@@ -19,11 +19,13 @@ import net.bytebuddy.asm.Advice;
 public class ByteBufLifecycleAdvice {
 
     // Re-entrance guard to prevent infinite recursion
-    private static final ThreadLocal<Boolean> IS_TRACKING =
+    // PUBLIC: Must be accessible from instrumented classes in different packages
+    public static final ThreadLocal<Boolean> IS_TRACKING =
         ThreadLocal.withInitial(() -> false);
 
     // ThreadLocal to store refCnt before the method call
-    private static final ThreadLocal<Integer> BEFORE_REF_COUNT =
+    // PUBLIC: Must be accessible from instrumented classes in different packages
+    public static final ThreadLocal<Integer> BEFORE_REF_COUNT =
         ThreadLocal.withInitial(() -> 0);
 
     /**
