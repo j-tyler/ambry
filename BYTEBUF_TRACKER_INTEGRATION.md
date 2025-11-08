@@ -23,10 +23,7 @@ Simply add `-PwithByteBufTracking` to any Gradle command:
 
 ```bash
 # Build with tracking enabled
-./gradlew allJar -PwithByteBufTracking
-
-# Run tests with tracking
-./gradlew test -PwithByteBufTracking
+./gradlew build -PwithByteBufTracking
 
 # Run integration tests with tracking
 ./gradlew intTest -PwithByteBufTracking
@@ -43,7 +40,7 @@ Simply add `-PwithByteBufTracking` to any Gradle command:
 Simply omit the flag:
 
 ```bash
-./gradlew test
+./gradlew build
 ```
 
 Tests run normally with no overhead.
@@ -160,9 +157,9 @@ jvmArgs "-javaagent:${trackerJar.absolutePath}=include=com.github.ambry;exclude=
 All of these work:
 
 ```bash
-./gradlew test -PwithByteBufTracking
-./gradlew test -PenableByteBufTracking
-./gradlew test -DenableByteBufTracking=true
+./gradlew build -PwithByteBufTracking
+./gradlew build -PenableByteBufTracking
+./gradlew build -DenableByteBufTracking=true
 ```
 
 ### JMX Monitoring
@@ -198,7 +195,7 @@ jconsole localhost:9999
 
 **Solution**: Make sure to use the `-PwithByteBufTracking` flag:
 ```bash
-./gradlew test -PwithByteBufTracking
+./gradlew build -PwithByteBufTracking
 ```
 
 The flag tells Gradle to build the agent JAR before running tests.
@@ -211,7 +208,7 @@ The flag tells Gradle to build the agent JAR before running tests.
 1. Verify you used the flag: `-PwithByteBufTracking`
 2. Check agent was loaded:
    ```bash
-   ./gradlew test -PwithByteBufTracking --info | grep "ByteBuf"
+   ./gradlew build -PwithByteBufTracking --info | grep "ByteBuf"
    ```
    You should see: `Using ByteBuf Flow Tracker agent: ...`
 3. Verify ByteBufs are actually used in your tests
@@ -224,13 +221,13 @@ The flag tells Gradle to build the agent JAR before running tests.
 
 1. **Network connectivity issues** (dependencies can't download):
    ```bash
-   ./gradlew test -PwithByteBufTracking --refresh-dependencies
+   ./gradlew build -PwithByteBufTracking --refresh-dependencies
    ```
 
 2. **Gradle daemon issues**:
    ```bash
    ./gradlew --stop
-   ./gradlew test -PwithByteBufTracking --no-daemon
+   ./gradlew build -PwithByteBufTracking --no-daemon
    ```
 
 3. **Java version compatibility**:
@@ -350,7 +347,7 @@ bytebuf-tracker/src/main/java/
 
 1. **Run tests with tracker periodically**:
    ```bash
-   ./gradlew test -PwithByteBufTracking
+   ./gradlew build -PwithByteBufTracking
    ```
 
 2. **Fix leaks immediately** - Don't accumulate technical debt
@@ -361,13 +358,6 @@ bytebuf-tracker/src/main/java/
    jvmArgs "-javaagent:...=include=com.github.ambry.mymodule"
    ```
 
-### In CI/CD
-
-1. **Run selectively** - Not on every build (performance)
-2. **Schedule nightly** - Deep leak analysis overnight
-3. **Fail on leaks** - Configure to fail build if leaks detected
-4. **Archive reports** - Save output for trend analysis
-
 ### Debugging Leaks
 
 1. **Start broad** - Track entire package
@@ -376,28 +366,11 @@ bytebuf-tracker/src/main/java/
 4. **Examine flow tree** - Understand ByteBuf journey
 5. **Fix root cause** - Not just symptoms
 
-## Migration from Shell Scripts
-
-**Old approach (deprecated):**
-```bash
-./build-bytebuf-tracker.sh  # Build agent
-./gradlew test              # Run tests (auto-detected)
-```
-
-**New approach (recommended):**
-```bash
-./gradlew test -PwithByteBufTracking  # One command!
-```
-
-The shell scripts (`build-bytebuf-tracker.sh`, `build-bytebuf-tracker-maven.sh`) are kept for backward compatibility but are no longer needed.
-
 ## Related Documentation
 
-- **CONSTRUCTOR_TRACKING.md** - Comprehensive guide to constructor tracking for wrapped objects (⭐ NEW!)
-- **README-BYTEBUF-TRACKING.md** - Simple usage guide
-- **bytebuf-tracker/QUICKSTART.md** - Quick reference
-- **GRADLE-INTEGRATION-SUMMARY.md** - Migration guide from shell scripts
-- **modules/bytebuddy-bytebuf-tracer/README.md** - Original tracker documentation
+- **CONSTRUCTOR_TRACKING.md** - Comprehensive guide to constructor tracking for wrapped objects
+- **bytebuf-tracker/README.md** - Tracker module overview
+- **bytebuf-tracker/UPSTREAM_README.md** - Upstream project documentation
 
 ## External Resources
 
@@ -406,14 +379,14 @@ The shell scripts (`build-bytebuf-tracker.sh`, `build-bytebuf-tracker-maven.sh`)
 - [Java Agents Tutorial](https://www.baeldung.com/java-instrumentation)
 - [Original ByteBuf Flow Tracker](https://github.com/j-tyler/bytebuddy-bytebuf-tracer)
 
-## Support & Contributing
+## Support & Troubleshooting
 
 ### Getting Help
 
 1. Check troubleshooting section above
 2. Verify agent JAR exists: `ls -lh bytebuf-tracker/build/libs/bytebuf-tracker-agent.jar`
-3. Run with verbose logging: `./gradlew test -PwithByteBufTracking --info`
-4. Review recent commits for similar issues
+3. Run with verbose logging: `./gradlew build -PwithByteBufTracking --info`
+4. Review documentation files listed in Related Documentation section
 
 ### Reporting Issues
 
@@ -423,16 +396,6 @@ When reporting issues, include:
 - Java version: `java -version`
 - Gradle version: `./gradlew --version`
 - Whether agent JAR was built successfully
-
-### Future Enhancements
-
-Potential improvements:
-- Automatic leak threshold enforcement in CI
-- HTML report generation with visual flow diagrams
-- Per-test leak isolation and reporting
-- Historical trend tracking
-- Custom object tracking beyond ByteBuf
-- Integration with other memory analysis tools
 
 ## License
 

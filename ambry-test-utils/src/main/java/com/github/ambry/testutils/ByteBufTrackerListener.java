@@ -85,11 +85,11 @@ public class ByteBufTrackerListener extends RunListener {
       report.append("End of ByteBuf Flow Tracker Report\n");
       report.append(SEPARATOR_LINE).append("\n");
 
-      // Write to file instead of stdout (Gradle captures stdout)
-      writeReportToFile(report.toString());
+      // Print to stdout so it's visible in the terminal
+      System.out.println(report.toString());
 
-      // Also print a notification to stdout
-      System.out.println("\n[ByteBufTracker] Report written to: " + getReportFile().getAbsolutePath());
+      // Also write to file for record keeping
+      writeReportToFile(report.toString());
 
     } catch (ClassNotFoundException e) {
       // Tracker not available - agent not running or not in classpath
