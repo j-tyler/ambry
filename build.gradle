@@ -256,6 +256,9 @@ subprojects {
 
             // Attach the Java agent with configuration
             jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry"
+
+            // Register test listener to print tracker output
+            systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
         }
 
         // Configure intTest task with ByteBuf tracker
@@ -273,6 +276,9 @@ subprojects {
             }
 
             jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry"
+
+            // Register test listener to print tracker output
+            systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
         }
     } else {
         logger.info("ByteBuf Flow Tracker disabled. Enable with: -PwithByteBufTracking")
