@@ -184,6 +184,77 @@ subprojects {
         systemProperty 'io.netty.leakDetection.level', 'paranoid'
     }
 
+    // ByteBuf Flow Tracker JVM configuration for test tasks
+    // The agent build tasks are defined at the root level below
+    def byteBufTrackingEnabled = project.hasProperty('withByteBufTracking') ||
+                                 project.hasProperty('enableByteBufTracking')
+
+    if (byteBufTrackingEnabled) {
+        def agentJar = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar")
+
+        // Ensure the agent is built before tests run (reference root-level task)
+        test.dependsOn rootProject.tasks.named('buildByteBufAgent')
+        intTest.dependsOn rootProject.tasks.named('buildByteBufAgent')
+
+        // Configure test task with ByteBuf tracker
+        test {
+            doFirst {
+                logger.lifecycle("ByteBuf Flow Tracker ENABLED")
+                logger.lifecycle("Using agent: ${agentJar}")
+            }
+
+            // Attach the Java agent with configuration
+            // - include: Track all com.github.ambry packages
+            // - exclude: Exclude specific classes to avoid Mockito conflicts
+            //   * org.mockito - Mockito framework itself
+            //   * MySqlAccountStore - Mocked in account service tests
+            // - trackConstructors: Track ByteBuf wrappers that store ByteBuf in constructors
+            jvmArgs "-javaagent:${agentJar.absolutePath}=" +
+                "include=com.github.ambry;" +
+                "exclude=org.mockito,com.github.ambry.account.mysql.MySqlAccountStore;" +
+                "trackConstructors=" +
+                    "com.github.ambry.messageformat.BlobData," +                       // Blob data wrapper
+                    "com.github.ambry.network.SocketServerRequest," +                  // Socket request wrapper
+                    "com.github.ambry.network.NettyServerRequest," +                   // Netty request wrapper
+                    "com.github.ambry.network.ResponseInfo," +                         // Network response wrapper
+                    "com.github.ambry.router.EncryptJob," +                            // Encryption job
+                    "com.github.ambry.router.EncryptJob\$EncryptJobResult," +          // Encryption result (inner class)
+                    "com.github.ambry.router.DecryptJob," +                            // Decryption job
+                    "com.github.ambry.rest.NettyResponseChannel\$Chunk," +             // Response chunk (inner class)
+                    "com.github.ambry.utils.NettyByteBufDataInputStream"               // ByteBuf to InputStream wrapper
+
+            // Register test listener to print tracker output
+            systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
+        }
+
+        // Configure intTest task with ByteBuf tracker
+        intTest {
+            doFirst {
+                logger.lifecycle("ByteBuf Flow Tracker ENABLED (integration tests)")
+                logger.lifecycle("Using agent: ${agentJar}")
+            }
+
+            // Same configuration as test task
+            jvmArgs "-javaagent:${agentJar.absolutePath}=" +
+                "include=com.github.ambry;" +
+                "exclude=org.mockito,com.github.ambry.account.mysql.MySqlAccountStore;" +
+                "trackConstructors=" +
+                    "com.github.ambry.messageformat.BlobData," +
+                    "com.github.ambry.network.SocketServerRequest," +
+                    "com.github.ambry.network.NettyServerRequest," +
+                    "com.github.ambry.network.ResponseInfo," +
+                    "com.github.ambry.router.EncryptJob," +
+                    "com.github.ambry.router.EncryptJob\$EncryptJobResult," +
+                    "com.github.ambry.router.DecryptJob," +
+                    "com.github.ambry.rest.NettyResponseChannel\$Chunk," +
+                    "com.github.ambry.utils.NettyByteBufDataInputStream"
+
+            systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
+        }
+    } else {
+        logger.info("ByteBuf Flow Tracker disabled. Enable with: -PwithByteBufTracking")
+    }
+
     task allTest {
         description = 'Runs unit and integration tests'
         group = 'verification'
@@ -197,6 +268,89 @@ subprojects {
         // Previously, javadocs weren't being compiled, but now shipkit automatically enables this build step
         options.addStringOption('Xdoclint:none', '-quiet') // Suppress lint warnings
         failOnError = false
+    }
+}
+
+// ByteBuf Flow Tracker agent build tasks (root level)
+// These tasks are defined once at the root level and referenced by all subproject test tasks
+// Enable with: ./gradlew test -PwithByteBufTracking
+
+// Task to initialize the ByteBuf tracker git submodule
+task initByteBufTrackerSubmodule(type: Exec) {
+    description = 'Initializes the ByteBuf Flow Tracker git submodule'
+    group = 'build'
+
+    def submoduleDir = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer")
+
+    workingDir rootProject.projectDir
+    commandLine 'git', 'submodule', 'update', '--init', '--', 'modules/bytebuddy-bytebuf-tracer'
+
+    // Only run if submodule is not already initialized
+    onlyIf {
+        !file("${submoduleDir}/bytebuf-flow-tracker/pom.xml").exists()
+    }
+
+    doFirst {
+        logger.lifecycle("Initializing ByteBuf tracker submodule...")
+    }
+}
+
+// Task to build the ByteBuf tracker agent from the git submodule
+// This runs once before any tests, not once per subproject
+task buildByteBufAgent(type: Exec) {
+    description = 'Builds the ByteBuf Flow Tracker agent from the git submodule using Maven'
+    group = 'build'
+
+    dependsOn initByteBufTrackerSubmodule
+
+    def submoduleDir = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer")
+    def agentJar = file("${submoduleDir}/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar")
+
+    workingDir submoduleDir
+    commandLine 'mvn', 'clean', 'package', '-DskipTests'
+
+    doFirst {
+        // Check if Maven is available
+        try {
+            def mvnCheck = new ProcessBuilder('mvn', '--version').start()
+            mvnCheck.waitFor()
+            if (mvnCheck.exitValue() != 0) {
+                throw new Exception("Maven command failed")
+            }
+        } catch (Exception e) {
+            throw new GradleException(
+                "Maven is required to build the ByteBuf tracker agent but was not found.\n\n" +
+                "Please install Maven:\n" +
+                "  macOS:    brew install maven\n" +
+                "  Ubuntu:   sudo apt-get install maven\n" +
+                "  Windows:  choco install maven\n" +
+                "  Other:    https://maven.apache.org/download.cgi\n\n" +
+                "Or run tests without ByteBuf tracking:\n" +
+                "  ./gradlew test"
+            )
+        }
+    }
+
+    // Only run if the submodule exists (after init)
+    onlyIf {
+        if (!submoduleDir.exists() || !file("${submoduleDir}/bytebuf-flow-tracker/pom.xml").exists()) {
+            throw new GradleException(
+                "ByteBuf tracker submodule not initialized at: ${submoduleDir}\n\n" +
+                "This should have been initialized automatically, but failed.\n" +
+                "Try manually running:\n" +
+                "  git submodule init\n" +
+                "  git submodule update"
+            )
+        }
+        true
+    }
+
+    // Skip if the JAR is already up-to-date (simple optimization)
+    outputs.file(agentJar)
+    // Only set inputs if the directory exists to avoid configuration-time errors
+    def srcDir = file("${submoduleDir}/bytebuf-flow-tracker/src")
+    if (srcDir.exists()) {
+        inputs.dir(srcDir)
     }
 }
 
