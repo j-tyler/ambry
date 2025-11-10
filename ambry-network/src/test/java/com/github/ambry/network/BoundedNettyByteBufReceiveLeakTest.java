@@ -164,18 +164,24 @@ public class BoundedNettyByteBufReceiveLeakTest {
     int requestSize = 100;
 
     // Create a channel that succeeds for size header but fails for content
+    // IMPORTANT: Must return 0 after size to force readFrom() to return before trying content
     ReadableByteChannel faultingChannel = new ReadableByteChannel() {
-      private boolean sizeRead = false;
+      private int readCount = 0;
 
       @Override
       public int read(ByteBuffer dst) throws IOException {
-        if (!sizeRead) {
+        if (readCount == 0) {
           // First read: return the size header
           dst.putLong(requestSize);
-          sizeRead = true;
+          readCount++;
           return Long.BYTES;
+        } else if (readCount == 1) {
+          // Second read: return 0 to simulate no data available yet
+          // This causes readFrom() to return without reading content
+          readCount++;
+          return 0;
         } else {
-          // Second read: throw IOException during content read
+          // Third read: throw IOException during content read
           throw new IOException("Simulated network error during content read");
         }
       }
@@ -192,7 +198,7 @@ public class BoundedNettyByteBufReceiveLeakTest {
 
     BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
 
-    // First call reads size successfully
+    // First call reads size successfully and returns when no content available
     long bytesRead = receive.readFrom(faultingChannel);
     Assert.assertEquals("Should have read size header", Long.BYTES, bytesRead);
 
@@ -343,17 +349,23 @@ public class BoundedNettyByteBufReceiveLeakTest {
   public void testEOFExceptionDuringContentRead() throws Exception {
     int requestSize = 100;
 
+    // Must return 0 after size to force readFrom() to return before trying content
     ReadableByteChannel eofChannel = new ReadableByteChannel() {
-      private boolean sizeRead = false;
+      private int readCount = 0;
 
       @Override
       public int read(ByteBuffer dst) throws IOException {
-        if (!sizeRead) {
+        if (readCount == 0) {
           dst.putLong(requestSize);
-          sizeRead = true;
+          readCount++;
           return Long.BYTES;
+        } else if (readCount == 1) {
+          // Return 0 to simulate no data available yet
+          // This causes readFrom() to return without reading content
+          readCount++;
+          return 0;
         }
-        return -1; // EOF during content read
+        return -1; // EOF during content read on third call
       }
 
       @Override
@@ -368,8 +380,9 @@ public class BoundedNettyByteBufReceiveLeakTest {
 
     BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
 
-    // First call reads size
-    receive.readFrom(eofChannel);
+    // First call reads size and returns when no content available
+    long bytesRead = receive.readFrom(eofChannel);
+    Assert.assertEquals("Should have read size header", Long.BYTES, bytesRead);
 
     // Second call should throw EOFException during content read
     IOException caughtException = null;
