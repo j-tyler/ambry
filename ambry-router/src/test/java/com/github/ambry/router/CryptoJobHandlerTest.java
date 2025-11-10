@@ -589,6 +589,104 @@ public class CryptoJobHandlerTest {
   }
 
   /**
+   * Test that closeJob() properly releases encryptedBlobContent when called before run().
+   * Tests the fix for DecryptJob.closeJob() memory leak.
+   */
+  @Test
+  public void testDecryptJobCloseBeforeRunReleasesBuffer() throws Exception {
+    TestBlobData testBlobData = getRandomBlob(referenceClusterMap);
+    ByteBuf blobContent = testBlobData.blobContent;
+
+    SecretKeySpec perBlobKey = kms.getRandomKey();
+    ByteBuf encryptedContent = cryptoService.encrypt(blobContent, perBlobKey);
+    blobContent.release();
+
+    SecretKeySpec containerKey = kms.getKey(null, testBlobData.blobId.getAccountId(),
+        testBlobData.blobId.getContainerId());
+    ByteBuffer encryptedKey = cryptoService.encryptKey(perBlobKey, containerKey);
+
+    CountDownLatch latch = new CountDownLatch(1);
+    DecryptJob job = new DecryptJob(testBlobData.blobId, encryptedKey, encryptedContent, null,
+        cryptoService, kms, null, new CryptoJobMetricsTracker(new CryptoJobMetrics(
+            CryptoJobHandlerTest.class, DECRYPT_JOB_TYPE, REGISTRY)),
+        (result, exception) -> latch.countDown());
+
+    // Close before running - this should release encryptedContent
+    job.closeJob(new GeneralSecurityException("Aborted before execution"));
+
+    assertTrue("Callback should complete", latch.await(5, TimeUnit.SECONDS));
+    // NettyByteBufLeakHelper will detect any leaks
+  }
+
+  /**
+   * Test that closeJob() is idempotent and can be called multiple times safely.
+   * Tests the AtomicBoolean-based idempotency fix.
+   */
+  @Test
+  public void testDecryptJobCloseIdempotent() throws Exception {
+    TestBlobData testBlobData = getRandomBlob(referenceClusterMap);
+    ByteBuf blobContent = testBlobData.blobContent;
+
+    SecretKeySpec perBlobKey = kms.getRandomKey();
+    ByteBuf encryptedContent = cryptoService.encrypt(blobContent, perBlobKey);
+    blobContent.release();
+
+    SecretKeySpec containerKey = kms.getKey(null, testBlobData.blobId.getAccountId(),
+        testBlobData.blobId.getContainerId());
+    ByteBuffer encryptedKey = cryptoService.encryptKey(perBlobKey, containerKey);
+
+    CountDownLatch latch = new CountDownLatch(1);
+    DecryptJob job = new DecryptJob(testBlobData.blobId, encryptedKey, encryptedContent, null,
+        cryptoService, kms, null, new CryptoJobMetricsTracker(new CryptoJobMetrics(
+            CryptoJobHandlerTest.class, DECRYPT_JOB_TYPE, REGISTRY)),
+        (result, exception) -> latch.countDown());
+
+    // Call closeJob() multiple times - should not cause double-release
+    job.closeJob(new GeneralSecurityException("First close"));
+    assertTrue("Callback should complete", latch.await(5, TimeUnit.SECONDS));
+
+    job.closeJob(new GeneralSecurityException("Second close"));
+    // No IllegalReferenceCountException should occur
+  }
+
+  /**
+   * Test that normal decrypt execution doesn't leak.
+   * Baseline test for DecryptJob memory management.
+   */
+  @Test
+  public void testDecryptJobNormalExecutionNoLeak() throws Exception {
+    TestBlobData testBlobData = getRandomBlob(referenceClusterMap);
+    ByteBuf blobContent = testBlobData.blobContent;
+
+    SecretKeySpec perBlobKey = kms.getRandomKey();
+    ByteBuf encryptedContent = cryptoService.encrypt(blobContent, perBlobKey);
+    blobContent.release();
+
+    SecretKeySpec containerKey = kms.getKey(null, testBlobData.blobId.getAccountId(),
+        testBlobData.blobId.getContainerId());
+    ByteBuffer encryptedKey = cryptoService.encryptKey(perBlobKey, containerKey);
+
+    CountDownLatch latch = new CountDownLatch(1);
+    List<DecryptJob.DecryptJobResult> results = new CopyOnWriteArrayList<>();
+    DecryptJob job = new DecryptJob(testBlobData.blobId, encryptedKey, encryptedContent, null,
+        cryptoService, kms, null, new CryptoJobMetricsTracker(new CryptoJobMetrics(
+            CryptoJobHandlerTest.class, DECRYPT_JOB_TYPE, REGISTRY)),
+        (result, exception) -> {
+          results.add(result);
+          latch.countDown();
+        });
+
+    job.run();
+
+    assertTrue("Callback should complete", latch.await(5, TimeUnit.SECONDS));
+    assertEquals("Should have one result", 1, results.size());
+    assertNotNull("Should have decrypted content", results.get(0).getDecryptedBlobContent());
+
+    // Caller must release the result
+    results.get(0).getDecryptedBlobContent().release();
+  }
+
+  /**
    * Mode to represent the entity that needs to be tested for encryption and decryption
    */
   enum Mode {
