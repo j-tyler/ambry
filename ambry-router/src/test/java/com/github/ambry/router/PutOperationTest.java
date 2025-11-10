@@ -1454,20 +1454,13 @@ public class PutOperationTest {
     //   3. Constructor never completes → retainedDuplicate orphaned
     // The leak happens immediately before fillChunks() returns - no sleep needed!
 
-    System.out.println("DEBUG: About to call fillChunks()");
-    System.out.println("DEBUG: Blob isEncrypted = " + blobProperties.isEncrypted());
-    System.out.println("DEBUG: Blob size = " + blobProperties.getBlobSize());
-
     op.fillChunks();
 
-    System.out.println("DEBUG: fillChunks() completed");
-    System.out.println("DEBUG: Operation exception = " + op.getOperationException());
-
-    // Clean up crypto job handler
-    cryptoJobHandler.close();
-
-    // When afterTest() runs, NettyByteBufLeakHelper will detect the leaked retainedDuplicate
-    // TEST WILL FAIL with: "HeapMemoryLeak: [allocation|deallocation] before test[0|0], after test[1|0]"
+    // Force test to show diagnostic info
+    fail("DEBUG: isEncrypted=" + blobProperties.isEncrypted() +
+         ", blobSize=" + blobProperties.getBlobSize() +
+         ", operationException=" + op.getOperationException() +
+         ", isDone=" + op.isOperationComplete());
   }
 
 }
