@@ -77,7 +77,8 @@ echo ""
 echo "------------------------------------------------------------------------------------------------------"
 echo ""
 
-# Run the bug tests
+# Run the bug tests (allow to fail without exiting script)
+set +e  # Temporarily disable exit-on-error
 ./gradlew :ambry-commons:test \
     --tests 'ByteBufferAsyncWritableChannelBugTest*' \
     --tests 'UnpooledWrapperLeakProofTest*' \
@@ -87,6 +88,7 @@ echo ""
     $BYTEBUF_TRACKING
 
 TEST_EXIT_CODE=$?
+set -e  # Re-enable exit-on-error
 
 echo ""
 echo "======================================================================================================"
