@@ -1374,7 +1374,6 @@ public class PutOperationTest {
    * AFTER FIX: Add try-catch around lines 1570-1574 to release buf on exception
    */
   @Test
-  @org.junit.Ignore("PRODUCTION BUG: Will fail until PutOperation.java:1562-1576 is fixed with try-catch")
   public void testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer() throws Exception {
     // Create a ByteBuf that will throw during nioBuffers()
     ByteBuf compressedBuffer = new ThrowingNioBuffersByteBuf(2048);
@@ -1429,7 +1428,6 @@ public class PutOperationTest {
    * AFTER FIX: Add try-catch around lines 1500-1502 to release buf on exception
    */
   @Test
-  @org.junit.Ignore("PRODUCTION BUG: Will fail until PutOperation.java:1498-1503 is fixed with try-catch")
   public void testProductionBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer() throws Exception {
     // Create encrypted buffer that will throw during nioBuffers()
     ByteBuf encryptedBuffer = new ThrowingNioBuffersByteBuf(4096);
@@ -1487,7 +1485,6 @@ public class PutOperationTest {
    * AFTER FIX: Pre-evaluate arguments and wrap in try-catch to release on error
    */
   @Test
-  @org.junit.Ignore("PRODUCTION BUG: Will fail until PutOperation.java:1589-1592 is fixed")
   public void testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer() throws Exception {
     // Create original buffer
     ByteBuf originalBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(4096);
