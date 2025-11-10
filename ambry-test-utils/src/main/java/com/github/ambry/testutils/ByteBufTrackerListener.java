@@ -55,15 +55,22 @@ public class ByteBufTrackerListener extends RunListener {
    */
   private void registerCustomHandler() {
     if (handlerRegistered) {
+      System.out.println("[ByteBufTrackerListener] Handler already registered, skipping");
       return;
     }
 
+    System.out.println("[ByteBufTrackerListener] Attempting to register custom handler...");
     try {
       // Load the ObjectTrackerRegistry
+      System.out.println("[ByteBufTrackerListener] Loading " + REGISTRY_CLASS);
       Class<?> registryClass = Class.forName(REGISTRY_CLASS);
+      System.out.println("[ByteBufTrackerListener] Registry class loaded successfully");
 
       // Create and register our custom handler
+      System.out.println("[ByteBufTrackerListener] Creating AmbryByteBufObjectHandler instance");
       AmbryByteBufObjectHandler handler = new AmbryByteBufObjectHandler();
+      System.out.println("[ByteBufTrackerListener] Handler instance created, calling setHandler()");
+
       registryClass.getMethod("setHandler", Class.forName("com.example.bytebuf.tracker.ObjectTrackerHandler"))
           .invoke(null, handler);
 
@@ -71,6 +78,7 @@ public class ByteBufTrackerListener extends RunListener {
       handlerRegistered = true;
     } catch (ClassNotFoundException e) {
       // Tracker not available - this is fine if tests run without -PwithByteBufTracking
+      System.out.println("[ByteBufTrackerListener] Tracker not available (ClassNotFoundException: " + e.getMessage() + ") - skipping handler registration");
     } catch (Exception e) {
       System.err.println("[ByteBufTrackerListener] Failed to register custom handler: " + e.getMessage());
       e.printStackTrace();
@@ -79,8 +87,10 @@ public class ByteBufTrackerListener extends RunListener {
 
   @Override
   public void testRunStarted(Description description) throws Exception {
+    System.out.println("[ByteBufTrackerListener] testRunStarted() called - attempting to register handler");
     // Register handler before any tests run
     registerCustomHandler();
+    System.out.println("[ByteBufTrackerListener] testRunStarted() completed - handler registration attempted");
   }
 
   @Override
