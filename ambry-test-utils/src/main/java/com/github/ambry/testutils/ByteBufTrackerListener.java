@@ -36,6 +36,17 @@ public class ByteBufTrackerListener extends RunListener {
   private static boolean handlerRegistered = false;
 
   /**
+   * Constructor - register handler immediately when listener is instantiated.
+   * This ensures the handler is registered before any tests run, even if
+   * testRunStarted() is not called by the test runner.
+   */
+  public ByteBufTrackerListener() {
+    super();
+    System.out.println("[ByteBufTrackerListener] Constructor called - registering handler immediately");
+    registerCustomHandler();
+  }
+
+  /**
    * Helper method to repeat a string (Java 8 compatible).
    * @param str the string to repeat
    * @param count the number of times to repeat
@@ -187,7 +198,12 @@ public class ByteBufTrackerListener extends RunListener {
 
   @Override
   public void testStarted(Description description) throws Exception {
-    // Could add per-test tracking here if needed
+    // Fallback: try to register handler before each test if not already registered
+    // This handles cases where constructor and testRunStarted() both failed
+    if (!handlerRegistered) {
+      System.out.println("[ByteBufTrackerListener] testStarted() - handler not yet registered, attempting now");
+      registerCustomHandler();
+    }
   }
 
   @Override
