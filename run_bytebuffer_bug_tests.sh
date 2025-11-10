@@ -1,9 +1,7 @@
 #!/bin/bash
 #
-# Script to run ByteBufferAsyncWritableChannel BUG-EXPOSING tests
-# These tests demonstrate actual production bugs where ByteBuf wrappers leak
-#
-# ⚠️ WARNING: These tests EXPECT LEAKS and use leakHelper.setDisabled(true)
+# Script to run ByteBufferAsyncWritableChannel wrapper release test
+# This test verifies that internal ByteBuf wrappers are properly released
 #
 # Usage: ./run_bytebuffer_bug_tests.sh
 #
@@ -11,23 +9,21 @@
 set -e  # Exit on error
 
 echo "======================================================================================================"
-echo "ByteBufferAsyncWritableChannel BUG-EXPOSING Test Runner"
+echo "ByteBufferAsyncWritableChannel Wrapper Release Test Runner"
 echo "======================================================================================================"
 echo ""
-echo "⚠️  WARNING: These tests demonstrate ACTUAL PRODUCTION BUGS"
+echo "This test verifies the fix for a memory leak bug where internal ByteBuf wrappers"
+echo "created by write(ByteBuffer) were never released."
 echo ""
-echo "These tests will FAIL (red test results) when the production bug exists."
-echo "After applying the fix, these tests will PASS (green test results)."
-echo ""
-echo "Bug Summary:"
+echo "Bug that was fixed:"
 echo "  - write(ByteBuffer) creates internal ByteBuf wrappers via Unpooled.wrappedBuffer()"
-echo "  - These wrappers have refCnt=1 and are NEVER released by the channel"
-echo "  - Every call to write(ByteBuffer) leaks a direct ByteBuf wrapper"
-echo "  - Direct buffers are NEVER garbage collected - this is a critical memory leak"
+echo "  - These wrappers had refCnt=1 and were NEVER released by the channel"
+echo "  - Every call to write(ByteBuffer) leaked a direct ByteBuf wrapper"
+echo "  - Direct buffers are NEVER garbage collected - this was a critical memory leak"
 echo ""
 echo "Tests to run:"
-echo "  - ByteBufferAsyncWritableChannelBugTest (1 test)"
-echo "  Total: 1 test demonstrating the wrapper leak"
+echo "  - ByteBufferAsyncWritableChannelTest.testWriteByteBufferReleasesWrapper"
+echo "  Total: 1 test verifying the wrapper is properly released"
 echo ""
 echo "======================================================================================================"
 echo ""
@@ -42,10 +38,10 @@ echo ""
 
 echo ""
 echo "======================================================================================================"
-echo "[2/3] Running ByteBufferAsyncWritableChannel BUG test..."
-echo "      Test class: ByteBufferAsyncWritableChannelBugTest"
+echo "[2/3] Running ByteBufferAsyncWritableChannel wrapper release test..."
+echo "      Test class: ByteBufferAsyncWritableChannelTest"
 echo "      Module: ambry-commons"
-echo "      Test: testWriteByteBufferLeaksWrapper"
+echo "      Test: testWriteByteBufferReleasesWrapper"
 echo ""
 
 # Check if ByteBuf tracking infrastructure is available
@@ -74,10 +70,10 @@ echo ""
 echo "------------------------------------------------------------------------------------------------------"
 echo ""
 
-# Run the bug test (allow to fail without exiting script)
+# Run the wrapper release test (allow to fail without exiting script)
 set +e  # Temporarily disable exit-on-error
 ./gradlew :ambry-commons:test \
-    --tests 'com.github.ambry.commons.ByteBufferAsyncWritableChannelBugTest.testWriteByteBufferLeaksWrapper' \
+    --tests 'com.github.ambry.commons.ByteBufferAsyncWritableChannelTest.testWriteByteBufferReleasesWrapper' \
     --no-build-cache \
     --rerun-tasks \
     $BYTEBUF_TRACKING
@@ -87,42 +83,46 @@ set -e  # Re-enable exit-on-error
 
 echo ""
 echo "======================================================================================================"
-echo "[3/3] Bug Test Execution Complete"
+echo "[3/3] Test Execution Complete"
 echo "======================================================================================================"
 echo ""
 
 if [ $TEST_EXIT_CODE -eq 0 ]; then
     echo "✅ Test PASSED"
     echo ""
-    echo "🎉 EXCELLENT! The production bug has been FIXED!"
+    echo "🎉 SUCCESS! The wrapper ByteBuf is properly released."
     echo ""
-    echo "The wrapper ByteBuf is now properly released after resolveOldestChunk()."
+    echo "The wrapper ByteBuf created by write(ByteBuffer) is correctly released"
+    echo "after resolveOldestChunk(), preventing memory leaks."
 else
     echo "❌ Test FAILED"
     echo ""
-    echo "✅ EXPECTED! This confirms the production bug exists."
+    echo "⚠️  WARNING: The wrapper release test failed!"
     echo ""
     echo "What failed:"
     echo "  - After resolveOldestChunk(), wrapper ByteBuf still has refCnt=1"
     echo "  - Expected refCnt=0 (released)"
-    echo "  - This proves the wrapper is never released = MEMORY LEAK"
+    echo "  - This indicates the wrapper is not being released = MEMORY LEAK"
     echo ""
-    echo "Next steps:"
-    echo "  1. Apply the fix from BYTEBUFFER_LEAK_FIX_SUMMARY.md"
-    echo "  2. Re-run this script to verify test passes after fix"
+    echo "This likely means:"
+    echo "  1. The fix was not applied correctly, OR"
+    echo "  2. The fix was reverted/overwritten, OR"
+    echo "  3. There's a regression in the wrapper release logic"
 fi
 
 echo ""
-echo "Bug Details:"
-echo "  - Location: ByteBufferAsyncWritableChannel.java:89"
+echo "Fix Details:"
+echo "  - Location: ByteBufferAsyncWritableChannel.java"
 echo "  - Method: write(ByteBuffer src, Callback<Long> callback)"
-echo "  - Issue: return write(Unpooled.wrappedBuffer(src), callback);"
-echo "  - Problem: Unpooled.wrappedBuffer() creates ByteBuf with refCnt=1, never released"
+echo "  - Solution: Mark ChunkData with isInternalWrapper flag"
+echo "  - Release: Wrapper released in resolveOldestChunk() and resolveAllRemainingChunks()"
 echo ""
-echo "Fix Required:"
-echo "  Option 1: Release wrappers in close() and resolveOldestChunk()"
-echo "  Option 2: Track wrappers separately and release them after conversion"
-echo "  Option 3: Don't use wrappers - copy data directly"
+echo "How the fix works:"
+echo "  1. write(ByteBuffer) creates wrapper via Unpooled.wrappedBuffer()"
+echo "  2. ChunkData is marked with isInternalWrapper=true flag"
+echo "  3. When resolveOldestChunk() is called, it checks the flag"
+echo "  4. If isInternalWrapper=true, wrapper.release() is called"
+echo "  5. This decrements refCnt to 0, preventing memory leak"
 echo ""
 echo "Test results location:"
 echo "  HTML report: file://$(pwd)/ambry-commons/build/reports/tests/test/index.html"
