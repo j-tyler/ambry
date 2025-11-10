@@ -19,8 +19,11 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
+import java.util.Collections;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -58,6 +61,11 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
   private final ReentrantLock lock = new ReentrantLock();
   private final AtomicBoolean channelOpen = new AtomicBoolean(true);
   private final ChannelEventListener channelEventListener;
+  /**
+   * Tracks ByteBuf wrappers created internally by {@link #write(ByteBuffer, Callback)} that must be released
+   * by the channel to prevent memory leaks.
+   */
+  private final Set<ByteBuf> internalWrappers = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
   /**
    * Construct a ByteBufferAsyncWritableChannel with a null {@link ChannelEventListener}
@@ -76,6 +84,9 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
 
   /**
    * If the channel is open, simply queues the buffer to be handled later.
+   * <p/>
+   * Note: This method creates an internal ByteBuf wrapper around the ByteBuffer. The wrapper is tracked
+   * and will be automatically released by the channel after the chunk is resolved.
    * @param src the data that needs to be written to the channel.
    * @param callback the {@link Callback} that will be invoked once the write succeeds/fails. This can be null.
    * @return a {@link Future} that will eventually contain the result of the write operation.
@@ -86,7 +97,9 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
     if (src == null) {
       throw new IllegalArgumentException("Source buffer cannot be null");
     }
-    return write(Unpooled.wrappedBuffer(src), callback);
+    ByteBuf wrapper = Unpooled.wrappedBuffer(src);
+    internalWrappers.add(wrapper);  // Track this wrapper so we can release it later
+    return write(wrapper, callback);
   }
 
   /**
@@ -102,6 +115,7 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
       throw new IllegalArgumentException("Source buffer cannot be null");
     }
     if (!isOpen()) {
+      internalWrappers.remove(src);  // Remove from tracking if it's a wrapper
       src.release();
       CompletableFuture<Long> failedFuture = new CompletableFuture<>();
       failedFuture.completeExceptionally(new ClosedChannelException());
@@ -239,12 +253,19 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
   /**
    * Resolves the oldest "checked-out" chunk and invokes the callback and future that accompanied the chunk. Once a
    * chunk is resolved, the data inside it is considered void. If no chunks have been "checked-out" yet, does nothing.
+   * <p/>
+   * If the chunk's ByteBuf is an internal wrapper (created by {@link #write(ByteBuffer, Callback)}), it will be
+   * automatically released to prevent memory leaks.
    * @param exception any {@link Exception} that occurred during the handling that needs to be notified.
    */
   public void resolveOldestChunk(Exception exception) {
     ChunkData chunkData = chunksAwaitingResolution.poll();
     if (chunkData != null) {
       chunkData.resolveChunk(exception);
+      // Release wrapper if it was created by write(ByteBuffer)
+      if (chunkData.buf != null && internalWrappers.remove(chunkData.buf)) {
+        chunkData.buf.release();
+      }
     }
   }
 
@@ -268,6 +289,8 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
 
   /**
    * Resolves all the remaining chunks with {@link ClosedChannelException}.
+   * <p/>
+   * Internal wrapper ByteBufs are automatically released to prevent memory leaks.
    * @param e the exception to use to resolve all the chunks.
    */
   private void resolveAllRemainingChunks(Exception e) {
@@ -276,11 +299,19 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
       ChunkData chunkData = chunksAwaitingResolution.poll();
       while (chunkData != null) {
         chunkData.resolveChunk(e);
+        // Release wrapper if it was created by write(ByteBuffer)
+        if (chunkData.buf != null && internalWrappers.remove(chunkData.buf)) {
+          chunkData.buf.release();
+        }
         chunkData = chunksAwaitingResolution.poll();
       }
       chunkData = chunks.poll();
       while (chunkData != null) {
         chunkData.resolveChunk(e);
+        // Release wrapper if it was created by write(ByteBuffer)
+        if (chunkData.buf != null && internalWrappers.remove(chunkData.buf)) {
+          chunkData.buf.release();
+        }
         chunkData = chunks.poll();
       }
       chunks.add(new ChunkData(null, null));
