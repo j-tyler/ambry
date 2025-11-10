@@ -1580,17 +1580,25 @@ class PutOperation {
      * Submits encrypt job for the given {@link PutChunk} and processes the callback for the same
      */
     private void encryptChunk() {
+      ByteBuf retainedCopy = null;
       try {
         logger.trace("{}: Chunk at index {} moves to {} state", loggingContext, chunkIndex, ChunkState.Encrypting);
         state = ChunkState.Encrypting;
         chunkEncryptReadyAtMs = time.milliseconds();
         encryptJobMetricsTracker.onJobSubmission();
         logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
+        // Create retained duplicate before EncryptJob constructor to ensure proper cleanup if constructor fails
+        retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
         cryptoJobHandler.submitJob(
             new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
-                isMetadataChunk() ? null : buf.retainedDuplicate(), ByteBuffer.wrap(chunkUserMetadata),
+                retainedCopy, ByteBuffer.wrap(chunkUserMetadata),
                 kms.getRandomKey(), cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
+        retainedCopy = null; // Ownership successfully transferred to EncryptJob
       } catch (GeneralSecurityException e) {
+        // Release retained duplicate if ownership was not transferred
+        if (retainedCopy != null) {
+          retainedCopy.release();
+        }
         encryptJobMetricsTracker.incrementOperationError();
         logger.trace("{}: Exception thrown while generating random key for chunk at index {}", loggingContext,
             chunkIndex, e);
@@ -1822,14 +1830,24 @@ class PutOperation {
         ReplicaId replicaId = replicaIterator.next();
         String hostname = replicaId.getDataNodeId().getHostname();
         Port port = RouterUtils.getPortToConnectTo(replicaId, routerConfig.routerEnableHttp2NetworkClient);
-        PutRequest putRequest = createPutRequest();
-        RequestInfo requestInfo =
-            new RequestInfo(hostname, port, putRequest, replicaId, prepareQuotaCharger(), time.milliseconds(),
-                routerConfig.routerRequestNetworkTimeoutMs, routerConfig.routerRequestTimeoutMs);
-        int correlationId = putRequest.getCorrelationId();
-        correlationIdToChunkPutRequestInfo.put(correlationId, requestInfo);
-        correlationIdToPutChunk.put(correlationId, this);
-        requestRegistrationCallback.registerRequestToSend(PutOperation.this, requestInfo);
+        PutRequest putRequest = null;
+        try {
+          putRequest = createPutRequest();
+          RequestInfo requestInfo =
+              new RequestInfo(hostname, port, putRequest, replicaId, prepareQuotaCharger(), time.milliseconds(),
+                  routerConfig.routerRequestNetworkTimeoutMs, routerConfig.routerRequestTimeoutMs);
+          int correlationId = putRequest.getCorrelationId();
+          correlationIdToChunkPutRequestInfo.put(correlationId, requestInfo);
+          correlationIdToPutChunk.put(correlationId, this);
+          requestRegistrationCallback.registerRequestToSend(PutOperation.this, requestInfo);
+          putRequest = null; // Successfully stored, ownership transferred to tracking maps
+        } catch (Exception e) {
+          // Release PutRequest if it was created but not successfully stored
+          if (putRequest != null) {
+            putRequest.release();
+          }
+          throw e;
+        }
         replicaIterator.remove();
         if (RouterUtils.isRemoteReplica(routerConfig, replicaId)) {
           logger.debug("{}: Making request with correlationId {} to a remote replica {} in {}", loggingContext,
