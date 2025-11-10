@@ -1831,12 +1831,13 @@ class PutOperation {
         String hostname = replicaId.getDataNodeId().getHostname();
         Port port = RouterUtils.getPortToConnectTo(replicaId, routerConfig.routerEnableHttp2NetworkClient);
         PutRequest putRequest = null;
+        int correlationId = -1;
         try {
           putRequest = createPutRequest();
           RequestInfo requestInfo =
               new RequestInfo(hostname, port, putRequest, replicaId, prepareQuotaCharger(), time.milliseconds(),
                   routerConfig.routerRequestNetworkTimeoutMs, routerConfig.routerRequestTimeoutMs);
-          int correlationId = putRequest.getCorrelationId();
+          correlationId = putRequest.getCorrelationId();
           correlationIdToChunkPutRequestInfo.put(correlationId, requestInfo);
           correlationIdToPutChunk.put(correlationId, this);
           requestRegistrationCallback.registerRequestToSend(PutOperation.this, requestInfo);
