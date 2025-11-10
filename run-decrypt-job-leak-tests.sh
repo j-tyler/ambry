@@ -20,17 +20,21 @@ echo ""
 echo "================================================================================"
 echo ""
 
-# Clean previous test results
-echo "Cleaning previous test results..."
-./gradlew :ambry-router:cleanTest
+# Clean previous test results and build cache
+echo "Cleaning previous test results and build cache..."
+./gradlew :ambry-router:cleanTest --no-build-cache
 
 echo ""
-echo "Running tests with ByteBuf tracking enabled..."
+echo "Running tests with ByteBuf tracking enabled (no cache, fresh run)..."
 echo ""
 
 # Run the DecryptJobLeakTest with ByteBuf tracking
-# The -PwithByteBufTracking flag enables the ByteBuf Flow Tracker agent
-./gradlew :ambry-router:test --tests DecryptJobLeakTest -PwithByteBufTracking --info 2>&1 | tee decrypt-job-test-output.log
+# Flags:
+#   -PwithByteBufTracking: Enables the ByteBuf Flow Tracker agent
+#   --no-build-cache: Disables build cache for fresh execution
+#   --rerun-tasks: Forces all tasks to run even if up-to-date
+#   --info: Provides detailed output
+./gradlew :ambry-router:test --tests DecryptJobLeakTest -PwithByteBufTracking --no-build-cache --rerun-tasks --info 2>&1 | tee decrypt-job-test-output.log
 
 echo ""
 echo "================================================================================"
