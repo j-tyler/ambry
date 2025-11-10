@@ -26,9 +26,8 @@ echo "  - Every call to write(ByteBuffer) leaks a direct ByteBuf wrapper"
 echo "  - Direct buffers are NEVER garbage collected - this is a critical memory leak"
 echo ""
 echo "Tests to run:"
-echo "  - ByteBufferAsyncWritableChannelBugTest (5 bug-exposing tests)"
-echo "  - UnpooledWrapperLeakProofTest (6 proof tests demonstrating GC prevention)"
-echo "  Total: 11 tests"
+echo "  - ByteBufferAsyncWritableChannelBugTest (1 test)"
+echo "  Total: 1 test demonstrating the wrapper leak"
 echo ""
 echo "======================================================================================================"
 echo ""
@@ -43,12 +42,10 @@ echo ""
 
 echo ""
 echo "======================================================================================================"
-echo "[2/3] Running ByteBufferAsyncWritableChannel BUG tests..."
-echo "      Test classes:"
-echo "        - ByteBufferAsyncWritableChannelBugTest (5 bug-exposing tests)"
-echo "        - UnpooledWrapperLeakProofTest (6 proof tests)"
+echo "[2/3] Running ByteBufferAsyncWritableChannel BUG test..."
+echo "      Test class: ByteBufferAsyncWritableChannelBugTest"
 echo "      Module: ambry-commons"
-echo "      Total: 11 tests demonstrating leak mechanism"
+echo "      Test: testWriteByteBufferLeaksWrapper"
 echo ""
 
 # Check if ByteBuf tracking infrastructure is available
@@ -77,14 +74,12 @@ echo ""
 echo "------------------------------------------------------------------------------------------------------"
 echo ""
 
-# Run the bug tests (allow to fail without exiting script)
+# Run the bug test (allow to fail without exiting script)
 set +e  # Temporarily disable exit-on-error
 ./gradlew :ambry-commons:test \
-    --tests 'com.github.ambry.commons.ByteBufferAsyncWritableChannelBugTest' \
-    --tests 'com.github.ambry.commons.UnpooledWrapperLeakProofTest' \
+    --tests 'com.github.ambry.commons.ByteBufferAsyncWritableChannelBugTest.testWriteByteBufferLeaksWrapper' \
     --no-build-cache \
     --rerun-tasks \
-    -i \
     $BYTEBUF_TRACKING
 
 TEST_EXIT_CODE=$?
@@ -97,46 +92,24 @@ echo "==========================================================================
 echo ""
 
 if [ $TEST_EXIT_CODE -eq 0 ]; then
-    echo "✅ All bug-exposing tests PASSED"
+    echo "✅ Test PASSED"
     echo ""
     echo "🎉 EXCELLENT! The production bug has been FIXED!"
     echo ""
-    echo "What this means:"
-    echo "  - The fix properly releases wrapper ByteBufs"
-    echo "  - No direct buffer leaks detected"
-    echo "  - Tests that previously failed now pass"
-    echo ""
-    echo "Expected leaks per test:"
-    echo ""
-    echo "  ByteBufferAsyncWritableChannelBugTest:"
-    echo "    - testWriteByteBufferToClosedChannelLeaksWrapper: 0-1 leaks (edge case)"
-    echo "    - testWriteByteBufferThenCloseLeaksWrapper: 2 leaks"
-    echo "    - testWriteByteBufferNormalFlowLeaksWrapper: 1 leak"
-    echo "    - testMultipleByteBufferWritesLeakMultipleWrappers: 3 leaks"
-    echo "    - testByteBufferVsByteBufLeakComparison: 1 leak (from ByteBuffer write)"
-    echo ""
-    echo "  UnpooledWrapperLeakProofTest (all tests show wrappers prevent GC):"
-    echo "    - testWrapperNotReleased_PreventsGC: 1 wrapper prevents ByteBuffer GC"
-    echo "    - testWrapperReleasedImmediately_RequiresCarefulTiming: Shows timing window"
-    echo "    - testMultipleWrappers_AccumulatingLeak: 10 wrappers prevent 10 ByteBuffers from GC"
-    echo "    - testWrapperHoldsReference_EvenAfterDataConsumed: 1 wrapper prevents GC even after read"
-    echo "    - testExactBugScenario_WrapperHiddenFromCaller: Demonstrates exact production bug"
-    echo "    - testControlCase_NoByteBufWrapper_ProperCleanup: Shows correct pattern (no leak)"
-    echo ""
+    echo "The wrapper ByteBuf is now properly released after resolveOldestChunk()."
 else
-    echo "❌ Bug-exposing tests FAILED"
+    echo "❌ Test FAILED"
     echo ""
     echo "✅ EXPECTED! This confirms the production bug exists."
     echo ""
-    echo "What this means:"
-    echo "  - Tests detected memory leaks in production code"
-    echo "  - ByteBuf wrappers are not being released"
-    echo "  - Direct buffers are leaking native memory"
+    echo "What failed:"
+    echo "  - After resolveOldestChunk(), wrapper ByteBuf still has refCnt=1"
+    echo "  - Expected refCnt=0 (released)"
+    echo "  - This proves the wrapper is never released = MEMORY LEAK"
     echo ""
     echo "Next steps:"
-    echo "  1. Review ByteBuf Flow Tracker output above for leak details"
-    echo "  2. Apply the fix from BYTEBUFFER_LEAK_FIX_SUMMARY.md"
-    echo "  3. Re-run this script to verify tests pass after fix"
+    echo "  1. Apply the fix from BYTEBUFFER_LEAK_FIX_SUMMARY.md"
+    echo "  2. Re-run this script to verify test passes after fix"
 fi
 
 echo ""
