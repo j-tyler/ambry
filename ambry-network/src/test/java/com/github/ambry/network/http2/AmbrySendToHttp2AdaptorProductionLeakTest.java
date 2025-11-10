@@ -14,6 +14,7 @@
 package com.github.ambry.network.http2;
 
 import com.github.ambry.network.Send;
+import com.github.ambry.utils.AbstractByteBufHolder;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
@@ -60,7 +61,7 @@ public class AmbrySendToHttp2AdaptorProductionLeakTest {
     when(mockContext.channel().isOpen()).thenReturn(true);
     when(mockContext.newPromise()).thenReturn(mockPromise);
 
-    adaptor = new AmbrySendToHttp2Adaptor(MAX_FRAME_SIZE);
+    adaptor = new AmbrySendToHttp2Adaptor(false, MAX_FRAME_SIZE);
   }
 
   @After
@@ -283,7 +284,7 @@ public class AmbrySendToHttp2AdaptorProductionLeakTest {
   /**
    * Test implementation of Send interface
    */
-  private static class TestSend implements Send {
+  private static class TestSend extends AbstractByteBufHolder<TestSend> implements Send {
     private final ByteBuf content;
 
     public TestSend(ByteBuf content) {
