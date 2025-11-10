@@ -1,264 +1,111 @@
 # Fix retainedDuplicate() Memory Leaks in PutOperation
 
-## 1. The Bugs
+## Background
 
-This PR fixes two memory leaks in `PutOperation` where `retainedDuplicate()` ByteBufs are created but never released when exceptions occur.
+Netty's `retainedDuplicate()` increments the ByteBuf reference count, transferring ownership of 1 reference to the caller. The caller must call `release()` to avoid memory leaks. When passing a retained duplicate to a constructor/method, ownership transfers to the receiver—but if an exception prevents the receiver from taking ownership, **the caller must release it**.
 
-### Background: Netty ByteBuf Reference Counting
+## The Bugs
 
-Netty ByteBufs use reference counting for memory management. The `retainedDuplicate()` method creates a new ByteBuf view that shares the underlying memory but **increments the reference count** (calls `retain()`). This means:
+This PR fixes two memory leaks where `retainedDuplicate()` ByteBufs are created but never released when exceptions occur before ownership transfer completes.
 
-- **The caller receives ownership of 1 reference count**
-- **The caller MUST call `release()` to decrement the count**
-- **If the reference count never reaches 0, the memory leaks**
+### Bug #1: KMS Exception After retainedDuplicate() in encryptChunk()
 
-When passing a retained duplicate to a constructor or method, ownership transfers to the receiver, who becomes responsible for releasing it. However, if an exception occurs before the receiver takes ownership, the caller must release it.
+**Location:** `PutOperation.java:1582-1609`
 
-### Bug #3: KMS Exception After retainedDuplicate() in encryptChunk()
-
-**Location:** `PutOperation.java:1582-1609` (encryptChunk method)
-
-**How it occurs:**
-
+**The Problem:**
 ```java
-// BEFORE FIX:
 cryptoJobHandler.submitJob(
     new EncryptJob(...,
-        buf.retainedDuplicate(),  // 3rd arg - evaluated first, refCnt++
-        ByteBuffer.wrap(chunkUserMetadata),  // 4th arg
-        kms.getRandomKey(),  // 5th arg - THROWS EXCEPTION
+        buf.retainedDuplicate(),  // Evaluated (refCnt++)
+        ByteBuffer.wrap(chunkUserMetadata),
+        kms.getRandomKey(),  // Throws exception
         ...));
 ```
 
-**Sequence of events:**
-1. Java evaluates constructor arguments **left-to-right**
-2. `buf.retainedDuplicate()` is evaluated (3rd argument) → `refCnt++`, caller owns 1 reference
-3. `kms.getRandomKey()` is evaluated (5th argument) → throws `GeneralSecurityException`
-4. `EncryptJob` constructor **never completes** → never receives the retained duplicate
-5. Exception is caught, but the retained duplicate is already created
-6. **LEAK**: The retained duplicate is orphaned with `refCnt=1`, never released
+Java evaluates constructor arguments left-to-right. When `kms.getRandomKey()` throws after `retainedDuplicate()` is evaluated, the EncryptJob constructor never completes and never receives the retained duplicate. The catch block handles the exception but doesn't release the orphaned ByteBuf.
 
-**Impact:** Every time `kms.getRandomKey()` throws an exception, a ByteBuf leaks.
+**Impact:** Every KMS failure leaks a ByteBuf.
 
-### Bug #4: RequestInfo Construction Exception After PutRequest Creation
+### Bug #2: RequestInfo Exception After PutRequest Creation
 
-**Location:** `PutOperation.java:1827-1863` (fetchRequests method)
+**Location:** `PutOperation.java:1827-1863`
 
-**How it occurs:**
-
+**The Problem:**
 ```java
-// BEFORE FIX:
 PutRequest putRequest = createPutRequest();  // Contains retainedDuplicate()
-RequestInfo requestInfo = new RequestInfo(hostname, port, putRequest, ...);  // THROWS
+RequestInfo requestInfo = new RequestInfo(hostname, port, putRequest, ...);  // Throws
 correlationIdToChunkPutRequestInfo.put(correlationId, requestInfo);  // Never reached
 ```
 
-**Sequence of events:**
-1. `createPutRequest()` calls `buf.retainedDuplicate()` → `refCnt++`
-2. `PutRequest` constructor completes successfully, taking ownership of the retained duplicate
-3. `RequestInfo` constructor throws an exception (e.g., `IllegalArgumentException`, `NullPointerException`)
-4. `PutRequest` is never stored in `correlationIdToChunkPutRequestInfo` map
-5. No reference to the `PutRequest` exists → `putRequest.release()` never called
-6. **LEAK**: The `PutRequest` (and its retained duplicate) is orphaned, never released
+When `RequestInfo` construction throws, the `PutRequest` (which owns a retained duplicate) is never stored in the tracking map. With no reference to it, `putRequest.release()` is never called.
 
-**Impact:** Every time `RequestInfo` construction fails, a ByteBuf leaks.
+**Impact:** Every RequestInfo construction failure leaks a ByteBuf.
 
 ---
 
-## 2. The Tests
+## The Tests
 
-Both bugs are tested in `PutOperationRetainedDuplicateLeakTest.java` with the ByteBuf Flow Tracker enabled.
+Tests in `PutOperationRetainedDuplicateLeakTest.java` verify both fixes using the ByteBuf Flow Tracker:
 
-### Test #1: testEncryptJobConstructorExceptionHandledProperly()
+1. **testEncryptJobConstructorExceptionHandledProperly()** - Simulates KMS exception after `retainedDuplicate()`, verifies the catch block releases it
+2. **testRequestInfoConstructionExceptionHandledProperly()** - Simulates RequestInfo exception after PutRequest creation, verifies `putRequest.release()` is called
 
-**What it tests:** Verifies that Bug #3 is fixed by simulating the exact failure scenario.
-
-**How it proves the fix works:**
-
-```java
-ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(4096);
-buf.writeBytes(TestUtils.getRandomBytes(4096));
-
-ByteBuf retainedCopy = null;
-try {
-  // Simulate the FIXED flow:
-  retainedCopy = buf.retainedDuplicate();  // refCnt++
-  assertEquals(1, retainedCopy.refCnt());
-
-  SecretKeySpec key = faultyKms.getRandomKey();  // Throws here!
-  fail("Should have thrown GeneralSecurityException");
-
-} catch (GeneralSecurityException e) {
-  // WITH THE FIX: catch block releases the retained duplicate
-  if (retainedCopy != null) {
-    retainedCopy.release();  // This is what the fix does
-    retainedCopy = null;
-  }
-}
-
-// VERIFICATION: No leak
-assertNull(retainedCopy);
-buf.release();
-```
-
-**Result:** With the fix, `retainedCopy` is properly released. ByteBuf Flow Tracker reports "Leak Paths: 0".
-
-### Test #2: testRequestInfoConstructionExceptionHandledProperly()
-
-**What it tests:** Verifies that Bug #4 is fixed by simulating RequestInfo construction failure.
-
-**How it proves the fix works:**
-
-```java
-ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(1024);
-buf.writeBytes(TestUtils.getRandomBytes(1024));
-
-ByteBuf retainedCopy = buf.retainedDuplicate();  // refCnt++
-BlobId blobId = new BlobId(...);
-
-PutRequest putRequest = null;
-try {
-  putRequest = new PutRequest(..., retainedCopy, ...);  // PutRequest takes ownership
-  assertEquals(1, retainedCopy.refCnt());
-
-  // Simulate RequestInfo construction failure
-  throw new IllegalArgumentException("Simulated RequestInfo construction failure");
-
-} catch (IllegalArgumentException e) {
-  // WITH THE FIX: catch block releases the abandoned PutRequest
-  if (putRequest != null) {
-    putRequest.release();  // This is what the fix does - releases the retained duplicate
-    putRequest = null;
-  }
-}
-
-// VERIFICATION: No leak - retained duplicate properly released
-assertNull(putRequest);
-assertEquals(0, retainedCopy.refCnt());
-buf.release();
-```
-
-**Result:** With the fix, `putRequest.release()` is called, which internally releases the retained duplicate. ByteBuf Flow Tracker reports "Leak Paths: 0".
+Both tests report "Leak Paths: 0" with the fixes in place.
 
 ---
 
-## 3. The Fixes
+## The Fixes
 
-Both fixes follow the same pattern: **extract, transfer, nullify, cleanup**.
+Both fixes follow the pattern: **track ownership → attempt transfer → nullify if successful → cleanup if failed**.
 
-### Fix #1: Bug #3 - encryptChunk() Method
+### Fix #1: encryptChunk() - Track and Release retainedDuplicate()
 
-**Strategy:** Extract `retainedDuplicate()` into a variable before the constructor call, then release it in the catch block if ownership was not transferred.
+Extract `retainedDuplicate()` into a variable before the constructor call, then release it in the catch block if ownership wasn't transferred:
 
 ```java
 private void encryptChunk() {
-  ByteBuf retainedCopy = null;  // ← Track ownership
+  ByteBuf retainedCopy = null;
   try {
-    logger.trace("{}: Chunk at index {} moves to {} state", loggingContext, chunkIndex, ChunkState.Encrypting);
-    state = ChunkState.Encrypting;
-    chunkEncryptReadyAtMs = time.milliseconds();
-    encryptJobMetricsTracker.onJobSubmission();
-    logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
-
-    // ← Extract retainedDuplicate() BEFORE constructor
     retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
-
     cryptoJobHandler.submitJob(
-        new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
-            retainedCopy,  // ← Pass the variable, not inline call
-            ByteBuffer.wrap(chunkUserMetadata),
-            kms.getRandomKey(),  // ← Can still throw, but retainedCopy is tracked
-            cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
-
-    retainedCopy = null;  // ← Ownership successfully transferred to EncryptJob
-
+        new EncryptJob(..., retainedCopy, ..., kms.getRandomKey(), ...));
+    retainedCopy = null;  // Ownership transferred
   } catch (GeneralSecurityException e) {
-    // ← Release if ownership was not transferred
     if (retainedCopy != null) {
-      retainedCopy.release();
+      retainedCopy.release();  // Release if not transferred
     }
-    encryptJobMetricsTracker.incrementOperationError();
-    logger.trace("{}: Exception thrown while generating random key for chunk at index {}", loggingContext,
-        chunkIndex, e);
-    setOperationExceptionAndComplete(new RouterException(
-        "GeneralSecurityException thrown while generating random key for chunk at index " + chunkIndex, e,
-        RouterErrorCode.UnexpectedInternalError));
+    // ... exception handling
   }
 }
 ```
 
-**Key points:**
-- `retainedCopy` is extracted before the constructor call
-- If an exception occurs before `submitJob()` completes, `retainedCopy != null` and we release it
-- If `submitJob()` succeeds, we set `retainedCopy = null` to indicate ownership transfer
-- Prevents the leak by ensuring the caller releases if the receiver never took ownership
+### Fix #2: fetchRequests() - Release Abandoned PutRequest
 
-### Fix #2: Bug #4 - fetchRequests() Method
-
-**Strategy:** Wrap PutRequest creation and RequestInfo construction in try-catch, then release the PutRequest if it's not successfully stored.
+Wrap PutRequest creation in try-catch, then release it if not successfully stored:
 
 ```java
-private void fetchRequests(RequestRegistrationCallback<PutOperation> requestRegistrationCallback) {
-  Iterator<ReplicaId> replicaIterator = operationTracker.getReplicaIterator();
+private void fetchRequests(...) {
   while (replicaIterator.hasNext()) {
-    ReplicaId replicaId = replicaIterator.next();
-    String hostname = replicaId.getDataNodeId().getHostname();
-    Port port = RouterUtils.getPortToConnectTo(replicaId, routerConfig.routerEnableHttp2NetworkClient);
-
-    PutRequest putRequest = null;  // ← Track ownership
-    int correlationId = -1;  // ← Declare outside try for logging
-
+    PutRequest putRequest = null;
     try {
-      putRequest = createPutRequest();  // ← Contains retainedDuplicate()
-
-      RequestInfo requestInfo =
-          new RequestInfo(hostname, port, putRequest, replicaId, prepareQuotaCharger(), time.milliseconds(),
-              routerConfig.routerRequestNetworkTimeoutMs, routerConfig.routerRequestTimeoutMs);
-
-      correlationId = putRequest.getCorrelationId();
+      putRequest = createPutRequest();  // Contains retainedDuplicate()
+      RequestInfo requestInfo = new RequestInfo(hostname, port, putRequest, ...);
       correlationIdToChunkPutRequestInfo.put(correlationId, requestInfo);
-      correlationIdToPutChunk.put(correlationId, this);
-      requestRegistrationCallback.registerRequestToSend(PutOperation.this, requestInfo);
-
-      putRequest = null;  // ← Successfully stored, ownership transferred to tracking maps
-
+      // ... store in maps
+      putRequest = null;  // Successfully stored
     } catch (Exception e) {
-      // ← Release PutRequest if it was created but not successfully stored
       if (putRequest != null) {
-        putRequest.release();  // This releases the retained duplicate inside PutRequest
+        putRequest.release();  // Release abandoned PutRequest
       }
       throw e;
     }
-
-    replicaIterator.remove();
-    if (RouterUtils.isRemoteReplica(routerConfig, replicaId)) {
-      logger.debug("{}: Making request with correlationId {} to a remote replica {} in {}", loggingContext,
-          correlationId, replicaId.getDataNodeId(), replicaId.getDataNodeId().getDatacenterName());
-      routerMetrics.crossColoRequestCount.inc();
-    } else {
-      logger.trace("{}: Making request with correlationId {} to a local replica {}", loggingContext, correlationId,
-          replicaId.getDataNodeId());
-    }
-    routerMetrics.getDataNodeBasedMetrics(replicaId.getDataNodeId()).putRequestRate.mark();
-    routerMetrics.routerPutRequestRate.mark();
+    // ... metrics and logging
   }
 }
 ```
-
-**Key points:**
-- `putRequest` is tracked throughout the try block
-- If `RequestInfo` construction or map storage fails, `putRequest != null` and we release it
-- If all operations succeed, we set `putRequest = null` to indicate ownership transfer to the map
-- `putRequest.release()` internally releases the retained duplicate it owns
-- Prevents the leak by ensuring abandoned `PutRequest` objects are properly released
 
 ---
 
 ## Summary
 
-Both fixes ensure that **the party responsible for releasing a ByteBuf always does so**, even when exceptions occur:
-
-1. **Bug #3 Fix:** Caller (PutOperation) retains responsibility until EncryptJob constructor completes
-2. **Bug #4 Fix:** Caller (PutOperation) retains responsibility until PutRequest is stored in tracking map
-
-The pattern is: track ownership → attempt transfer → nullify if successful → cleanup if failed.
+Both fixes ensure the responsible party always releases ByteBufs, even when exceptions occur. The caller retains responsibility until ownership transfer completes successfully.
