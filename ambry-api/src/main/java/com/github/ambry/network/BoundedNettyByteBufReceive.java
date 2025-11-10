@@ -59,11 +59,12 @@ public class BoundedNettyByteBufReceive extends AbstractByteBufHolder<BoundedNet
    * @throws IOException Any I/O error.
    */
   private int readBytesFromReadableByteChannel(ReadableByteChannel channel, ByteBuf buffer) throws IOException {
-    int n = channel.read(buffer.nioBuffer(buffer.writerIndex(), buffer.capacity() - buffer.writerIndex()));
-    if (n > 0) {
-      buffer.writerIndex(buffer.writerIndex() + n);
-    }
-    return n;
+    // Use ByteBuf's writeBytes() method to let the ByteBuf implementation handle channel reading.
+    // This avoids creating NIO buffer views (via nioBuffer()) which can cause pool deallocation
+    // issues when exceptions occur during the read operation.
+    int writerIndexBefore = buffer.writerIndex();
+    int writableBytes = buffer.capacity() - writerIndexBefore;
+    return buffer.writeBytes(channel, writableBytes);
   }
 
   public long readFrom(ReadableByteChannel channel) throws IOException {
