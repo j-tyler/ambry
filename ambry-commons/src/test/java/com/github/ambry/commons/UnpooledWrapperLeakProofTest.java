@@ -61,7 +61,7 @@ public class UnpooledWrapperLeakProofTest {
    */
   @Test
   public void testWrapperNotReleased_PreventsGC() throws Exception {
-    leakHelper.setDisabled(true);  // We expect leaks
+    // This test will FAIL - demonstrates wrapper prevents ByteBuffer from GC
 
     // Track the ByteBuffer with a WeakReference to observe GC
     WeakReference<ByteBuffer> byteBufferRef;
@@ -121,7 +121,7 @@ public class UnpooledWrapperLeakProofTest {
    */
   @Test
   public void testWrapperReleasedImmediately_RequiresCarefulTiming() throws Exception {
-    leakHelper.setDisabled(true);  // Educational test
+    // Educational test showing timing window issues
 
     ByteBuffer byteBuffer = ByteBuffer.allocateDirect(1024);
     byteBuffer.put(new byte[1024]);
@@ -160,7 +160,7 @@ public class UnpooledWrapperLeakProofTest {
    */
   @Test
   public void testMultipleWrappers_AccumulatingLeak() throws Exception {
-    leakHelper.setDisabled(true);  // We expect leaks
+    // This test will FAIL - demonstrates 10 wrappers leak
 
     int count = 10;
     WeakReference<ByteBuffer>[] refs = new WeakReference[count];
@@ -213,7 +213,7 @@ public class UnpooledWrapperLeakProofTest {
    */
   @Test
   public void testWrapperHoldsReference_EvenAfterDataConsumed() throws Exception {
-    leakHelper.setDisabled(true);
+    // This test will FAIL - wrapper holds reference even after data consumed
 
     WeakReference<ByteBuffer> byteBufferRef;
     ByteBuf wrapper;
@@ -268,7 +268,7 @@ public class UnpooledWrapperLeakProofTest {
    */
   @Test
   public void testExactBugScenario_WrapperHiddenFromCaller() throws Exception {
-    leakHelper.setDisabled(true);
+    // This test will FAIL - demonstrates exact production bug scenario
 
     // Simulate caller code
     ByteBuffer callerBuffer = ByteBuffer.allocateDirect(1024);

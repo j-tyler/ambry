@@ -78,7 +78,7 @@ public class ByteBufferAsyncWritableChannelBugTest {
    */
   @Test
   public void testWriteByteBufferToClosedChannelLeaksWrapper() throws Exception {
-    leakHelper.setDisabled(true);  // This is a bug-exposing test
+    // This test will FAIL if the bug exists (wrapper leaks)
 
     // Create a DIRECT ByteBuffer (critical: uses native memory, never GC'd)
     ByteBuffer nioBuffer = ByteBuffer.allocateDirect(100);
@@ -130,7 +130,7 @@ public class ByteBufferAsyncWritableChannelBugTest {
    */
   @Test
   public void testWriteByteBufferThenCloseLeaksWrapper() throws Exception {
-    leakHelper.setDisabled(true);  // This is a bug-exposing test
+    // This test will FAIL if the bug exists (2 wrappers leak)
 
     // Create DIRECT ByteBuffers (critical: use native memory, never GC'd)
     ByteBuffer nioBuffer1 = ByteBuffer.allocateDirect(100);
@@ -192,7 +192,7 @@ public class ByteBufferAsyncWritableChannelBugTest {
    */
   @Test
   public void testWriteByteBufferNormalFlowLeaksWrapper() throws Exception {
-    leakHelper.setDisabled(true);  // This is a bug-exposing test
+    // This test will FAIL if the bug exists (1 wrapper leaks)
 
     // Create DIRECT ByteBuffer (critical: uses native memory, never GC'd)
     ByteBuffer nioBuffer = ByteBuffer.allocateDirect(100);
@@ -246,7 +246,7 @@ public class ByteBufferAsyncWritableChannelBugTest {
    */
   @Test
   public void testMultipleByteBufferWritesLeakMultipleWrappers() throws Exception {
-    leakHelper.setDisabled(true);  // This is a bug-exposing test
+    // This test will FAIL if the bug exists (3 wrappers leak)
 
     int writeCount = 3;
     ByteBuffer[] nioBuffers = new ByteBuffer[writeCount];
@@ -291,7 +291,7 @@ public class ByteBufferAsyncWritableChannelBugTest {
    */
   @Test
   public void testByteBufferVsByteBufLeakComparison() throws Exception {
-    leakHelper.setDisabled(true);  // This is a bug-exposing test
+    // This test will FAIL if the bug exists (1 wrapper from ByteBuffer write leaks)
 
     CountDownLatch latch = new CountDownLatch(2);
 
