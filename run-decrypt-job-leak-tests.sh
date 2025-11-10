@@ -25,8 +25,8 @@ echo "Stopping Gradle daemon..."
 ./gradlew --stop
 
 echo ""
-echo "Cleaning previous test results and build cache..."
-./gradlew :bytebuf-tracker:clean :ambry-router:clean --no-build-cache
+echo "Cleaning previous test results..."
+./gradlew :ambry-router:clean --no-build-cache
 
 echo ""
 echo "================================================================================"
@@ -35,8 +35,12 @@ echo "==========================================================================
 echo ""
 
 # Pre-build the tracker agent to ensure it's available before test JVM starts
+# This runs 'mvn clean package' on the git submodule, which:
+# 1. Cleans the Maven target directory
+# 2. Builds the agent JAR with all dependencies
+# 3. Places it at: modules/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/
 # This is CRITICAL - if the agent isn't pre-built, classloading issues occur
-./gradlew :bytebuf-tracker:agentJar -PwithByteBufTracking
+./gradlew buildByteBufAgent
 
 echo ""
 echo "================================================================================"
