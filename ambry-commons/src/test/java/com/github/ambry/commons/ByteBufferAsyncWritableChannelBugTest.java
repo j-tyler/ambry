@@ -57,8 +57,8 @@ public class ByteBufferAsyncWritableChannelBugTest {
     if (channel != null && channel.isOpen()) {
       channel.close();
     }
-    // Note: We DON'T call leakHelper.afterTest() for bug-exposing tests
-    // because we expect leaks and don't want the test to fail
+    // Call afterTest() to detect leaks - tests will FAIL if leaks exist
+    leakHelper.afterTest();
   }
 
   /**

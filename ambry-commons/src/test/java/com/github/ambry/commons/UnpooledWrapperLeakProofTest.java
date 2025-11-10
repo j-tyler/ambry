@@ -42,8 +42,8 @@ public class UnpooledWrapperLeakProofTest {
 
   @After
   public void tearDown() {
-    // Disabled for leak demonstration tests
-    // leakHelper.afterTest();
+    // Call afterTest() to detect leaks - tests will FAIL if leaks exist
+    leakHelper.afterTest();
   }
 
   /**
