@@ -1446,20 +1446,14 @@ public class PutOperationTest {
 
     op.startOperation();
 
-    // Fill chunks - this will load data into PutChunks
-    op.fillChunks();
-
-    // The operation should try to encrypt the chunk, which will trigger encryptChunk()
-    // encryptChunk() will call: new EncryptJob(..., buf.retainedDuplicate(), ..., kms.getRandomKey(), ...)
-    // Java evaluates arguments left-to-right:
+    // Fill chunks - this triggers the production bug SYNCHRONOUSLY (no background thread needed)
+    // Call stack: fillChunks() → onFillComplete() → encryptChunk() → new EncryptJob(...)
+    // During EncryptJob constructor argument evaluation (left-to-right on calling thread):
     //   1. buf.retainedDuplicate() executes → creates retained copy (refCnt++)
     //   2. kms.getRandomKey() executes → THROWS GeneralSecurityException
-    //   3. EncryptJob constructor never completes
-    //   4. catch block handles exception but has no reference to retainedDuplicate
-    //   5. LEAK: retainedDuplicate orphaned with refCnt=1
-
-    // Give the crypto job handler a moment to process (it runs in background thread)
-    Thread.sleep(100);
+    //   3. Constructor never completes → retainedDuplicate orphaned
+    // The leak happens immediately before fillChunks() returns - no sleep needed!
+    op.fillChunks();
 
     // Clean up crypto job handler
     cryptoJobHandler.close();
