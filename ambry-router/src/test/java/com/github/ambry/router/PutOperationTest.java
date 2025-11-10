@@ -1343,30 +1343,52 @@ public class PutOperationTest {
   // ========== PRODUCTION BUG TESTS - ByteBuf Memory Leaks ==========
 
   /**
-   * PRODUCTION BUG TEST: KMS exception during EncryptJob constructor in PutOperation
+   * Minimal test to verify Java argument evaluation and ByteBuf leak
    *
-   * BUG LOCATION: PutOperation.java:1589-1592 (encryptChunk method)
-   *
-   * This test calls the actual PutOperation production code with a mocked KMS that throws
-   * during getRandomKey(). When PutOperation.encryptChunk() executes:
-   *
-   * <pre>
-   * cryptoJobHandler.submitJob(
-   *   new EncryptJob(...,
-   *       buf.retainedDuplicate(),  // Evaluated FIRST → refCnt++
-   *       ByteBuffer.wrap(...),
-   *       kms.getRandomKey(),       // THROWS!
-   *       ...));
-   * </pre>
-   *
-   * The retainedDuplicate is created during argument evaluation, but the EncryptJob
-   * constructor never completes, leaving the retainedDuplicate orphaned.
-   *
-   * EXPECTED: TEST FAILS with ByteBuf leak detected
-   * AFTER FIX: Pre-evaluate kms.getRandomKey() in try-catch to handle exceptions properly
+   * This test directly demonstrates whether the hypothesized bug exists by:
+   * 1. Creating a ByteBuf
+   * 2. Calling retainedDuplicate() as a constructor argument
+   * 3. Having a later argument throw
+   * 4. Checking if the retainedDuplicate leaked
    */
   @Test
-  public void testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer() throws Exception {
+  public void testMinimal_RetainedDuplicateArgumentEvaluationLeak() throws Exception {
+    ByteBuf originalBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(100);
+    assertEquals("Original starts with refCnt=1", 1, originalBuf.refCnt());
+
+    try {
+      // Simulate EncryptJob constructor call:
+      // new EncryptJob(arg1, arg2, buf.retainedDuplicate(), arg4, throwingArg5)
+      simulateConstructorWithThrowingArg(originalBuf);
+      fail("Should have thrown");
+    } catch (Exception e) {
+      assertEquals("Should be our test exception", "arg5 throws", e.getMessage());
+    }
+
+    // If the bug exists: originalBuf.refCnt() will be 2 (retainedDuplicate incremented it but was orphaned)
+    // If no bug: originalBuf.refCnt() will be 1 (retainedDuplicate was never created or was cleaned up)
+    int finalRefCnt = originalBuf.refCnt();
+
+    originalBuf.release();
+
+    fail("DEBUG: After exception, originalBuf refCnt was " + finalRefCnt +
+         ". If refCnt==2, the retainedDuplicate leaked. If refCnt==1, no leak (bug doesn't exist).");
+  }
+
+  // Simulates: new SomeConstructor(arg1, arg2, buf.retainedDuplicate(), arg4, throwingMethod())
+  private void simulateConstructorWithThrowingArg(ByteBuf buf) throws Exception {
+    // Args evaluated left-to-right
+    ByteBuf arg3 = buf.retainedDuplicate();  // This should increment refCnt
+    ByteBuffer arg4 = ByteBuffer.wrap(new byte[10]);
+    throw new Exception("arg5 throws");  // Throws before constructor completes
+    // Constructor never reached, arg3 orphaned
+  }
+
+  /**
+   * PRODUCTION BUG TEST: KMS exception during EncryptJob constructor in PutOperation
+   */
+  @Test
+  public void testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer_DISABLED() throws Exception {
     // Set up crypto infrastructure
     String defaultKey = TestUtils.getRandomKey(64);
     Properties cryptoProps = new Properties();
