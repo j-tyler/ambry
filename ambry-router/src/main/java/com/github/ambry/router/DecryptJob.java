@@ -110,6 +110,9 @@ class DecryptJob implements CryptoJob {
    */
   @Override
   public void closeJob(GeneralSecurityException gse) {
+    if (encryptedBlobContent != null) {
+      encryptedBlobContent.release();
+    }
     callback.onCompletion(null, gse);
   }
 
