@@ -21,11 +21,16 @@ This document describes the **real production bug tests** that will **FAIL** due
 
 ---
 
-## Test File 1: PutOperationRealBugTest.java
+## Test File: PutOperationRealBugTest.java
 
 **Location:** `ambry-router/src/test/java/com/github/ambry/router/PutOperationRealBugTest.java`
 
-**Status:** ✅ Created, ⚠️ Tests @Ignored until production fixes applied
+**Status:** ✅ Simplified version that compiles, ⚠️ Tests @Ignored until production fixes applied
+
+**Key Implementation Details:**
+- Extends `UnpooledHeapByteBuf` instead of using non-public `WrappedByteBuf`
+- Uses direct method calls to simulate production flow
+- Leak detection fully enabled (not disabled)
 
 ### Tests Included (3 tests)
 
@@ -171,31 +176,6 @@ try {
   throw new RouterException(...);
 }
 ```
-
----
-
-## Test File 2: PutOperationProductionBugTest.java
-
-**Location:** `ambry-router/src/test/java/com/github/ambry/router/PutOperationProductionBugTest.java`
-
-**Status:** ⚠️ Created but incomplete - requires more infrastructure
-
-**Purpose:** Full integration tests that run real PutOperation code paths with injected failures
-
-**Challenges:**
-- PutOperation has many dependencies (router, network client, crypto services, etc.)
-- Requires significant mocking infrastructure
-- More complex to set up than reflection-based tests
-
-**Current State:**
-- Test structure created
-- Helper classes defined (`FaultyByteBuf`, `FaultyKMS`)
-- Implementation TODOs marked
-
-**Next Steps:**
-- Option 1: Extend `NonBlockingRouterTestBase` to support service injection
-- Option 2: Use reflection-based tests (PutOperationRealBugTest) as primary validation
-- Option 3: Create manual integration test scenarios
 
 ---
 
@@ -354,10 +334,11 @@ try {
 
 ## Summary
 
-**Status:** ✅ Real bug tests created and ready
+**Status:** ✅ Real bug tests created, compiled, and ready
 
 **What's Done:**
 - Created `PutOperationRealBugTest.java` with 3 tests
+- Fixed compilation errors (uses `UnpooledHeapByteBuf` instead of non-public `WrappedByteBuf`)
 - Tests use leak detection (enabled)
 - Tests are @Ignored (will fail until fixes applied)
 - Documented all bugs with exact code locations
