@@ -14,8 +14,9 @@ echo "==========================================================================
 echo ""
 echo "This script will:"
 echo "  1. Clean Gradle build cache for ambry-commons module"
-echo "  2. Run all *LeakTest tests related to ByteBufferAsyncWritableChannel"
-echo "  3. Execute tests with ByteBuf tracking enabled (if infrastructure is available)"
+echo "  2. Run ByteBufferAsyncWritableChannelLeakTest (6 tests)"
+echo "  3. Run RetainingAsyncWritableChannelLeakTest (8 tests)"
+echo "  4. Execute tests with ByteBuf tracking enabled (if infrastructure is available)"
 echo ""
 echo "Note: This tests PRODUCTION code, not test code. It's normal for a class to create"
 echo "      a ByteBuf and return it for the caller to manage."
@@ -34,8 +35,11 @@ echo ""
 echo ""
 echo "======================================================================================================"
 echo "[2/3] Running ByteBufferAsyncWritableChannel leak tests..."
-echo "      Test class: ByteBufferAsyncWritableChannelLeakTest"
+echo "      Test classes:"
+echo "        - ByteBufferAsyncWritableChannelLeakTest (6 tests)"
+echo "        - RetainingAsyncWritableChannelLeakTest (8 tests)"
 echo "      Module: ambry-commons"
+echo "      Total: 14 leak detection tests"
 echo ""
 
 # Check if ByteBuf tracking infrastructure is available
@@ -59,6 +63,7 @@ echo ""
 # Use -i for info-level logging to see test execution details
 ./gradlew :ambry-commons:test \
     --tests '*ByteBufferAsyncWritableChannelLeakTest*' \
+    --tests '*RetainingAsyncWritableChannelLeakTest*' \
     --no-build-cache \
     --rerun-tasks \
     -i \
