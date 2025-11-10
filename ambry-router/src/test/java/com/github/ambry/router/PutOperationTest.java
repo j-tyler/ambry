@@ -1453,7 +1453,15 @@ public class PutOperationTest {
     //   2. kms.getRandomKey() executes → THROWS GeneralSecurityException
     //   3. Constructor never completes → retainedDuplicate orphaned
     // The leak happens immediately before fillChunks() returns - no sleep needed!
+
+    System.out.println("DEBUG: About to call fillChunks()");
+    System.out.println("DEBUG: Blob isEncrypted = " + blobProperties.isEncrypted());
+    System.out.println("DEBUG: Blob size = " + blobProperties.getBlobSize());
+
     op.fillChunks();
+
+    System.out.println("DEBUG: fillChunks() completed");
+    System.out.println("DEBUG: Operation exception = " + op.getOperationException());
 
     // Clean up crypto job handler
     cryptoJobHandler.close();
