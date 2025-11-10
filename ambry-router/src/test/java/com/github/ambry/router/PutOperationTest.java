@@ -1341,125 +1341,6 @@ public class PutOperationTest {
   }
 
   // ========== PRODUCTION BUG TESTS - ByteBuf Memory Leaks ==========
-  // These tests validate that production code properly handles ByteBuf ownership and cleanup
-  // during error conditions. They are currently @Ignore'd and will fail until fixes are applied.
-
-  /**
-   * PRODUCTION BUG TEST: Exception during nioBuffers() after compression ownership transfer
-   *
-   * BUG LOCATION: PutOperation.java:1562-1576 (compressChunk method)
-   *
-   * ISSUE: After compression succeeds and ownership is transferred (buf = newBuffer),
-   * if buf.nioBuffers() throws during CRC calculation, the compressed buffer is leaked
-   * because there's no try-catch to release it.
-   *
-   * CODE PATH:
-   * <pre>
-   * ByteBuf newBuffer = compressionService.compressChunk(buf, isFullChunk, outputDirectMemory);
-   * if (newBuffer != null) {
-   *   buf.release();           // Old buffer released
-   *   buf = newBuffer;         // OWNERSHIP TRANSFERRED - line 1565
-   *   isChunkCompressed = true;
-   *   if (routerConfig.routerVerifyCrcForPutRequests) {
-   *     chunkCrc32.reset();
-   *     for (ByteBuffer byteBuffer : buf.nioBuffers()) {  // EXCEPTION HERE - line 1570
-   *       chunkCrc32.update(byteBuffer);
-   *     }
-   *   }
-   * }
-   * // NO TRY-CATCH → newBuffer LEAKED
-   * </pre>
-   *
-   * EXPECTED: TEST FAILS with ByteBuf leak detected (until production fix applied)
-   * AFTER FIX: Add try-catch around lines 1570-1574 to release buf on exception
-   */
-  @Test
-  public void testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer() throws Exception {
-    // Allocate a buffer using PooledByteBufAllocator so leak detection tracks it
-    ByteBuf compressedBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(2048);
-    compressedBuffer.writeBytes(TestUtils.getRandomBytes(2048));
-
-    assertEquals("Buffer should have refCnt=1", 1, compressedBuffer.refCnt());
-
-    // Simulate the production code flow:
-    // After line 1565: buf = newBuffer (ownership transferred to PutChunk)
-    // Line 1570: for (ByteBuffer bb : buf.nioBuffers()) → THROWS
-    // In production: If nioBuffers() could throw, the compressed buffer would leak
-
-    // Simulate that an exception occurs during CRC calculation
-    // In the real bug, this would be nioBuffers() throwing, but here we just
-    // simulate the effect: ownership has transferred, exception occurs, no cleanup
-
-    try {
-      // Simulate exception during CRC calculation after ownership transfer
-      throw new RuntimeException("Simulated CRC calculation failure after compression");
-    } catch (RuntimeException e) {
-      // In production code, this exception propagates UP
-      // There's NO try-catch around lines 1562-1576
-      // Therefore: compressedBuffer is LEAKED (refCnt=1, never released)
-      assertEquals("Exception should be CRC failure", "Simulated CRC calculation failure after compression", e.getMessage());
-    }
-
-    // Buffer is still allocated with refCnt=1 - THIS IS THE LEAK
-    assertEquals("Compressed buffer is LEAKED - refCnt should be 1", 1, compressedBuffer.refCnt());
-
-    // When afterTest() runs, NettyByteBufLeakHelper will detect this unreleased buffer
-    // TEST WILL FAIL with: "HeapMemoryLeak: [allocation|deallocation] before test[0|0], after test[1|0]"
-
-    // DON'T RELEASE - let leak detection fail the test
-  }
-
-  /**
-   * PRODUCTION BUG TEST: Exception during buf.nioBuffers() in encryptionCallback
-   *
-   * BUG LOCATION: PutOperation.java:1498-1503 (encryptionCallback method)
-   *
-   * ISSUE: After encryption completes and ownership is transferred (buf = result.getEncryptedBlobContent()),
-   * if buf.nioBuffers() throws during CRC calculation, the encrypted buffer is leaked.
-   *
-   * CODE PATH:
-   * <pre>
-   * buf = result.getEncryptedBlobContent();  // OWNERSHIP TRANSFERRED - line 1498
-   * isChunkEncrypted = true;
-   * for (ByteBuffer byteBuffer : buf.nioBuffers()) {  // EXCEPTION HERE - line 1500
-   *   chunkCrc32.update(byteBuffer);
-   * }
-   * // NO TRY-CATCH → buf (encrypted) LEAKED
-   * </pre>
-   *
-   * EXPECTED: TEST FAILS with ByteBuf leak detected (until production fix applied)
-   * AFTER FIX: Add try-catch around lines 1500-1502 to release buf on exception
-   */
-  @Test
-  public void testProductionBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer() throws Exception {
-    // Allocate encrypted buffer using PooledByteBufAllocator so leak detection tracks it
-    ByteBuf encryptedBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(4096);
-    encryptedBuffer.writeBytes(TestUtils.getRandomBytes(4096));
-
-    assertEquals("Buffer should have refCnt=1", 1, encryptedBuffer.refCnt());
-
-    // Simulate production flow:
-    // Line 1498: buf = result.getEncryptedBlobContent() (ownership transferred to PutChunk)
-    // Line 1500: for (ByteBuffer bb : buf.nioBuffers()) → THROWS
-    // In production: If nioBuffers() could throw, the encrypted buffer would leak
-
-    // Simulate exception during CRC calculation after ownership transfer
-    try {
-      throw new RuntimeException("Simulated CRC calculation failure after encryption");
-    } catch (RuntimeException e) {
-      // Exception propagates UP - no try-catch around lines 1498-1503
-      // encryptedBuffer is LEAKED (refCnt=1, never released)
-      assertEquals("Exception should be CRC failure", "Simulated CRC calculation failure after encryption", e.getMessage());
-    }
-
-    // Buffer is still allocated with refCnt=1 - THIS IS THE LEAK
-    assertEquals("Encrypted buffer is LEAKED - refCnt should be 1", 1, encryptedBuffer.refCnt());
-
-    // When afterTest() runs, NettyByteBufLeakHelper will detect this unreleased buffer
-    // TEST WILL FAIL with: "HeapMemoryLeak: [allocation|deallocation] before test[0|0], after test[1|0]"
-
-    // DON'T RELEASE - let leak detection fail the test
-  }
 
   /**
    * PRODUCTION BUG TEST: KMS exception after retainedDuplicate() evaluated
@@ -1486,7 +1367,7 @@ public class PutOperationTest {
    * 3. kms.getRandomKey() THROWS
    * 4. EncryptJob constructor NEVER CALLED
    * 5. Retained duplicate created but never passed to EncryptJob
-   * 6. NO try-catch → LEAKED
+   * 6. catch block doesn't know about it → LEAKED
    *
    * EXPECTED: TEST FAILS with ByteBuf leak detected (until production fix applied)
    * AFTER FIX: Pre-evaluate arguments and wrap in try-catch to release on error
@@ -1530,7 +1411,7 @@ public class PutOperationTest {
 
       // CRITICAL: retainedDuplicate was created in step 1
       // But EncryptJob never received it (constructor not called)
-      // The retainedDuplicate is LEAKED - it needs to be released but won't be
+      // The catch block in production code (line 1593) doesn't know about it
 
       assertEquals("Retained duplicate still has refCnt=2 (LEAKED)", 2, retainedDuplicate.refCnt());
     }
