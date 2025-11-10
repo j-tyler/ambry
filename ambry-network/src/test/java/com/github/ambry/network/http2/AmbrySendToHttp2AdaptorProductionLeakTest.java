@@ -310,5 +310,10 @@ public class AmbrySendToHttp2AdaptorProductionLeakTest {
     public ByteBuf content() {
       return content;
     }
+
+    @Override
+    public TestSend replace(ByteBuf content) {
+      return new TestSend(content);
+    }
   }
 }
