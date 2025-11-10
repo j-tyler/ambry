@@ -14,11 +14,15 @@
 package com.github.ambry.router;
 
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.clustermap.MockClusterMap;
+import com.github.ambry.commons.BlobId;
+import com.github.ambry.commons.Callback;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
 import com.github.ambry.utils.TestUtils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.nio.ByteBuffer;
 import java.security.GeneralSecurityException;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
@@ -41,10 +45,15 @@ import static org.junit.Assert.*;
  */
 public class DecryptJobProductionLeakTest {
   private static final int DEFAULT_KEY_SIZE = 64;
+  private static final int RANDOM_KEY_SIZE_IN_BITS = 256;
+  private static final String CLUSTER_NAME = "test-cluster";
   private static final MetricRegistry REGISTRY = new MetricRegistry();
 
   private NettyByteBufLeakHelper leakHelper = new NettyByteBufLeakHelper();
   private GCMCryptoService cryptoService;
+  private KeyManagementService<SecretKeySpec> kms;
+  private CryptoJobMetricsTracker metricsTracker;
+  private BlobId blobId;
   private SecretKeySpec key;
 
   @Before
@@ -52,9 +61,18 @@ public class DecryptJobProductionLeakTest {
     leakHelper.beforeTest();
 
     String defaultKey = TestUtils.getRandomKey(DEFAULT_KEY_SIZE);
-    Properties props = getKMSProperties(defaultKey, DEFAULT_KEY_SIZE);
+    Properties props = getKMSProperties(defaultKey, RANDOM_KEY_SIZE_IN_BITS);
     VerifiableProperties verifiableProperties = new VerifiableProperties(props);
+
+    kms = new SingleKeyManagementServiceFactory(verifiableProperties, CLUSTER_NAME, REGISTRY)
+        .getKeyManagementService();
     cryptoService = (GCMCryptoService) new GCMCryptoServiceFactory(verifiableProperties, REGISTRY).getCryptoService();
+
+    CryptoJobMetrics decryptJobMetrics = new CryptoJobMetrics(DecryptJobProductionLeakTest.class, "Decrypt", REGISTRY);
+    metricsTracker = new CryptoJobMetricsTracker(decryptJobMetrics);
+
+    blobId = new BlobId(BlobId.BLOB_ID_V6, BlobId.BlobIdType.NATIVE, (byte) 0, (short) 1, (short) 1,
+        new MockClusterMap().getWritablePartitionIds(null).get(0), false, BlobId.BlobDataType.DATACHUNK);
 
     byte[] keyBytes = TestUtils.getRandomBytes(32);
     key = new SecretKeySpec(keyBytes, "AES");
@@ -78,36 +96,36 @@ public class DecryptJobProductionLeakTest {
     // Create and encrypt some data
     ByteBuf plaintext = PooledByteBufAllocator.DEFAULT.heapBuffer(1024);
     plaintext.writeBytes(TestUtils.getRandomBytes(1024));
-    ByteBuf encryptedContent = cryptoService.encrypt(plaintext, key);
+
+    SecretKeySpec perBlobKey = kms.getRandomKey();
+    ByteBuf encryptedContent = cryptoService.encrypt(plaintext, perBlobKey);
     plaintext.release();
 
-    // Retain the encrypted content to simulate DecryptJob constructor taking ownership
-    encryptedContent.retain();
+    // Encrypt the key
+    SecretKeySpec containerKey = kms.getKey(null, blobId.getAccountId(), blobId.getContainerId());
+    ByteBuffer encryptedKey = cryptoService.encryptKey(perBlobKey, containerKey);
 
     CountDownLatch callbackLatch = new CountDownLatch(1);
     AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
     AtomicReference<Exception> exceptionRef = new AtomicReference<>();
 
     // Create decrypt job
-    DecryptJob.DecryptJobCallback callback = new DecryptJob.DecryptJobCallback() {
-      @Override
-      public void onJobComplete(DecryptJob.DecryptJobResult result, Exception exception) {
-        resultRef.set(result);
-        exceptionRef.set(exception);
-        callbackLatch.countDown();
-      }
+    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
+      resultRef.set(result);
+      exceptionRef.set(exception);
+      callbackLatch.countDown();
     };
 
     DecryptJob decryptJob = new DecryptJob(
-        (short) 1,
-        (short) 1,
+        blobId,
+        encryptedKey,
         encryptedContent,
         null,
-        key,
         cryptoService,
         kms,
-        callback,
-        null
+        null,
+        metricsTracker,
+        callback
     );
 
     // Abort the job BEFORE run() is called (simulates operation timeout/cancellation)
@@ -120,8 +138,9 @@ public class DecryptJobProductionLeakTest {
     assertNotNull("Exception should be set", exceptionRef.get());
     assertNull("Result should be null on abort", resultRef.get());
 
-    // Release our reference to encryptedContent
-    encryptedContent.release();
+    // Release our reference to encryptedContent (bug: closeJob should have done this)
+    // If bug exists: encryptedContent.refCnt() will be 1, test FAILS with leak detection
+    // After fix: encryptedContent.refCnt() will be 0
 
     // If bug exists: encryptedBlobContent was never released by closeJob()
     // Test will FAIL here with leak detection error
@@ -143,35 +162,35 @@ public class DecryptJobProductionLeakTest {
     // Create and encrypt some data
     ByteBuf plaintext = PooledByteBufAllocator.DEFAULT.heapBuffer(2048);
     plaintext.writeBytes(TestUtils.getRandomBytes(2048));
-    ByteBuf encryptedContent = cryptoService.encrypt(plaintext, key);
+
+    SecretKeySpec perBlobKey = kms.getRandomKey();
+    ByteBuf encryptedContent = cryptoService.encrypt(plaintext, perBlobKey);
     plaintext.release();
 
-    // Use a slow crypto service to create timing window
-    encryptedContent.retain();
+    // Encrypt the key
+    SecretKeySpec containerKey = kms.getKey(null, blobId.getAccountId(), blobId.getContainerId());
+    ByteBuffer encryptedKey = cryptoService.encryptKey(perBlobKey, containerKey);
 
     CountDownLatch jobStarted = new CountDownLatch(1);
     CountDownLatch proceedWithClose = new CountDownLatch(1);
     CountDownLatch callbackLatch = new CountDownLatch(1);
     AtomicReference<Exception> exceptionRef = new AtomicReference<>();
 
-    DecryptJob.DecryptJobCallback callback = new DecryptJob.DecryptJobCallback() {
-      @Override
-      public void onJobComplete(DecryptJob.DecryptJobResult result, Exception exception) {
-        exceptionRef.set(exception);
-        callbackLatch.countDown();
-      }
+    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
+      exceptionRef.set(exception);
+      callbackLatch.countDown();
     };
 
     DecryptJob decryptJob = new DecryptJob(
-        (short) 1,
-        (short) 1,
+        blobId,
+        encryptedKey,
         encryptedContent,
         null,
-        key,
         cryptoService,
         kms,
-        callback,
-        null
+        null,
+        metricsTracker,
+        callback
     );
 
     // Start job in separate thread
@@ -212,38 +231,40 @@ public class DecryptJobProductionLeakTest {
       // Create and encrypt data
       ByteBuf plaintext = PooledByteBufAllocator.DEFAULT.heapBuffer(512);
       plaintext.writeBytes(TestUtils.getRandomBytes(512));
-      ByteBuf encryptedContent = cryptoService.encrypt(plaintext, key);
+
+      SecretKeySpec perBlobKey = kms.getRandomKey();
+      ByteBuf encryptedContent = cryptoService.encrypt(plaintext, perBlobKey);
       plaintext.release();
 
-      encryptedContent.retain();
+      // Encrypt the key
+      SecretKeySpec containerKey = kms.getKey(null, blobId.getAccountId(), blobId.getContainerId());
+      ByteBuffer encryptedKey = cryptoService.encryptKey(perBlobKey, containerKey);
 
       CountDownLatch callbackLatch = new CountDownLatch(1);
 
-      DecryptJob.DecryptJobCallback callback = new DecryptJob.DecryptJobCallback() {
-        @Override
-        public void onJobComplete(DecryptJob.DecryptJobResult result, Exception exception) {
-          callbackLatch.countDown();
-        }
+      Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
+        callbackLatch.countDown();
       };
 
       DecryptJob decryptJob = new DecryptJob(
-          (short) 1,
-          (short) 1,
+          blobId,
+          encryptedKey,
           encryptedContent,
           null,
-          key,
           cryptoService,
           kms,
-          callback,
-          null
+          null,
+          metricsTracker,
+          callback
       );
 
       // Abort immediately
       decryptJob.closeJob(new GeneralSecurityException("Operation " + i + " aborted"));
       callbackLatch.await();
 
-      // Release our reference
-      encryptedContent.release();
+      // Release our reference (bug: closeJob should have done this)
+      // If bug exists: encryptedContent leaked, test FAILS
+      // After fix: encryptedContent already released by closeJob
     }
 
     // If bug exists: 10 buffers leaked

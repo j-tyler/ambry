@@ -13,8 +13,7 @@
  */
 package com.github.ambry.router;
 
-import com.github.ambry.compression.CompressionService;
-import com.github.ambry.compression.LZ4CompressionService;
+import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.config.CompressionConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
@@ -51,7 +50,8 @@ public class GetBlobOperationDecompressionProductionLeakTest {
     Properties props = new Properties();
     props.setProperty("compression.algorithm", "LZ4");
     CompressionConfig compressionConfig = new CompressionConfig(new VerifiableProperties(props));
-    decompressionService = new LZ4CompressionService(compressionConfig);
+    CompressionMetrics metrics = new CompressionMetrics(new MetricRegistry());
+    decompressionService = new CompressionService(compressionConfig, metrics);
   }
 
   @After
@@ -86,7 +86,7 @@ public class GetBlobOperationDecompressionProductionLeakTest {
     assertNotNull("Compression should succeed", compressed);
 
     // Decompress (simulates decompressContent() return at line 882)
-    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes());
+    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes(), false);
     assertNotNull("Decompression should succeed", decompressed);
     assertEquals("Decompressed size should match", sourceData.readableBytes(), decompressed.readableBytes());
 
@@ -140,7 +140,7 @@ public class GetBlobOperationDecompressionProductionLeakTest {
     ByteBuf compressed = compressionService.compressChunk(sourceData.duplicate(), true, false);
 
     // Decompress
-    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes());
+    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes(), false);
     assertNotNull("Decompression should succeed", decompressed);
 
     // Simulate filterChunkToRange() exception (line 884)
@@ -190,7 +190,7 @@ public class GetBlobOperationDecompressionProductionLeakTest {
     ByteBuf compressed = compressionService.compressChunk(sourceData.duplicate(), true, false);
 
     // Decompress (simulates decompressContent() in simple blob path)
-    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes());
+    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes(), false);
     assertNotNull("Decompression should succeed", decompressed);
 
     // Simulate resolveRange() exception before safeRelease()
@@ -232,7 +232,7 @@ public class GetBlobOperationDecompressionProductionLeakTest {
 
       CompressionService compressionService = decompressionService;
       ByteBuf compressed = compressionService.compressChunk(sourceData.duplicate(), true, false);
-      ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes());
+      ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes(), false);
 
       // Simulate exception after decompression
       try {
@@ -273,7 +273,7 @@ public class GetBlobOperationDecompressionProductionLeakTest {
     ByteBuf compressed = compressionService.compressChunk(sourceData.duplicate(), true, false);
 
     // Decompress
-    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes());
+    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes(), false);
     assertNotNull("Decompression should succeed", decompressed);
     assertEquals("Decompressed size should match", sourceData.readableBytes(), decompressed.readableBytes());
 
@@ -314,7 +314,7 @@ public class GetBlobOperationDecompressionProductionLeakTest {
 
     CompressionService compressionService = decompressionService;
     ByteBuf compressed = compressionService.compressChunk(sourceData.duplicate(), true, false);
-    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes());
+    ByteBuf decompressed = decompressionService.decompress(compressed.duplicate(), sourceData.readableBytes(), false);
 
     // Simulate exception
     try {

@@ -13,8 +13,7 @@
  */
 package com.github.ambry.router;
 
-import com.github.ambry.compression.CompressionService;
-import com.github.ambry.compression.LZ4CompressionService;
+import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.config.CompressionConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
@@ -50,7 +49,8 @@ public class PutOperationCompressionProductionLeakTest {
     Properties props = new Properties();
     props.setProperty("compression.algorithm", "LZ4");
     CompressionConfig compressionConfig = new CompressionConfig(new VerifiableProperties(props));
-    compressionService = new LZ4CompressionService(compressionConfig);
+    CompressionMetrics metrics = new CompressionMetrics(new MetricRegistry());
+    compressionService = new CompressionService(compressionConfig, metrics);
   }
 
   @After
