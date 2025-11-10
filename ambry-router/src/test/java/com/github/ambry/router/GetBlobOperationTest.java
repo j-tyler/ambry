@@ -76,6 +76,7 @@ import io.netty.buffer.Unpooled;
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -2076,8 +2077,9 @@ public class GetBlobOperationTest {
 
     // Invoke the decompressContent method on the compressed buffer.
     ByteBuf compressedByteBuf = Unpooled.wrappedBuffer((ByteBuffer) compressedBuffer.flip());
-    ByteBuf decompressedByteBuf =
-        (ByteBuf) MethodUtils.invokeMethod(firstChunk, true, "decompressContent", compressedByteBuf);
+    Method decompressMethod = firstChunk.getClass().getDeclaredMethod("decompressContent", ByteBuf.class);
+    decompressMethod.setAccessible(true);
+    ByteBuf decompressedByteBuf = (ByteBuf) decompressMethod.invoke(firstChunk, compressedByteBuf);
     byte[] decompressedData = new byte[decompressedByteBuf.readableBytes()];
     decompressedByteBuf.readBytes(decompressedData);
     decompressedByteBuf.release();

@@ -51,50 +51,34 @@ public class AggregatedAccountReportsDaoTest {
   private final String queryMonthValue = "2020-01";
 
   public AggregatedAccountReportsDaoTest() throws SQLException {
-    // Mock inserts
+    // Mock inserts - don't stub executeUpdate() here, let each test stub as needed
     mockInsertAggregatedStatement = mock(PreparedStatement.class);
-    when(mockInsertAggregatedStatement.executeUpdate()).thenReturn(1);
     mockInsertCopyStatement = mock(PreparedStatement.class);
-    when(mockInsertCopyStatement.executeUpdate()).thenReturn(1);
     mockInsertMonthStatement = mock(PreparedStatement.class);
-    when(mockInsertMonthStatement.executeUpdate()).thenReturn(1);
 
-    // Mock select statement
+    // Mock select statements - don't stub executeQuery() here, let each test stub as needed
     mockQueryAggregatedStatement = mock(PreparedStatement.class);
-    ResultSet mockResultSet = mock(ResultSet.class);
-    when(mockResultSet.next()).thenReturn(true).thenReturn(false);
-    when(mockResultSet.getInt(eq(AggregatedAccountReportsDao.ACCOUNT_ID_COLUMN))).thenReturn(queryAccountId);
-    when(mockResultSet.getInt(eq(AggregatedAccountReportsDao.CONTAINER_ID_COLUMN))).thenReturn(queryContainerId);
-    when(mockResultSet.getLong(eq(AggregatedAccountReportsDao.STORAGE_USAGE_COLUMN))).thenReturn(queryStorageUsage);
-    when(mockResultSet.getLong(eq(AggregatedAccountReportsDao.PHYSICAL_STORAGE_USAGE_COLUMN))).thenReturn(
-        queryStorageUsage);
-    when(mockResultSet.getLong(eq(AggregatedAccountReportsDao.NUMBER_OF_BLOBS_COLUMN))).thenReturn(1L);
-    when(mockQueryAggregatedStatement.executeQuery()).thenReturn(mockResultSet);
-
     mockQueryMonthStatement = mock(PreparedStatement.class);
-    mockResultSet = mock(ResultSet.class);
-    when(mockResultSet.next()).thenReturn(true).thenReturn(false);
-    when(mockResultSet.getString(eq(AggregatedAccountReportsDao.MONTH_COLUMN))).thenReturn(queryMonthValue);
-    when(mockQueryMonthStatement.executeQuery()).thenReturn(mockResultSet);
 
     // Set mocked statements in the mock connection
+    // These stubbings are lenient because exception tests create fresh DAOs and don't use them
     mockConnection = mock(Connection.class);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         contains("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_TABLE))).thenReturn(
         mockInsertAggregatedStatement);
-    when(mockConnection.prepareStatement(contains(
+    lenient().when(mockConnection.prepareStatement(contains(
         "INSERT " + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + " SELECT"))).thenReturn(
         mockInsertCopyStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         contains("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE))).thenReturn(
         mockInsertMonthStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         matches("SELECT.+" + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE + ".+"))).thenReturn(
         mockQueryMonthStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         matches("SELECT.+" + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_TABLE + " .+"))).thenReturn(
         mockQueryAggregatedStatement);
-    when(mockConnection.prepareStatement(
+    lenient().when(mockConnection.prepareStatement(
         matches("SELECT.+" + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + ".+"))).thenReturn(
         mockQueryAggregatedStatement);
 
@@ -114,8 +98,33 @@ public class AggregatedAccountReportsDaoTest {
     return mockDataSource;
   }
 
+  /**
+   * Helper to stub aggregated stats query ResultSet.
+   */
+  private void stubAggregatedStatsResultSet() throws SQLException {
+    ResultSet mockResultSet = mock(ResultSet.class);
+    when(mockResultSet.next()).thenReturn(true).thenReturn(false);
+    when(mockResultSet.getInt(eq(AggregatedAccountReportsDao.ACCOUNT_ID_COLUMN))).thenReturn(queryAccountId);
+    when(mockResultSet.getInt(eq(AggregatedAccountReportsDao.CONTAINER_ID_COLUMN))).thenReturn(queryContainerId);
+    when(mockResultSet.getLong(eq(AggregatedAccountReportsDao.STORAGE_USAGE_COLUMN))).thenReturn(queryStorageUsage);
+    when(mockResultSet.getLong(eq(AggregatedAccountReportsDao.PHYSICAL_STORAGE_USAGE_COLUMN))).thenReturn(queryStorageUsage);
+    when(mockResultSet.getLong(eq(AggregatedAccountReportsDao.NUMBER_OF_BLOBS_COLUMN))).thenReturn(1L);
+    when(mockQueryAggregatedStatement.executeQuery()).thenReturn(mockResultSet);
+  }
+
+  /**
+   * Helper to stub month query ResultSet.
+   */
+  private void stubMonthResultSet() throws SQLException {
+    ResultSet mockResultSet = mock(ResultSet.class);
+    when(mockResultSet.next()).thenReturn(true).thenReturn(false);
+    when(mockResultSet.getString(eq(AggregatedAccountReportsDao.MONTH_COLUMN))).thenReturn(queryMonthValue);
+    when(mockQueryMonthStatement.executeQuery()).thenReturn(mockResultSet);
+  }
+
   @Test
   public void testInsertAggregatedStats() throws Exception {
+    lenient().when(mockInsertAggregatedStatement.executeUpdate()).thenReturn(1);
     short accountId = 10;
     short containerId = 1;
     long storageUsage = 1000;
@@ -129,14 +138,28 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertAggregatedStatsWithException() throws Exception {
-    when(mockInsertAggregatedStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
+    // Create completely fresh mocks to avoid ByteBuddy instrumentation issues
+    PreparedStatement throwingStatement = mock(PreparedStatement.class);
+    when(throwingStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
+
+    Connection freshConnection = mock(Connection.class);
+    when(freshConnection.prepareStatement(
+        contains("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_TABLE)))
+        .thenReturn(throwingStatement);
+
+    DataSource freshDataSource = mock(DataSource.class);
+    when(freshDataSource.getConnection()).thenReturn(freshConnection);
+
+    AggregatedAccountReportsDao freshDao = new AggregatedAccountReportsDao(freshDataSource, metrics);
+
     TestUtils.assertException(SQLTransientConnectionException.class,
-        () -> aggregatedAccountReportsDao.updateStorageUsage(clusterName, (short) 1, (short) 1000, 100000), null);
+        () -> freshDao.updateStorageUsage(clusterName, (short) 1, (short) 1000, 100000), null);
     assertEquals("Write failure count should be 1", 1, metrics.writeFailureCount.getCount());
   }
 
   @Test
   public void testInsertCopy() throws Exception {
+    lenient().when(mockInsertCopyStatement.executeUpdate()).thenReturn(1);
     aggregatedAccountReportsDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName);
     verify(mockConnection).prepareStatement(anyString());
     assertEquals("Copy success count should be 1", 1, metrics.copySuccessCount.getCount());
@@ -148,14 +171,28 @@ public class AggregatedAccountReportsDaoTest {
 
   @Test
   public void testInsertCopyWithException() throws Exception {
-    when(mockInsertCopyStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
+    // Create completely fresh mocks to avoid ByteBuddy instrumentation issues
+    PreparedStatement throwingStatement = mock(PreparedStatement.class);
+    when(throwingStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
+
+    Connection freshConnection = mock(Connection.class);
+    when(freshConnection.prepareStatement(contains(
+        "INSERT " + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + " SELECT")))
+        .thenReturn(throwingStatement);
+
+    DataSource freshDataSource = mock(DataSource.class);
+    when(freshDataSource.getConnection()).thenReturn(freshConnection);
+
+    AggregatedAccountReportsDao freshDao = new AggregatedAccountReportsDao(freshDataSource, metrics);
+
     TestUtils.assertException(SQLTransientConnectionException.class,
-        () -> aggregatedAccountReportsDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
+        () -> freshDao.copyAggregatedUsageToMonthlyAggregatedTableForCluster(clusterName), null);
     assertEquals("Copy failure count should be 1", 1, metrics.copyFailureCount.getCount());
   }
 
   @Test
   public void testInsertMonth() throws Exception {
+    lenient().when(mockInsertMonthStatement.executeUpdate()).thenReturn(1);
     long writeSuccessCountBefore = metrics.writeSuccessCount.getCount();
     aggregatedAccountReportsDao.updateMonth(clusterName, "2020-01");
     verify(mockConnection).prepareStatement(anyString());
@@ -170,15 +207,30 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testInsertMonthWithException() throws Exception {
     long writeFailureCountBefore = metrics.writeFailureCount.getCount();
-    when(mockInsertMonthStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
+
+    // Create completely fresh mocks to avoid ByteBuddy instrumentation issues
+    PreparedStatement throwingStatement = mock(PreparedStatement.class);
+    when(throwingStatement.executeUpdate()).thenThrow(new SQLTransientConnectionException());
+
+    Connection freshConnection = mock(Connection.class);
+    when(freshConnection.prepareStatement(
+        contains("INSERT INTO " + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE)))
+        .thenReturn(throwingStatement);
+
+    DataSource freshDataSource = mock(DataSource.class);
+    when(freshDataSource.getConnection()).thenReturn(freshConnection);
+
+    AggregatedAccountReportsDao freshDao = new AggregatedAccountReportsDao(freshDataSource, metrics);
+
     TestUtils.assertException(SQLTransientConnectionException.class,
-        () -> aggregatedAccountReportsDao.updateMonth(clusterName, "2020-01"), null);
+        () -> freshDao.updateMonth(clusterName, "2020-01"), null);
     assertEquals("Write failure count should be " + (writeFailureCountBefore + 1), writeFailureCountBefore + 1,
         metrics.writeFailureCount.getCount());
   }
 
   @Test
   public void testQueryAggregatedStats() throws Exception {
+    stubAggregatedStatsResultSet();
     long readSuccessCountBefore = metrics.readSuccessCount.getCount();
     aggregatedAccountReportsDao.queryContainerUsageForCluster(clusterName, (accountId, containerStats) -> {
       assertEquals(queryAccountId, accountId);
@@ -195,15 +247,30 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryAggregatedStatsWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
-    when(mockQueryAggregatedStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
+
+    // Create completely fresh mocks to avoid ByteBuddy instrumentation issues
+    PreparedStatement throwingStatement = mock(PreparedStatement.class);
+    when(throwingStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
+
+    Connection freshConnection = mock(Connection.class);
+    when(freshConnection.prepareStatement(
+        matches("SELECT.+" + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_TABLE + " .+")))
+        .thenReturn(throwingStatement);
+
+    DataSource freshDataSource = mock(DataSource.class);
+    when(freshDataSource.getConnection()).thenReturn(freshConnection);
+
+    AggregatedAccountReportsDao freshDao = new AggregatedAccountReportsDao(freshDataSource, metrics);
+
     TestUtils.assertException(SQLTransientConnectionException.class,
-        () -> aggregatedAccountReportsDao.queryContainerUsageForCluster(clusterName, null), null);
+        () -> freshDao.queryContainerUsageForCluster(clusterName, null), null);
     assertEquals("Read failure count should be " + (readFailureCountBefore + 1), readFailureCountBefore + 1,
         metrics.readFailureCount.getCount());
   }
 
   @Test
   public void testQueryMonthlyAggregatedStats() throws Exception {
+    stubAggregatedStatsResultSet();
     long readSuccessCountBefore = metrics.readSuccessCount.getCount();
     aggregatedAccountReportsDao.queryMonthlyContainerUsageForCluster(clusterName, (accountId, containerStats) -> {
       assertEquals(queryAccountId, accountId);
@@ -220,15 +287,30 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryMonthlyAggregatedStatsWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
-    when(mockQueryAggregatedStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
+
+    // Create completely fresh mocks to avoid ByteBuddy instrumentation issues
+    PreparedStatement throwingStatement = mock(PreparedStatement.class);
+    when(throwingStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
+
+    Connection freshConnection = mock(Connection.class);
+    when(freshConnection.prepareStatement(
+        matches("SELECT.+" + AggregatedAccountReportsDao.MONTHLY_AGGREGATED_ACCOUNT_REPORTS_TABLE + ".+")))
+        .thenReturn(throwingStatement);
+
+    DataSource freshDataSource = mock(DataSource.class);
+    when(freshDataSource.getConnection()).thenReturn(freshConnection);
+
+    AggregatedAccountReportsDao freshDao = new AggregatedAccountReportsDao(freshDataSource, metrics);
+
     TestUtils.assertException(SQLTransientConnectionException.class,
-        () -> aggregatedAccountReportsDao.queryMonthlyContainerUsageForCluster(clusterName, null), null);
+        () -> freshDao.queryMonthlyContainerUsageForCluster(clusterName, null), null);
     assertEquals("Read failure count should be " + (readFailureCountBefore + 1), readFailureCountBefore + 1,
         metrics.readFailureCount.getCount());
   }
 
   @Test
   public void testQueryMonth() throws Exception {
+    stubMonthResultSet();
     long readSuccessCountBefore = metrics.readSuccessCount.getCount();
     String monthValue = aggregatedAccountReportsDao.queryMonthForCluster(clusterName);
     assertTrue(queryMonthValue.equals(monthValue));
@@ -240,9 +322,23 @@ public class AggregatedAccountReportsDaoTest {
   @Test
   public void testQueryMonthWithException() throws Exception {
     long readFailureCountBefore = metrics.readFailureCount.getCount();
-    when(mockQueryMonthStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
+
+    // Create completely fresh mocks to avoid ByteBuddy instrumentation issues
+    PreparedStatement throwingStatement = mock(PreparedStatement.class);
+    when(throwingStatement.executeQuery()).thenThrow(new SQLTransientConnectionException());
+
+    Connection freshConnection = mock(Connection.class);
+    when(freshConnection.prepareStatement(
+        matches("SELECT.+" + AggregatedAccountReportsDao.AGGREGATED_ACCOUNT_REPORTS_MONTH_TABLE + ".+")))
+        .thenReturn(throwingStatement);
+
+    DataSource freshDataSource = mock(DataSource.class);
+    when(freshDataSource.getConnection()).thenReturn(freshConnection);
+
+    AggregatedAccountReportsDao freshDao = new AggregatedAccountReportsDao(freshDataSource, metrics);
+
     TestUtils.assertException(SQLTransientConnectionException.class,
-        () -> aggregatedAccountReportsDao.queryMonthForCluster(clusterName), null);
+        () -> freshDao.queryMonthForCluster(clusterName), null);
     assertEquals("Read failure count should be " + (readFailureCountBefore + 1), readFailureCountBefore + 1,
         metrics.readFailureCount.getCount());
   }

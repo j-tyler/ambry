@@ -293,7 +293,7 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
    * Representation of all the data associated with a chunk i.e. the actual bytes and the future and callback that need to
    * be invoked on resolution.
    */
-  private static class ChunkData {
+  static class ChunkData {
     /**
      * The future that will be set on chunk resolution.
      */
