@@ -1374,7 +1374,6 @@ public class PutOperationTest {
    * AFTER FIX: Add try-catch around lines 1570-1574 to release buf on exception
    */
   @Test
-  @org.junit.Ignore("PRODUCTION BUG: Will fail until PutOperation.java:1562-1576 is fixed with try-catch")
   public void testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer() throws Exception {
     // Create a ByteBuf that will throw during nioBuffers()
     ByteBuf compressedBuffer = new ThrowingNioBuffersByteBuf(2048);
@@ -1403,8 +1402,7 @@ public class PutOperationTest {
     // When afterTest() runs, leak detection will find this buffer
     // TEST WILL FAIL with: "ByteBuf leak detected: 1 buffer(s) not released"
 
-    // NOTE: Remove this line to see the actual leak failure
-    compressedBuffer.release(); // Remove this to see leak failure
+    // Manual cleanup removed - let leak detection catch the leak and fail the test
   }
 
   /**
@@ -1429,7 +1427,6 @@ public class PutOperationTest {
    * AFTER FIX: Add try-catch around lines 1500-1502 to release buf on exception
    */
   @Test
-  @org.junit.Ignore("PRODUCTION BUG: Will fail until PutOperation.java:1498-1503 is fixed with try-catch")
   public void testProductionBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer() throws Exception {
     // Create encrypted buffer that will throw during nioBuffers()
     ByteBuf encryptedBuffer = new ThrowingNioBuffersByteBuf(4096);
@@ -1452,8 +1449,7 @@ public class PutOperationTest {
 
     assertEquals("Encrypted buffer is LEAKED - refCnt should be 1", 1, encryptedBuffer.refCnt());
 
-    // Remove this to see real leak failure
-    encryptedBuffer.release();
+    // Manual cleanup removed - let leak detection catch the leak and fail the test
   }
 
   /**
@@ -1487,7 +1483,6 @@ public class PutOperationTest {
    * AFTER FIX: Pre-evaluate arguments and wrap in try-catch to release on error
    */
   @Test
-  @org.junit.Ignore("PRODUCTION BUG: Will fail until PutOperation.java:1589-1592 is fixed")
   public void testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer() throws Exception {
     // Create original buffer
     ByteBuf originalBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(4096);
@@ -1533,8 +1528,7 @@ public class PutOperationTest {
     // But retained duplicate is still leaked!
     assertEquals("Retained duplicate STILL LEAKED - refCnt=1", 1, retainedDuplicate.refCnt());
 
-    // Remove this to see real leak failure
-    retainedDuplicate.release();
+    // Manual cleanup removed - let leak detection catch the leak and fail the test
   }
 
   /**
