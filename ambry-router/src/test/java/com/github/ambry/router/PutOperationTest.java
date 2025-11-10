@@ -1456,11 +1456,14 @@ public class PutOperationTest {
 
     op.fillChunks();
 
-    // Force test to show diagnostic info
-    fail("DEBUG: isEncrypted=" + blobProperties.isEncrypted() +
-         ", blobSize=" + blobProperties.getBlobSize() +
-         ", operationException=" + op.getOperationException() +
-         ", isDone=" + op.isOperationComplete());
+    cryptoJobHandler.close();
+
+    // The bug occurred: kms.getRandomKey() threw after retainedDuplicate() was evaluated
+    // The operation completed with exception: isDone=true
+    // But cleanup doesn't handle Encrypting state chunks properly
+    //
+    // The question is: does the leak actually occur?
+    // Let afterTest() check for leaks (it will pass or fail based on actual memory state)
   }
 
 }
