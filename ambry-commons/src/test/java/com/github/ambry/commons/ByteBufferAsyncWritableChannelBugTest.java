@@ -80,8 +80,8 @@ public class ByteBufferAsyncWritableChannelBugTest {
   public void testWriteByteBufferToClosedChannelLeaksWrapper() throws Exception {
     leakHelper.setDisabled(true);  // This is a bug-exposing test
 
-    // Create a ByteBuffer (caller-owned, will be released by caller)
-    ByteBuffer nioBuffer = ByteBuffer.allocate(100);
+    // Create a DIRECT ByteBuffer (critical: uses native memory, never GC'd)
+    ByteBuffer nioBuffer = ByteBuffer.allocateDirect(100);
     nioBuffer.put(new byte[100]);
     nioBuffer.flip();
 
@@ -132,9 +132,9 @@ public class ByteBufferAsyncWritableChannelBugTest {
   public void testWriteByteBufferThenCloseLeaksWrapper() throws Exception {
     leakHelper.setDisabled(true);  // This is a bug-exposing test
 
-    // Create ByteBuffers (caller-owned)
-    ByteBuffer nioBuffer1 = ByteBuffer.allocate(100);
-    ByteBuffer nioBuffer2 = ByteBuffer.allocate(200);
+    // Create DIRECT ByteBuffers (critical: use native memory, never GC'd)
+    ByteBuffer nioBuffer1 = ByteBuffer.allocateDirect(100);
+    ByteBuffer nioBuffer2 = ByteBuffer.allocateDirect(200);
     nioBuffer1.put(new byte[100]);
     nioBuffer2.put(new byte[200]);
     nioBuffer1.flip();
@@ -194,8 +194,8 @@ public class ByteBufferAsyncWritableChannelBugTest {
   public void testWriteByteBufferNormalFlowLeaksWrapper() throws Exception {
     leakHelper.setDisabled(true);  // This is a bug-exposing test
 
-    // Create ByteBuffer (caller-owned)
-    ByteBuffer nioBuffer = ByteBuffer.allocate(100);
+    // Create DIRECT ByteBuffer (critical: uses native memory, never GC'd)
+    ByteBuffer nioBuffer = ByteBuffer.allocateDirect(100);
     nioBuffer.put(new byte[100]);
     nioBuffer.flip();
 
@@ -252,9 +252,9 @@ public class ByteBufferAsyncWritableChannelBugTest {
     ByteBuffer[] nioBuffers = new ByteBuffer[writeCount];
     CountDownLatch latch = new CountDownLatch(writeCount);
 
-    // Write multiple ByteBuffers
+    // Write multiple DIRECT ByteBuffers (critical: use native memory, never GC'd)
     for (int i = 0; i < writeCount; i++) {
-      nioBuffers[i] = ByteBuffer.allocate(100 + i * 10);
+      nioBuffers[i] = ByteBuffer.allocateDirect(100 + i * 10);
       nioBuffers[i].put(new byte[100 + i * 10]);
       nioBuffers[i].flip();
 
@@ -295,8 +295,8 @@ public class ByteBufferAsyncWritableChannelBugTest {
 
     CountDownLatch latch = new CountDownLatch(2);
 
-    // Write 1: ByteBuf (caller-owned, we'll release it)
-    ByteBuf byteBuf = Unpooled.buffer(100);
+    // Write 1: DIRECT ByteBuf (caller-owned, we'll release it properly)
+    ByteBuf byteBuf = Unpooled.directBuffer(100);
     byteBuf.writeBytes(new byte[100]);
 
     channel.write(byteBuf, new Callback<Long>() {
@@ -307,8 +307,8 @@ public class ByteBufferAsyncWritableChannelBugTest {
       }
     });
 
-    // Write 2: ByteBuffer (wrapper created internally, we CAN'T release it)
-    ByteBuffer nioBuffer = ByteBuffer.allocate(100);
+    // Write 2: DIRECT ByteBuffer (wrapper created internally, we CAN'T release it)
+    ByteBuffer nioBuffer = ByteBuffer.allocateDirect(100);
     nioBuffer.put(new byte[100]);
     nioBuffer.flip();
 
