@@ -1382,13 +1382,22 @@ public class PutOperationTest {
   }
 
   // Simulates: new SomeConstructor(arg1, arg2, buf.retainedDuplicate(), arg4, throwingMethod())
-  // WITHOUT FIX - demonstrates the bug
+  // WITH FIX - pre-evaluate arguments and cleanup on exception
   private void simulateConstructorWithThrowingArg(ByteBuf buf) throws Exception {
-    // Args evaluated left-to-right - bug occurs here:
-    ByteBuf arg3 = buf.retainedDuplicate();  // This increments refCnt
-    ByteBuffer arg4 = ByteBuffer.wrap(new byte[10]);
-    throw new Exception("arg5 throws");  // Throws before constructor completes
-    // Constructor never reached, arg3 is orphaned and leaked!
+    ByteBuf retainedCopy = null;
+    try {
+      // Pre-evaluate arguments to avoid leak if exception occurs
+      retainedCopy = buf.retainedDuplicate();  // This increments refCnt
+      ByteBuffer arg4 = ByteBuffer.wrap(new byte[10]);
+      throw new Exception("arg5 throws");  // Throws before constructor completes
+      // Constructor never reached
+    } catch (Exception e) {
+      // Fix: clean up the retainedCopy that was created before the exception
+      if (retainedCopy != null) {
+        retainedCopy.release();
+      }
+      throw e;
+    }
   }
 
   /**
