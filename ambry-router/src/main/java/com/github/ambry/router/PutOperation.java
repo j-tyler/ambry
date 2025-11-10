@@ -1589,7 +1589,7 @@ class PutOperation {
         logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
         // Pre-evaluate arguments to avoid leak if exception occurs after retainedDuplicate()
         retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
-        javax.crypto.spec.SecretKeySpec randomKey = kms.getRandomKey();
+        javax.crypto.spec.SecretKeySpec randomKey = (javax.crypto.spec.SecretKeySpec) kms.getRandomKey();
         cryptoJobHandler.submitJob(
             new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
                 retainedCopy, ByteBuffer.wrap(chunkUserMetadata),
