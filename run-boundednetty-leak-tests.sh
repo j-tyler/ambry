@@ -35,7 +35,7 @@ echo ""
 echo "Running leak tests with ByteBuf tracking..."
 echo ""
 ./gradlew :ambry-network:test \
-  --tests "com.github.ambry.network.BoundedNettyByteBufReceiveLeakTest" \
+  --tests "com.github.ambry.network.BoundedNettyByteBufReceiveTest" \
   -PwithByteBufTracking \
   --no-build-cache \
   --rerun-tasks
