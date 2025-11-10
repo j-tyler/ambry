@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Script to run NettyRequestWriteContentLeakTest
+# Script to run NettyRequest.writeContent() leak tests
+# These tests are now integrated into NettyRequestTest.java
 # This test should FAIL with current production code due to the leak bug
 # After fixing NettyRequest.writeContent(), this test should PASS
 
@@ -22,7 +23,9 @@ echo ""
 echo "[1/2] Running test WITHOUT ByteBuf tracker..."
 echo "=================================================="
 ./gradlew :ambry-rest:test \
-  --tests "NettyRequestWriteContentLeakTest" \
+  --tests "NettyRequestTest.testWriteContentExceptionLeaksRetainedBuffer" \
+  --tests "NettyRequestTest.testWriteContentSuccessProperlyReleasesBuffer" \
+  --tests "NettyRequestTest.testMultipleContentChunksWithWriteFailureLeakAll" \
   --no-build-cache \
   --rerun-tasks
 
@@ -30,7 +33,9 @@ echo ""
 echo "[2/2] Running test WITH ByteBuf tracker for detailed leak analysis..."
 echo "=================================================="
 ./gradlew :ambry-rest:test \
-  --tests "NettyRequestWriteContentLeakTest" \
+  --tests "NettyRequestTest.testWriteContentExceptionLeaksRetainedBuffer" \
+  --tests "NettyRequestTest.testWriteContentSuccessProperlyReleasesBuffer" \
+  --tests "NettyRequestTest.testMultipleContentChunksWithWriteFailureLeakAll" \
   -PwithByteBufTracking \
   --no-build-cache \
   --rerun-tasks
