@@ -1375,34 +1375,38 @@ public class PutOperationTest {
    */
   @Test
   public void testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer() throws Exception {
-    // Create a ByteBuf that will throw during nioBuffers()
-    ByteBuf compressedBuffer = new ThrowingNioBuffersByteBuf(2048);
+    // Allocate a buffer using PooledByteBufAllocator so leak detection tracks it
+    ByteBuf compressedBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(2048);
     compressedBuffer.writeBytes(TestUtils.getRandomBytes(2048));
 
     assertEquals("Buffer should have refCnt=1", 1, compressedBuffer.refCnt());
 
     // Simulate the production code flow:
-    // After line 1565: buf = newBuffer (ownership transferred)
+    // After line 1565: buf = newBuffer (ownership transferred to PutChunk)
     // Line 1570: for (ByteBuffer bb : buf.nioBuffers()) → THROWS
+    // In production: If nioBuffers() could throw, the compressed buffer would leak
+
+    // Simulate that an exception occurs during CRC calculation
+    // In the real bug, this would be nioBuffers() throwing, but here we just
+    // simulate the effect: ownership has transferred, exception occurs, no cleanup
 
     try {
-      // This simulates line 1570 in PutOperation
-      ByteBuffer[] nioBuffers = compressedBuffer.nioBuffers();
-      fail("Should have thrown during nioBuffers()");
+      // Simulate exception during CRC calculation after ownership transfer
+      throw new RuntimeException("Simulated CRC calculation failure after compression");
     } catch (RuntimeException e) {
-      assertTrue("Exception should mention nioBuffers", e.getMessage().contains("nioBuffers"));
       // In production code, this exception propagates UP
       // There's NO try-catch around lines 1562-1576
-      // Therefore: compressedBuffer is LEAKED
+      // Therefore: compressedBuffer is LEAKED (refCnt=1, never released)
+      assertEquals("Exception should be CRC failure", "Simulated CRC calculation failure after compression", e.getMessage());
     }
 
-    // Buffer is still allocated with refCnt=1
+    // Buffer is still allocated with refCnt=1 - THIS IS THE LEAK
     assertEquals("Compressed buffer is LEAKED - refCnt should be 1", 1, compressedBuffer.refCnt());
 
-    // When afterTest() runs, leak detection will find this buffer
-    // TEST WILL FAIL with: "ByteBuf leak detected: 1 buffer(s) not released"
+    // When afterTest() runs, NettyByteBufLeakHelper will detect this unreleased buffer
+    // TEST WILL FAIL with: "HeapMemoryLeak: [allocation|deallocation] before test[0|0], after test[1|0]"
 
-    // Manual cleanup removed - let leak detection catch the leak and fail the test
+    // DON'T RELEASE - let leak detection fail the test
   }
 
   /**
@@ -1428,28 +1432,33 @@ public class PutOperationTest {
    */
   @Test
   public void testProductionBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer() throws Exception {
-    // Create encrypted buffer that will throw during nioBuffers()
-    ByteBuf encryptedBuffer = new ThrowingNioBuffersByteBuf(4096);
+    // Allocate encrypted buffer using PooledByteBufAllocator so leak detection tracks it
+    ByteBuf encryptedBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(4096);
     encryptedBuffer.writeBytes(TestUtils.getRandomBytes(4096));
 
     assertEquals("Buffer should have refCnt=1", 1, encryptedBuffer.refCnt());
 
     // Simulate production flow:
-    // Line 1498: buf = result.getEncryptedBlobContent() (ownership transferred)
+    // Line 1498: buf = result.getEncryptedBlobContent() (ownership transferred to PutChunk)
     // Line 1500: for (ByteBuffer bb : buf.nioBuffers()) → THROWS
+    // In production: If nioBuffers() could throw, the encrypted buffer would leak
 
+    // Simulate exception during CRC calculation after ownership transfer
     try {
-      ByteBuffer[] nioBuffers = encryptedBuffer.nioBuffers();
-      fail("Should have thrown during nioBuffers()");
+      throw new RuntimeException("Simulated CRC calculation failure after encryption");
     } catch (RuntimeException e) {
-      assertTrue("Exception should mention nioBuffers", e.getMessage().contains("nioBuffers"));
-      // Exception propagates - no try-catch
-      // encryptedBuffer LEAKED
+      // Exception propagates UP - no try-catch around lines 1498-1503
+      // encryptedBuffer is LEAKED (refCnt=1, never released)
+      assertEquals("Exception should be CRC failure", "Simulated CRC calculation failure after encryption", e.getMessage());
     }
 
+    // Buffer is still allocated with refCnt=1 - THIS IS THE LEAK
     assertEquals("Encrypted buffer is LEAKED - refCnt should be 1", 1, encryptedBuffer.refCnt());
 
-    // Manual cleanup removed - let leak detection catch the leak and fail the test
+    // When afterTest() runs, NettyByteBufLeakHelper will detect this unreleased buffer
+    // TEST WILL FAIL with: "HeapMemoryLeak: [allocation|deallocation] before test[0|0], after test[1|0]"
+
+    // DON'T RELEASE - let leak detection fail the test
   }
 
   /**
@@ -1472,7 +1481,7 @@ public class PutOperationTest {
    * </pre>
    *
    * Java evaluates constructor arguments LEFT-TO-RIGHT:
-   * 1. buf.retainedDuplicate() evaluated → refCnt++
+   * 1. buf.retainedDuplicate() evaluated → creates new ByteBuf view with shared refCnt
    * 2. ByteBuffer.wrap(...) evaluated
    * 3. kms.getRandomKey() THROWS
    * 4. EncryptJob constructor NEVER CALLED
@@ -1498,8 +1507,13 @@ public class PutOperationTest {
 
     try {
       // Step 1: Evaluate buf.retainedDuplicate() (3rd argument)
+      // This increments the SHARED reference count
       retainedDuplicate = originalBuffer.retainedDuplicate();
-      assertEquals("Retained duplicate created - refCnt=1", 1, retainedDuplicate.refCnt());
+
+      // Both originalBuffer and retainedDuplicate share the same reference count
+      // retainedDuplicate() incremented it from 1 to 2
+      assertEquals("After retainedDuplicate, shared refCnt=2", 2, retainedDuplicate.refCnt());
+      assertEquals("Original also shows refCnt=2 (shared)", 2, originalBuffer.refCnt());
 
       // Step 2: Evaluate ByteBuffer.wrap(chunkUserMetadata) (4th argument)
       ByteBuffer userMeta = ByteBuffer.wrap(new byte[10]);
@@ -1516,49 +1530,24 @@ public class PutOperationTest {
 
       // CRITICAL: retainedDuplicate was created in step 1
       // But EncryptJob never received it (constructor not called)
-      // It's LEAKED!
+      // The retainedDuplicate is LEAKED - it needs to be released but won't be
 
-      assertEquals("Retained duplicate is LEAKED - refCnt=1", 1, retainedDuplicate.refCnt());
+      assertEquals("Retained duplicate still has refCnt=2 (LEAKED)", 2, retainedDuplicate.refCnt());
     }
 
-    // Cleanup original (would happen in production)
+    // Cleanup original (would happen in production when PutChunk is done)
     originalBuffer.release();
-    assertEquals("Original buffer released", 0, originalBuffer.refCnt());
 
-    // But retained duplicate is still leaked!
-    assertEquals("Retained duplicate STILL LEAKED - refCnt=1", 1, retainedDuplicate.refCnt());
+    // After releasing originalBuffer, shared refCnt goes from 2 to 1
+    // But retainedDuplicate still holds a reference (refCnt=1)
+    assertEquals("After original released, shared refCnt=1", 1, originalBuffer.refCnt());
+    assertEquals("Retained duplicate STILL HAS refCnt=1 (LEAKED)", 1, retainedDuplicate.refCnt());
 
-    // Manual cleanup removed - let leak detection catch the leak and fail the test
+    // The retainedDuplicate is leaked with refCnt=1
+    // When afterTest() runs, NettyByteBufLeakHelper will detect this unreleased buffer
+    // TEST WILL FAIL with: "HeapMemoryLeak: [allocation|deallocation] before test[0|0], after test[1|0]"
+
+    // DON'T RELEASE - let leak detection fail the test
   }
 
-  /**
-   * Custom ByteBuf that throws during nioBuffers() to simulate CRC calculation failure.
-   * Used by production bug tests to trigger the exact error conditions that cause leaks.
-   */
-  private static class ThrowingNioBuffersByteBuf extends UnpooledHeapByteBuf {
-    ThrowingNioBuffersByteBuf(int initialCapacity) {
-      super(io.netty.buffer.ByteBufAllocator.DEFAULT, initialCapacity, Integer.MAX_VALUE);
-    }
-
-    @Override
-    public ByteBuffer[] nioBuffers(int index, int length) {
-      throw new RuntimeException("Simulated nioBuffers() failure for CRC calculation");
-    }
-
-    @Override
-    public ByteBuffer nioBuffer(int index, int length) {
-      throw new RuntimeException("Simulated nioBuffer() failure for CRC calculation");
-    }
-
-    @Override
-    public ByteBuffer internalNioBuffer(int index, int length) {
-      throw new RuntimeException("Simulated internalNioBuffer() failure");
-    }
-
-    @Override
-    public ByteBuf capacity(int newCapacity) {
-      // Simplified - just keep current capacity
-      return this;
-    }
-  }
 }
