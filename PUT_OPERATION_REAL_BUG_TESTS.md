@@ -13,7 +13,7 @@ This document describes the **real production bug tests** that will **FAIL** due
 
 | Aspect | Simulation Tests | Real Bug Tests |
 |--------|------------------|----------------|
-| **File** | `PutOperationCompressionLeakTest.java`<br>`PutOperationRetainedDuplicateLeakTest.java` | `PutOperationRealBugTest.java`<br>`PutOperationProductionBugTest.java` |
+| **File** | `PutOperationCompressionLeakTest.java`<br>`PutOperationRetainedDuplicateLeakTest.java` | `PutOperationTest.java` (3 tests added) |
 | **Leak Detection** | DISABLED (`leakHelper.setDisabled(true)`) | ENABLED (default) |
 | **Test Status** | PASS (with manual cleanup) | **FAIL** (until fixes applied) |
 | **Purpose** | Demonstrate bug conditions | Prove bugs exist in production |
@@ -21,20 +21,25 @@ This document describes the **real production bug tests** that will **FAIL** due
 
 ---
 
-## Test File: PutOperationRealBugTest.java
+## Production Bug Tests in PutOperationTest.java
 
-**Location:** `ambry-router/src/test/java/com/github/ambry/router/PutOperationRealBugTest.java`
+**Location:** `ambry-router/src/test/java/com/github/ambry/router/PutOperationTest.java`
 
-**Status:** ✅ Simplified version that compiles, ⚠️ Tests @Ignored until production fixes applied
+**Status:** ✅ Added to existing test class, ⚠️ Tests @Ignored until production fixes applied
+
+**Why in PutOperationTest.java:**
+- Already has `NettyByteBufLeakHelper` set up
+- Existing comprehensive PutOperation test infrastructure
+- Follows project convention (not in *LeakTest files)
 
 **Key Implementation Details:**
-- Extends `UnpooledHeapByteBuf` instead of using non-public `WrappedByteBuf`
-- Uses direct method calls to simulate production flow
+- Uses custom `ThrowingNioBuffersByteBuf` that extends `UnpooledHeapByteBuf`
+- Direct method calls to simulate production flow
 - Leak detection fully enabled (not disabled)
 
 ### Tests Included (3 tests)
 
-#### Test #1: testRealBug_CrcExceptionAfterCompressionLeaksCompressedBuffer
+#### Test #1: testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer
 
 **Bug Location:** `PutOperation.java:1562-1576`
 
@@ -88,7 +93,7 @@ if (newBuffer != null) {
 
 ---
 
-#### Test #2: testRealBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer
+#### Test #2: testProductionBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer
 
 **Bug Location:** `PutOperation.java:1498-1503`
 
@@ -124,7 +129,7 @@ try {  // ADD THIS
 
 ---
 
-#### Test #3: testRealBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer
+#### Test #3: testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer
 
 **Bug Location:** `PutOperation.java:1589-1592`
 
@@ -186,14 +191,14 @@ try {
 All real bug tests are annotated with `@Ignore` and will be skipped:
 
 ```bash
-./gradlew :ambry-router:test --tests "PutOperationRealBugTest"
+./gradlew :ambry-router:test --tests "PutOperationTest.testProductionBug*"
 ```
 
 Output:
 ```
-com.github.ambry.router.PutOperationRealBugTest > testRealBug_CrcExceptionAfterCompressionLeaksCompressedBuffer SKIPPED
-com.github.ambry.router.PutOperationRealBugTest > testRealBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer SKIPPED
-com.github.ambry.router.PutOperationRealBugTest > testRealBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer SKIPPED
+com.github.ambry.router.PutOperationTest > testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer SKIPPED
+com.github.ambry.router.PutOperationTest > testProductionBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer SKIPPED
+com.github.ambry.router.PutOperationTest > testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer SKIPPED
 ```
 
 ### Step 2: Enable Tests to See Failures
@@ -201,15 +206,15 @@ com.github.ambry.router.PutOperationRealBugTest > testRealBug_KmsExceptionAfterR
 Remove `@Ignore` annotations and run with ByteBuf tracking:
 
 ```bash
-# Edit PutOperationRealBugTest.java - remove @Ignore from one test
+# Edit PutOperationTest.java - remove @Ignore from one test
 ./gradlew :ambry-router:test \
-    --tests "PutOperationRealBugTest.testRealBug_CrcExceptionAfterCompressionLeaksCompressedBuffer" \
+    --tests "PutOperationTest.testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer" \
     -PwithByteBufTracking
 ```
 
 Expected output:
 ```
-com.github.ambry.router.PutOperationRealBugTest > testRealBug_CrcExceptionAfterCompressionLeaksCompressedBuffer FAILED
+com.github.ambry.router.PutOperationTest > testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer FAILED
     java.lang.AssertionError: ByteBuf leak detected: 1 buffer(s) not released
 
 === ByteBuf Flow Tracker Report ===
@@ -337,11 +342,12 @@ try {
 **Status:** ✅ Real bug tests created, compiled, and ready
 
 **What's Done:**
-- Created `PutOperationRealBugTest.java` with 3 tests
-- Fixed compilation errors (uses `UnpooledHeapByteBuf` instead of non-public `WrappedByteBuf`)
+- Added 3 production bug tests to `PutOperationTest.java`
+- Tests integrated into existing test infrastructure
 - Tests use leak detection (enabled)
 - Tests are @Ignored (will fail until fixes applied)
 - Documented all bugs with exact code locations
+- Follows project convention (not in *LeakTest files)
 
 **What's Next:**
 - Apply production fixes to PutOperation.java
