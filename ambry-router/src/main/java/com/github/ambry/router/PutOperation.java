@@ -1497,16 +1497,11 @@ class PutOperation {
         if (!isMetadataChunk()) {
           buf = result.getEncryptedBlobContent();
           if (routerConfig.routerVerifyCrcForPutRequests) {
-            try {
-              for (ByteBuffer byteBuffer : buf.nioBuffers()) {
-                chunkCrc32.update(byteBuffer);
-              }
-              logger.debug("{}: Chunk {} post-encryption CRC: {}, size: {}", loggingContext, chunkIndex,
-                  chunkCrc32.getValue(), buf != null ? buf.readableBytes() : 0);
-            } catch (Exception e) {
-              buf.release();
-              throw e;
+            for (ByteBuffer byteBuffer : buf.nioBuffers()) {
+              chunkCrc32.update(byteBuffer);
             }
+            logger.debug("{}: Chunk {} post-encryption CRC: {}, size: {}", loggingContext, chunkIndex,
+                chunkCrc32.getValue(), buf != null ? buf.readableBytes() : 0);
           }
         }
         encryptedPerBlobKey = result.getEncryptedKey();
@@ -1571,17 +1566,12 @@ class PutOperation {
         isChunkCompressed = true;
         // Recalculate CRC on compressed buffer if CRC verification is enabled
         if (routerConfig.routerVerifyCrcForPutRequests) {
-          try {
-            chunkCrc32.reset();
-            for (ByteBuffer byteBuffer : buf.nioBuffers()) {
-              chunkCrc32.update(byteBuffer);
-            }
-            logger.debug("{}: Chunk {} CRC update after compression - before: {}, after: {}, compressed size: {}",
-                loggingContext, chunkIndex, preCrc, chunkCrc32.getValue(), buf.readableBytes());
-          } catch (Exception e) {
-            buf.release();
-            throw e;
+          chunkCrc32.reset();
+          for (ByteBuffer byteBuffer : buf.nioBuffers()) {
+            chunkCrc32.update(byteBuffer);
           }
+          logger.debug("{}: Chunk {} CRC update after compression - before: {}, after: {}, compressed size: {}",
+              loggingContext, chunkIndex, preCrc, chunkCrc32.getValue(), buf.readableBytes());
         }
       }
     }
@@ -1590,25 +1580,17 @@ class PutOperation {
      * Submits encrypt job for the given {@link PutChunk} and processes the callback for the same
      */
     private void encryptChunk() {
-      ByteBuf retainedCopy = null;
       try {
         logger.trace("{}: Chunk at index {} moves to {} state", loggingContext, chunkIndex, ChunkState.Encrypting);
         state = ChunkState.Encrypting;
         chunkEncryptReadyAtMs = time.milliseconds();
         encryptJobMetricsTracker.onJobSubmission();
         logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
-        // Pre-evaluate arguments to avoid leak if exception occurs after retainedDuplicate()
-        retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
-        javax.crypto.spec.SecretKeySpec randomKey = kms.getRandomKey();
         cryptoJobHandler.submitJob(
             new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
-                retainedCopy, ByteBuffer.wrap(chunkUserMetadata),
-                randomKey, cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
-        retainedCopy = null; // Ownership transferred to EncryptJob
+                isMetadataChunk() ? null : buf.retainedDuplicate(), ByteBuffer.wrap(chunkUserMetadata),
+                kms.getRandomKey(), cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
       } catch (GeneralSecurityException e) {
-        if (retainedCopy != null) {
-          retainedCopy.release();
-        }
         encryptJobMetricsTracker.incrementOperationError();
         logger.trace("{}: Exception thrown while generating random key for chunk at index {}", loggingContext,
             chunkIndex, e);
