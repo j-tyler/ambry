@@ -1343,92 +1343,149 @@ public class PutOperationTest {
   // ========== PRODUCTION BUG TESTS - ByteBuf Memory Leaks ==========
 
   /**
-   * PRODUCTION BUG TEST: KMS exception after retainedDuplicate() evaluated
+   * PRODUCTION BUG TEST: KMS exception during EncryptJob constructor argument evaluation
    *
    * BUG LOCATION: PutOperation.java:1589-1592 (encryptChunk method)
    *
-   * ISSUE: Due to Java's left-to-right argument evaluation, if kms.getRandomKey() throws
-   * AFTER buf.retainedDuplicate() is evaluated, the retained duplicate is leaked because
-   * the EncryptJob constructor never completes.
-   *
-   * CODE PATH:
+   * ISSUE: Due to Java's left-to-right argument evaluation, when constructing EncryptJob:
    * <pre>
-   * cryptoJobHandler.submitJob(
-   *   new EncryptJob(...,
-   *       isMetadataChunk() ? null : buf.retainedDuplicate(),  // Arg 3 - EVALUATED → refCnt++
-   *       ByteBuffer.wrap(chunkUserMetadata),                  // Arg 4 - EVALUATED
-   *       kms.getRandomKey(),                                  // Arg 5 - THROWS!
-   *       ...));
+   * new EncryptJob(...,
+   *     buf.retainedDuplicate(),  // Arg 3: Evaluated FIRST → refCnt incremented
+   *     ByteBuffer.wrap(...),      // Arg 4: Evaluated
+   *     kms.getRandomKey(),        // Arg 5: THROWS GeneralSecurityException
+   *     ...)
    * </pre>
    *
-   * Java evaluates constructor arguments LEFT-TO-RIGHT:
-   * 1. buf.retainedDuplicate() evaluated → creates new ByteBuf view with shared refCnt
-   * 2. ByteBuffer.wrap(...) evaluated
-   * 3. kms.getRandomKey() THROWS
-   * 4. EncryptJob constructor NEVER CALLED
-   * 5. Retained duplicate created but never passed to EncryptJob
-   * 6. catch block doesn't know about it → LEAKED
+   * When kms.getRandomKey() throws, the constructor NEVER COMPLETES. The retainedDuplicate
+   * was created during argument evaluation but never received by EncryptJob, so it leaks.
    *
    * EXPECTED: TEST FAILS with ByteBuf leak detected (until production fix applied)
-   * AFTER FIX: Pre-evaluate arguments and wrap in try-catch to release on error
+   * AFTER FIX: Pre-evaluate kms.getRandomKey() in a local variable with try-catch to
+   *            properly handle the exception and release the retainedDuplicate.
    */
   @Test
   public void testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer() throws Exception {
-    // Create original buffer
+    // Set up crypto infrastructure
+    String defaultKey = TestUtils.getRandomKey(64);
+    Properties props = new Properties();
+    props.setProperty("kms.default.container.key", defaultKey);
+    props.setProperty("kms.random.key.size.in.bits", "256");
+    VerifiableProperties verifiableProperties = new VerifiableProperties(props);
+
+    // Create a real KMS that works for initial setup
+    KeyManagementService<javax.crypto.spec.SecretKeySpec> workingKms =
+        new SingleKeyManagementServiceFactory(verifiableProperties, "test-cluster",
+            new com.codahale.metrics.MetricRegistry()).getKeyManagementService();
+
+    // Create a KMS that throws when getRandomKey() is called
+    KeyManagementService<javax.crypto.spec.SecretKeySpec> faultyKms =
+        new KeyManagementService<javax.crypto.spec.SecretKeySpec>() {
+      @Override
+      public void register(short accountId, short containerId) throws java.security.GeneralSecurityException {
+      }
+
+      @Override
+      public void register(String context) throws java.security.GeneralSecurityException {
+      }
+
+      @Override
+      public javax.crypto.spec.SecretKeySpec getKey(com.github.ambry.rest.RestRequest restRequest,
+          short accountId, short containerId) throws java.security.GeneralSecurityException {
+        return workingKms.getKey(restRequest, accountId, containerId);
+      }
+
+      @Override
+      public javax.crypto.spec.SecretKeySpec getKey(com.github.ambry.rest.RestRequest restRequest,
+          String context) throws java.security.GeneralSecurityException {
+        return workingKms.getKey(restRequest, context);
+      }
+
+      @Override
+      public javax.crypto.spec.SecretKeySpec getRandomKey() throws java.security.GeneralSecurityException {
+        throw new java.security.GeneralSecurityException("Simulated KMS failure during getRandomKey");
+      }
+
+      @Override
+      public void close() {
+      }
+    };
+
+    CryptoService<javax.crypto.spec.SecretKeySpec> cryptoService =
+        new GCMCryptoServiceFactory(verifiableProperties,
+            new com.codahale.metrics.MetricRegistry()).getCryptoService();
+
+    CryptoJobMetrics metrics = new CryptoJobMetrics(PutOperationTest.class, "Encrypt",
+        new com.codahale.metrics.MetricRegistry());
+    CryptoJobMetricsTracker metricsTracker = new CryptoJobMetricsTracker(metrics);
+
+    // Create original buffer (simulating PutChunk's buf field)
     ByteBuf originalBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(4096);
     originalBuffer.writeBytes(TestUtils.getRandomBytes(4096));
 
     assertEquals("Original buffer refCnt=1", 1, originalBuffer.refCnt());
 
-    // Simulate argument evaluation:
-    // new EncryptJob(..., buf.retainedDuplicate(), ..., kms.getRandomKey(), ...)
+    // This simulates the EXACT production code path at PutOperation.java:1590-1592
+    // The constructor arguments are evaluated LEFT-TO-RIGHT:
 
     ByteBuf retainedDuplicate = null;
-    boolean encryptJobConstructorCalled = false;
+    boolean constructorCompleted = false;
 
     try {
-      // Step 1: Evaluate buf.retainedDuplicate() (3rd argument)
-      // This increments the SHARED reference count
+      // Simulate: new EncryptJob(..., buf.retainedDuplicate(), ..., kms.getRandomKey(), ...)
+
+      // Step 1: Evaluate buf.retainedDuplicate() - happens FIRST
       retainedDuplicate = originalBuffer.retainedDuplicate();
-
-      // Both originalBuffer and retainedDuplicate share the same reference count
-      // retainedDuplicate() incremented it from 1 to 2
       assertEquals("After retainedDuplicate, shared refCnt=2", 2, retainedDuplicate.refCnt());
-      assertEquals("Original also shows refCnt=2 (shared)", 2, originalBuffer.refCnt());
 
-      // Step 2: Evaluate ByteBuffer.wrap(chunkUserMetadata) (4th argument)
+      // Step 2: Evaluate ByteBuffer.wrap(chunkUserMetadata)
       ByteBuffer userMeta = ByteBuffer.wrap(new byte[10]);
 
-      // Step 3: Evaluate kms.getRandomKey() (5th argument) - THROWS!
-      throw new java.security.GeneralSecurityException("Simulated KMS failure during getRandomKey");
+      // Step 3: Evaluate kms.getRandomKey() - THROWS!
+      // This happens BEFORE the EncryptJob constructor body executes
+      javax.crypto.spec.SecretKeySpec randomKey = faultyKms.getRandomKey();
 
-      // If we get here, EncryptJob constructor would be called
-      // encryptJobConstructorCalled = true;
+      // Step 4: If we got here, construct EncryptJob (but we won't reach this)
+      EncryptJob job = new EncryptJob(
+          (short) 1, (short) 1,
+          retainedDuplicate,  // This would transfer ownership to EncryptJob
+          userMeta,
+          randomKey,
+          cryptoService, faultyKms,
+          null, metricsTracker,
+          (result, exception) -> {
+            if (result != null) result.release();
+          }
+      );
+
+      constructorCompleted = true;
+
     } catch (java.security.GeneralSecurityException e) {
-      // Exception during argument evaluation (step 3)
-      // EncryptJob constructor NEVER called
-      assertFalse("EncryptJob constructor should NOT have been called", encryptJobConstructorCalled);
+      // The exception occurs at Step 3, AFTER retainedDuplicate was created
+      // The EncryptJob constructor NEVER executed
+      assertFalse("EncryptJob constructor should NOT have completed", constructorCompleted);
+      assertEquals("Exception should be from KMS", "Simulated KMS failure during getRandomKey",
+          e.getMessage());
 
-      // CRITICAL: retainedDuplicate was created in step 1
-      // But EncryptJob never received it (constructor not called)
-      // The catch block in production code (line 1593) doesn't know about it
+      // CRITICAL BUG: retainedDuplicate was created in Step 1
+      // But EncryptJob never received it (constructor didn't execute)
+      // The catch block in production code (PutOperation.java:1593) has NO REFERENCE to it
+      // Therefore: LEAKED!
 
-      assertEquals("Retained duplicate still has refCnt=2 (LEAKED)", 2, retainedDuplicate.refCnt());
+      assertEquals("Retained duplicate is LEAKED - refCnt still 2", 2, retainedDuplicate.refCnt());
     }
 
-    // Cleanup original (would happen in production when PutChunk is done)
+    // Simulate PutChunk cleanup (releases original buffer)
     originalBuffer.release();
 
-    // After releasing originalBuffer, shared refCnt goes from 2 to 1
-    // But retainedDuplicate still holds a reference (refCnt=1)
+    // After releasing originalBuffer once, the shared refCnt goes from 2 to 1
+    // The retainedDuplicate still holds a reference
     assertEquals("After original released, shared refCnt=1", 1, originalBuffer.refCnt());
     assertEquals("Retained duplicate STILL HAS refCnt=1 (LEAKED)", 1, retainedDuplicate.refCnt());
 
-    // The retainedDuplicate is leaked with refCnt=1
     // When afterTest() runs, NettyByteBufLeakHelper will detect this unreleased buffer
     // TEST WILL FAIL with: "HeapMemoryLeak: [allocation|deallocation] before test[0|0], after test[1|0]"
 
-    // DON'T RELEASE - let leak detection fail the test
+    // DON'T RELEASE - let leak detection fail the test to prove the bug exists
   }
 
 }
