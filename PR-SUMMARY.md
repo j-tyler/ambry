@@ -1,74 +1,50 @@
-# Fix PutOperation ByteBuf Memory Leaks
+# Fix ByteBuf Memory Leak in PutOperation.encryptChunk()
 
 ## Summary
 
-Fixes 3 critical ByteBuf memory leaks in PutOperation where exceptions occur after ownership transfer but before cleanup can execute.
+Fixes ByteBuf memory leak in `PutOperation.encryptChunk()` when KMS throws exception after `retainedDuplicate()` is evaluated.
 
-**Key Concept:** In Netty, **the owner of a ByteBuf must call `release()`**. Ownership transfers when a method returns a ByteBuf or a constructor receives one. If an exception occurs after ownership transfers but before the new owner can store/release the buffer, it leaks.
+## The Bug
 
----
+**Location:** `PutOperation.java:1582-1609` (encryptChunk method)
 
-## Bug #1: CRC Exception After Compression
-
-**Location:** `PutOperation.java:1562-1576`
-
-**Issue:** After `compressionService.compressChunk()` returns a new buffer and ownership transfers (`buf = newBuffer`), if `buf.nioBuffers()` throws during CRC calculation, the compressed buffer leaks because there's no try-catch to release it.
-
-**Fix:** Wrap CRC calculation in try-catch and release `buf` on exception.
-
----
-
-## Bug #2: CRC Exception in Encryption Callback
-
-**Location:** `PutOperation.java:1498-1503`
-
-**Issue:** After encryption completes and ownership transfers (`buf = result.getEncryptedBlobContent()`), if `buf.nioBuffers()` throws during CRC calculation, the encrypted buffer leaks.
-
-**Fix:** Wrap CRC calculation in try-catch and release `buf` on exception.
-
----
-
-## Bug #3: KMS Exception After retainedDuplicate()
-
-**Location:** `PutOperation.java:1589-1592`
-
-**Issue:** Java evaluates constructor arguments left-to-right. In `new EncryptJob(..., buf.retainedDuplicate(), ..., kms.getRandomKey(), ...)`, if `getRandomKey()` throws after `retainedDuplicate()` is evaluated, the retained duplicate leaks because the constructor never completes and ownership never transfers.
-
-**Fix:** Pre-evaluate arguments, wrap in try-catch, and release retained duplicate if constructor fails.
-
----
-
-## Tests
-
-Added 3 tests to `PutOperationTest.java` (lines 1343-1570):
-- `testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer`
-- `testProductionBug_CrcExceptionInEncryptionCallbackLeaksEncryptedBuffer`
-- `testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer`
-
-Each test simulates the exact ownership transfer state and triggers the exception condition. Tests are currently `@Ignore`'d and will **FAIL** when enabled (proving bugs exist) until fixes are applied.
-
----
-
-## Validation
-
-**Before fixes:**
-```bash
-./gradlew :ambry-router:test \
-    --tests "PutOperationTest.testProductionBug_CrcExceptionAfterCompressionLeaksCompressedBuffer" \
-    -PwithByteBufTracking
+**Root Cause:** Java evaluates constructor arguments left-to-right. In the original code:
+```java
+new EncryptJob(..., buf.retainedDuplicate(), ..., kms.getRandomKey(), ...)
 ```
-Result: ❌ FAILS with "ByteBuf leak detected: 1 buffer(s) not released"
 
-**After fixes:**
-```bash
-./gradlew :ambry-router:test --tests "PutOperationTest.testProductionBug*"
+If `kms.getRandomKey()` throws `GeneralSecurityException` after `buf.retainedDuplicate()` has already been evaluated and incremented the refCount, the retained duplicate is orphaned and leaks because:
+1. The constructor never completes, so ownership never transfers to EncryptJob
+2. The exception handler has no reference to clean up the orphaned ByteBuf
+
+## The Fix
+
+Pre-evaluate arguments in local variables with proper exception handling:
+
+```java
+ByteBuf retainedCopy = null;
+try {
+  retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
+  SecretKeySpec randomKey = (SecretKeySpec) kms.getRandomKey();
+  cryptoJobHandler.submitJob(new EncryptJob(..., retainedCopy, ..., randomKey, ...));
+  retainedCopy = null; // Ownership transferred to EncryptJob
+} catch (GeneralSecurityException e) {
+  if (retainedCopy != null) {
+    retainedCopy.release(); // Clean up orphaned buffer
+  }
+  // ... handle exception
+}
 ```
-Result: ✅ PASSES - All 3 tests pass with zero leaks detected
 
----
+**Note:** Explicit cast required because `kms` is declared as raw type `KeyManagementService`.
 
-## Impact
+## Test
 
-- **Severity:** Critical - Direct memory leaks on error paths
-- **Affected:** Compression/encryption with CRC verification, all encryption operations
-- **Risk:** Low - Adds defensive error handling without changing happy path
+Added `testMinimal_RetainedDuplicateArgumentEvaluationLeak()` in `PutOperationTest.java` that:
+- Creates a ByteBuf with refCount=1
+- Simulates the argument evaluation pattern where retainedDuplicate() executes before exception
+- Verifies no leak occurs with proper cleanup
+
+**Validation:**
+- Without fix: Test fails with `HeapMemoryLeak: [allocation|deallocation] before test[0|0], after test[1|0]`
+- With fix: Test passes with no leaks detected
