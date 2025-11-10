@@ -1,0 +1,20 @@
+diff --git a/ambry-api/src/main/java/com/github/ambry/network/BoundedNettyByteBufReceive.java b/ambry-api/src/main/java/com/github/ambry/network/BoundedNettyByteBufReceive.java
+index 1234567..abcdefg 100644
+--- a/ambry-api/src/main/java/com/github/ambry/network/BoundedNettyByteBufReceive.java
++++ b/ambry-api/src/main/java/com/github/ambry/network/BoundedNettyByteBufReceive.java
+@@ -59,10 +59,11 @@ public class BoundedNettyByteBufReceive extends AbstractByteBufHolder<BoundedNe
+    * @throws IOException Any I/O error.
+    */
+   private int readBytesFromReadableByteChannel(ReadableByteChannel channel, ByteBuf buffer) throws IOException {
+-    int n = channel.read(buffer.nioBuffer(buffer.writerIndex(), buffer.capacity() - buffer.writerIndex()));
+-    if (n > 0) {
+-      buffer.writerIndex(buffer.writerIndex() + n);
+-    }
++    // Use ByteBuf's writeBytes() to let it handle channel reading internally
++    // This avoids creating NIO buffer views that might have lifecycle issues
++    int writerIndexBefore = buffer.writerIndex();
++    int n = buffer.writeBytes(channel, buffer.capacity() - writerIndexBefore);
++    // writeBytes() automatically updates writerIndex
+     return n;
+   }
+
