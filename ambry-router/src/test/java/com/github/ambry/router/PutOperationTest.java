@@ -1461,9 +1461,6 @@ public class PutOperationTest {
     // Give the crypto job handler a moment to process (it runs in background thread)
     Thread.sleep(100);
 
-    // Clean up the operation
-    op.abort(new Exception("Test cleanup"));
-
     // Clean up crypto job handler
     cryptoJobHandler.close();
 
