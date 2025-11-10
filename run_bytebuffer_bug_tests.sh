@@ -80,8 +80,8 @@ echo ""
 # Run the bug tests (allow to fail without exiting script)
 set +e  # Temporarily disable exit-on-error
 ./gradlew :ambry-commons:test \
-    --tests 'ByteBufferAsyncWritableChannelBugTest*' \
-    --tests 'UnpooledWrapperLeakProofTest*' \
+    --tests 'com.github.ambry.commons.ByteBufferAsyncWritableChannelBugTest' \
+    --tests 'com.github.ambry.commons.UnpooledWrapperLeakProofTest' \
     --no-build-cache \
     --rerun-tasks \
     -i \
