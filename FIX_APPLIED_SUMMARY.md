@@ -64,9 +64,9 @@ allContentReceived = isLast;  // Line 502
 
 ### Tests Created
 
-**File:** `ambry-rest/src/test/java/com/github/ambry/rest/NettyRequestWriteContentLeakTest.java`
+**File:** `ambry-rest/src/test/java/com/github/ambry/rest/NettyRequestTest.java`
 
-Three production-testing tests:
+Three production-testing tests (integrated into permanent test suite):
 
 1. **testWriteContentExceptionLeaksRetainedBuffer**
    - Tests single content chunk with write() exception
@@ -121,10 +121,15 @@ Or run tests directly:
 
 ```bash
 # Without ByteBuf tracker
-./gradlew :ambry-rest:test --tests "NettyRequestWriteContentLeakTest"
+./gradlew :ambry-rest:test --tests "NettyRequestTest.testWriteContentExceptionLeaksRetainedBuffer" \
+  --tests "NettyRequestTest.testWriteContentSuccessProperlyReleasesBuffer" \
+  --tests "NettyRequestTest.testMultipleContentChunksWithWriteFailureLeakAll"
 
 # With ByteBuf tracker for detailed flow analysis
-./gradlew :ambry-rest:test --tests "NettyRequestWriteContentLeakTest" -PwithByteBufTracking
+./gradlew :ambry-rest:test --tests "NettyRequestTest.testWriteContentExceptionLeaksRetainedBuffer" \
+  --tests "NettyRequestTest.testWriteContentSuccessProperlyReleasesBuffer" \
+  --tests "NettyRequestTest.testMultipleContentChunksWithWriteFailureLeakAll" \
+  -PwithByteBufTracking
 ```
 
 **Expected Outcome:**
@@ -156,12 +161,13 @@ Or run tests directly:
 
 ## Regression Prevention
 
-The tests in `NettyRequestWriteContentLeakTest.java` will:
+The tests in `NettyRequestTest.java` will:
 - ✅ Detect if this bug is reintroduced
 - ✅ Validate any refactoring of writeContent()
 - ✅ Serve as documentation of correct error handling
+- ✅ Run as part of the permanent test suite (integrated into NettyRequestTest)
 
-**Keep these tests in the codebase permanently.**
+**These tests are now part of the permanent test suite and run with every build.**
 
 ---
 
