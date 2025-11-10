@@ -19,11 +19,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
-import java.util.Collections;
 import java.util.Queue;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -61,11 +58,6 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
   private final ReentrantLock lock = new ReentrantLock();
   private final AtomicBoolean channelOpen = new AtomicBoolean(true);
   private final ChannelEventListener channelEventListener;
-  /**
-   * Tracks ByteBuf wrappers created internally by {@link #write(ByteBuffer, Callback)} that must be released
-   * by the channel to prevent memory leaks.
-   */
-  private final Set<ByteBuf> internalWrappers = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
   /**
    * Construct a ByteBufferAsyncWritableChannel with a null {@link ChannelEventListener}
@@ -85,8 +77,8 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
   /**
    * If the channel is open, simply queues the buffer to be handled later.
    * <p/>
-   * Note: This method creates an internal ByteBuf wrapper around the ByteBuffer. The wrapper is tracked
-   * and will be automatically released by the channel after the chunk is resolved.
+   * Note: This method creates an internal ByteBuf wrapper around the ByteBuffer. The wrapper will be
+   * automatically released by the channel after the chunk is resolved.
    * @param src the data that needs to be written to the channel.
    * @param callback the {@link Callback} that will be invoked once the write succeeds/fails. This can be null.
    * @return a {@link Future} that will eventually contain the result of the write operation.
@@ -97,9 +89,21 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
     if (src == null) {
       throw new IllegalArgumentException("Source buffer cannot be null");
     }
+    if (!isOpen()) {
+      CompletableFuture<Long> failedFuture = new CompletableFuture<>();
+      failedFuture.completeExceptionally(new ClosedChannelException());
+      if (callback != null) {
+        callback.onCompletion(0L, new ClosedChannelException());
+      }
+      return failedFuture;
+    }
     ByteBuf wrapper = Unpooled.wrappedBuffer(src);
-    internalWrappers.add(wrapper);  // Track this wrapper so we can release it later
-    return write(wrapper, callback);
+    ChunkData chunkData = new ChunkData(wrapper, callback, true);
+    chunks.add(chunkData);
+    if (channelEventListener != null) {
+      channelEventListener.onEvent(EventType.Write);
+    }
+    return chunkData.future;
   }
 
   /**
@@ -115,7 +119,6 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
       throw new IllegalArgumentException("Source buffer cannot be null");
     }
     if (!isOpen()) {
-      internalWrappers.remove(src);  // Remove from tracking if it's a wrapper
       src.release();
       CompletableFuture<Long> failedFuture = new CompletableFuture<>();
       failedFuture.completeExceptionally(new ClosedChannelException());
@@ -124,7 +127,7 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
       }
       return failedFuture;
     }
-    ChunkData chunkData = new ChunkData(src, callback);
+    ChunkData chunkData = new ChunkData(src, callback, false);
     chunks.add(chunkData);
     if (channelEventListener != null) {
       channelEventListener.onEvent(EventType.Write);
@@ -263,7 +266,7 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
     if (chunkData != null) {
       chunkData.resolveChunk(exception);
       // Release wrapper if it was created by write(ByteBuffer)
-      if (chunkData.buf != null && internalWrappers.remove(chunkData.buf)) {
+      if (chunkData.isInternalWrapper && chunkData.buf != null) {
         chunkData.buf.release();
       }
     }
@@ -300,7 +303,7 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
       while (chunkData != null) {
         chunkData.resolveChunk(e);
         // Release wrapper if it was created by write(ByteBuffer)
-        if (chunkData.buf != null && internalWrappers.remove(chunkData.buf)) {
+        if (chunkData.isInternalWrapper && chunkData.buf != null) {
           chunkData.buf.release();
         }
         chunkData = chunksAwaitingResolution.poll();
@@ -309,12 +312,12 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
       while (chunkData != null) {
         chunkData.resolveChunk(e);
         // Release wrapper if it was created by write(ByteBuffer)
-        if (chunkData.buf != null && internalWrappers.remove(chunkData.buf)) {
+        if (chunkData.isInternalWrapper && chunkData.buf != null) {
           chunkData.buf.release();
         }
         chunkData = chunks.poll();
       }
-      chunks.add(new ChunkData(null, null));
+      chunks.add(new ChunkData(null, null, false));
     } finally {
       lock.unlock();
     }
@@ -333,6 +336,10 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
      * The bytes associated with this chunk.
      */
     public ByteBuf buf;
+    /**
+     * Whether this ByteBuf is an internal wrapper created by write(ByteBuffer) that needs to be released by the channel.
+     */
+    public final boolean isInternalWrapper;
 
     private final int startPos;
     private final Callback<Long> callback;
@@ -341,9 +348,12 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
      * Create a new instance of ChunkData with the given parameters.
      * @param buf the bytes of data associated with the chunk.
      * @param callback the {@link Callback} that will be invoked on chunk resolution.
+     * @param isInternalWrapper true if this ByteBuf was created internally by write(ByteBuffer) and should be released
+     *                          by the channel after resolution.
      */
-    private ChunkData(ByteBuf buf, Callback<Long> callback) {
+    private ChunkData(ByteBuf buf, Callback<Long> callback, boolean isInternalWrapper) {
       this.buf = buf;
+      this.isInternalWrapper = isInternalWrapper;
       if (buf != null) {
         startPos = buf.readerIndex();
       } else {
