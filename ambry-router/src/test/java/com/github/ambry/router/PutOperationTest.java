@@ -1398,8 +1398,9 @@ public class PutOperationTest {
     PutOperation op =
         PutOperation.forUpload(testRouterConfig, routerMetrics, mockClusterMap, new LoggingNotificationSystem(),
             new InMemAccountService(true, false), userMetadata, channel, PutBlobOptions.DEFAULT, future, null,
-            faultyKms, cryptoService, cryptoJobHandler, time, blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS,
-            quotaChargeCallback, compressionService);
+            new RouterCallback(mockNetworkClient, new ArrayList<>()), null, faultyKms, cryptoService,
+            cryptoJobHandler, time, blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback,
+            compressionService);
 
     op.startOperation();
 
@@ -1447,9 +1448,9 @@ public class PutOperationTest {
     // Create PutOperation (no encryption, so it goes straight to request creation)
     PutOperation op =
         PutOperation.forUpload(testRouterConfig, routerMetrics, mockClusterMap, new LoggingNotificationSystem(),
-            new InMemAccountService(true, false), userMetadata, channel, PutBlobOptions.DEFAULT, future, null, null,
-            null, null, time, blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback,
-            compressionService);
+            new InMemAccountService(true, false), userMetadata, channel, PutBlobOptions.DEFAULT, future, null,
+            new RouterCallback(mockNetworkClient, new ArrayList<>()), null, null, null, null, time, blobProperties,
+            MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
 
     op.startOperation();
 
