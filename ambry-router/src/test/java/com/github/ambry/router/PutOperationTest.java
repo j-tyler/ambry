@@ -1325,7 +1325,7 @@ public class PutOperationTest {
    * KMS exception during EncryptJob constructor in PutOperation does not leak
    */
   @Test
-  public void testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer_DISABLED() throws Exception {
+  public void testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer() throws Exception {
     // Set up crypto infrastructure
     String defaultKey = TestUtils.getRandomKey(64);
     Properties cryptoProps = new Properties();
@@ -1416,7 +1416,7 @@ public class PutOperationTest {
    * RequestInfo exception after PutRequest creation in PutOperation does not leak
    */
   @Test
-  public void testProductionBug_RequestInfoExceptionAfterPutRequestCreationLeaksBuffer_DISABLED() throws Exception {
+  public void testProductionBug_RequestInfoExceptionAfterPutRequestCreationLeaksBuffer() throws Exception {
     // Create router config
     Properties routerProps = createBasicRouterProperties();
     VerifiableProperties vProps = new VerifiableProperties(routerProps);
