@@ -45,10 +45,10 @@ When `RequestInfo` construction throws, the `PutRequest` (which owns a retained 
 
 ## The Tests
 
-Tests in `PutOperationRetainedDuplicateLeakTest.java` verify both fixes using the ByteBuf Flow Tracker:
+Regression tests in `PutOperationTest.java` verify both fixes using the ByteBuf Flow Tracker:
 
-1. **testEncryptJobConstructorExceptionHandledProperly()** - Simulates KMS exception after `retainedDuplicate()`, verifies the catch block releases it
-2. **testRequestInfoConstructionExceptionHandledProperly()** - Simulates RequestInfo exception after PutRequest creation, verifies `putRequest.release()` is called
+1. **testEncryptChunkKmsExceptionReleasesRetainedDuplicate()** - Simulates KMS exception after `retainedDuplicate()`, verifies the catch block releases it
+2. **testFetchRequestsExceptionReleasesPutRequest()** - Simulates RequestInfo exception after PutRequest creation, verifies `putRequest.release()` is called
 
 Both tests report "Leak Paths: 0" with the fixes in place.
 

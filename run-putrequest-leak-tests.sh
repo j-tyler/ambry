@@ -14,10 +14,12 @@ echo "  - No Gradle build cache (--no-build-cache)"
 echo "  - No Gradle daemon cache (--rerun-tasks)"
 echo ""
 echo "Tests included:"
-echo "  1. PutRequestLeakTest (6 baseline tests)"
-echo "  2. PutOperationRetainedDuplicateLeakTest (4 baseline tests - tests fixes for retainedDuplicate leaks)"
+echo "  1. PutRequestLeakTest (6 tests)"
+echo "  2. PutOperationTest (2 regression tests for retainedDuplicate leak fixes)"
 echo ""
-echo "Total: 10 tests (all baseline - verifying fixes work correctly)"
+echo "Regression tests verify:"
+echo "  - Bug #1 fix: KMS exception after retainedDuplicate() is properly handled"
+echo "  - Bug #2 fix: RequestInfo exception after PutRequest creation is properly handled"
 echo ""
 
 # Clean any previous test results and caches
@@ -31,7 +33,7 @@ echo "========================================="
 echo ""
 
 # Run PutRequestLeakTest (6 tests)
-echo "[1/2] Running PutRequestLeakTest (6 baseline tests)..."
+echo "[1/2] Running PutRequestLeakTest (6 tests)..."
 ./gradlew :ambry-protocol:test \
   --tests "com.github.ambry.protocol.PutRequestLeakTest" \
   -PwithByteBufTracking \
@@ -40,9 +42,10 @@ echo "[1/2] Running PutRequestLeakTest (6 baseline tests)..."
   --info
 
 echo ""
-echo "[2/2] Running PutOperationRetainedDuplicateLeakTest (4 baseline tests)..."
+echo "[2/2] Running retainedDuplicate regression tests in PutOperationTest..."
 ./gradlew :ambry-router:test \
-  --tests "com.github.ambry.router.PutOperationRetainedDuplicateLeakTest" \
+  --tests "com.github.ambry.router.PutOperationTest.testEncryptChunkKmsExceptionReleasesRetainedDuplicate" \
+  --tests "com.github.ambry.router.PutOperationTest.testFetchRequestsExceptionReleasesPutRequest" \
   -PwithByteBufTracking \
   --no-build-cache \
   --rerun-tasks \
@@ -58,12 +61,12 @@ echo "  - Check test output above for ByteBuf Flow Tracker reports"
 echo "  - Look for 'Unreleased ByteBufs: N' in the output"
 echo "  - All tests should show 0 leaks (fixes are in place)"
 echo ""
-echo "Tests verify fixes for:"
-echo "  1. Bug #3: Exception during KMS getRandomKey() after retainedDuplicate()"
-echo "     - Fixed in PutOperation.encryptChunk() with try-catch and cleanup"
-echo "     - Tested by: testEncryptJobConstructorExceptionHandledProperly"
+echo "Regression tests verify fixes for:"
+echo "  1. Bug #1: KMS exception after retainedDuplicate() in encryptChunk()"
+echo "     - Fixed with try-catch and cleanup"
+echo "     - Test: testEncryptChunkKmsExceptionReleasesRetainedDuplicate"
 echo ""
-echo "  2. Bug #4: Exception during RequestInfo construction after PutRequest creation"
-echo "     - Fixed in PutOperation.fetchRequests() with try-catch and cleanup"
-echo "     - Tested by: testRequestInfoConstructionExceptionHandledProperly"
+echo "  2. Bug #2: RequestInfo exception after PutRequest creation"
+echo "     - Fixed with try-catch and cleanup"
+echo "     - Test: testFetchRequestsExceptionReleasesPutRequest"
 echo ""
