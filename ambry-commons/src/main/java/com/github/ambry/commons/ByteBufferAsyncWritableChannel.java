@@ -86,7 +86,10 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
     if (src == null) {
       throw new IllegalArgumentException("Source buffer cannot be null");
     }
-    return write(Unpooled.wrappedBuffer(src), callback);
+    // Use PooledByteBufAllocator instead of Unpooled so NettyByteBufLeakHelper can detect leaks
+    ByteBuf pooledBuf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.heapBuffer(src.remaining());
+    pooledBuf.writeBytes(src);
+    return write(pooledBuf, callback);
   }
 
   /**
