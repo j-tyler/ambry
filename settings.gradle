@@ -9,6 +9,7 @@
 // CONDITIONS OF ANY KIND, either express or implied.
 include 'ambry-api',
         'ambry-account',
+        'ambry-benchmarks',
         'ambry-server',
         'ambry-network',
         'ambry-utils',
