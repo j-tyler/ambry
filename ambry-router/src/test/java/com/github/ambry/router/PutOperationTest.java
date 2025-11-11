@@ -1422,12 +1422,15 @@ public class PutOperationTest {
     VerifiableProperties vProps = new VerifiableProperties(routerProps);
     RouterConfig testRouterConfig = new RouterConfig(vProps);
 
-    // Create blob properties and content
+    // CRITICAL: Use TWO chunks so data chunks get polled (single chunk would complete immediately in metadata chunk)
+    int blobSize = chunkSize * 2;
+
+    // Create blob properties and content (NOT encrypted, so prepareForSending() is called instead of encryptChunk())
     BlobProperties blobProperties =
-        new BlobProperties(chunkSize, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
+        new BlobProperties(blobSize, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
             Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
     byte[] userMetadata = new byte[10];
-    byte[] content = new byte[chunkSize];
+    byte[] content = new byte[blobSize];
     random.nextBytes(content);
     ReadableStreamChannel channel = new ByteBufferReadableStreamChannel(ByteBuffer.wrap(content));
 
@@ -1454,10 +1457,10 @@ public class PutOperationTest {
 
     op.startOperation();
 
-    // Fill chunks to prepare data
+    // Fill chunks to prepare data - this calls prepareForSending() on each chunk, setting them to Ready state
     op.fillChunks();
 
-    // Poll for requests - this triggers fetchRequests() which will throw when trying to register
+    // Poll for requests - this triggers data chunk poll() → fetchRequests() which will throw when trying to register
     try {
       op.poll(throwingCallback);
       fail("Expected exception from callback");
