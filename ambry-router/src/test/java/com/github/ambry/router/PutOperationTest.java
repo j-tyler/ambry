@@ -1322,16 +1322,22 @@ public class PutOperationTest {
   }
 
   /**
-   * Regression test for Bug #1: KMS Exception After retainedDuplicate() in encryptChunk()
-   *
-   * This test verifies that when kms.getRandomKey() throws an exception after
-   * buf.retainedDuplicate() is evaluated (due to left-to-right argument evaluation),
-   * the fix properly releases the orphaned retained duplicate.
-   *
-   * Location: PutOperation.java:1582-1609 (encryptChunk method)
+   * KMS exception during EncryptJob constructor in PutOperation does not leak
    */
   @Test
-  public void testEncryptChunkKmsExceptionReleasesRetainedDuplicate() throws Exception {
+  public void testProductionBug_KmsExceptionAfterRetainedDuplicateLeaksBuffer_DISABLED() throws Exception {
+    // Set up crypto infrastructure
+    String defaultKey = TestUtils.getRandomKey(64);
+    Properties cryptoProps = new Properties();
+    cryptoProps.setProperty("kms.default.container.key", defaultKey);
+    cryptoProps.setProperty("kms.random.key.size.in.bits", "256");
+    VerifiableProperties cryptoVerifiableProps = new VerifiableProperties(cryptoProps);
+
+    // Create a working KMS for reference
+    KeyManagementService<SecretKeySpec> workingKms =
+        new SingleKeyManagementServiceFactory(cryptoVerifiableProps, "test-cluster",
+            new com.codahale.metrics.MetricRegistry()).getKeyManagementService();
+
     // Create a KMS that throws during getRandomKey()
     KeyManagementService<SecretKeySpec> faultyKms = new KeyManagementService<SecretKeySpec>() {
       @Override
@@ -1345,18 +1351,19 @@ public class PutOperationTest {
       @Override
       public SecretKeySpec getKey(com.github.ambry.rest.RestRequest restRequest, short accountId, short containerId)
           throws GeneralSecurityException {
-        throw new GeneralSecurityException("Not implemented");
+        return workingKms.getKey(restRequest, accountId, containerId);
       }
 
       @Override
       public SecretKeySpec getKey(com.github.ambry.rest.RestRequest restRequest, String context)
           throws GeneralSecurityException {
-        throw new GeneralSecurityException("Not implemented");
+        return workingKms.getKey(restRequest, context);
       }
 
       @Override
       public SecretKeySpec getRandomKey() throws GeneralSecurityException {
-        throw new GeneralSecurityException("Simulated KMS failure");
+        // This will be called during EncryptJob constructor argument evaluation
+        throw new GeneralSecurityException("Simulated KMS failure during getRandomKey");
       }
 
       @Override
@@ -1364,79 +1371,100 @@ public class PutOperationTest {
       }
     };
 
-    // Simulate the encryptChunk() flow with the fix
-    ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(4096);
-    buf.writeBytes(TestUtils.getRandomBytes(4096));
+    CryptoService<SecretKeySpec> cryptoService =
+        new GCMCryptoServiceFactory(cryptoVerifiableProps,
+            new com.codahale.metrics.MetricRegistry()).getCryptoService();
 
-    ByteBuf retainedCopy = null;
-    try {
-      // The fix: extract retainedDuplicate() before constructor
-      retainedCopy = buf.retainedDuplicate();
-      assertEquals(1, retainedCopy.refCnt());
+    CryptoJobHandler cryptoJobHandler = new CryptoJobHandler(2);
 
-      // Simulate getRandomKey() throwing
-      SecretKeySpec key = faultyKms.getRandomKey();
-      fail("Should have thrown GeneralSecurityException");
+    // Create router config with encryption enabled
+    Properties routerProps = createBasicRouterProperties();
+    VerifiableProperties vProps = new VerifiableProperties(routerProps);
+    RouterConfig testRouterConfig = new RouterConfig(vProps);
 
-    } catch (GeneralSecurityException e) {
-      // The fix: release retained duplicate if ownership not transferred
-      if (retainedCopy != null) {
-        retainedCopy.release();
-        retainedCopy = null;
-      }
-    }
+    // Create blob properties and content
+    BlobProperties blobProperties =
+        new BlobProperties(chunkSize, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
+            Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), true, null, null, null);
+    byte[] userMetadata = new byte[10];
+    byte[] content = new byte[chunkSize];
+    random.nextBytes(content);
+    ReadableStreamChannel channel = new ByteBufferReadableStreamChannel(ByteBuffer.wrap(content));
 
-    // Verify no leak
-    assertNull(retainedCopy);
-    buf.release();
+    MockNetworkClient mockNetworkClient = new MockNetworkClient();
+    FutureResult<String> future = new FutureResult<>();
+
+    // Create PutOperation with faulty KMS
+    PutOperation op =
+        PutOperation.forUpload(testRouterConfig, routerMetrics, mockClusterMap, new LoggingNotificationSystem(),
+            new InMemAccountService(true, false), userMetadata, channel, PutBlobOptions.DEFAULT, future, null,
+            faultyKms, cryptoService, cryptoJobHandler, time, blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS,
+            quotaChargeCallback, compressionService);
+
+    op.startOperation();
+
+    // Fill chunks - this would trigger the memory leak
+    op.fillChunks();
+
+    cryptoJobHandler.close();
+
+    // Let afterTest() check for leaks (it will pass or fail based on actual memory state)
   }
 
   /**
-   * Regression test for Bug #2: RequestInfo Exception After PutRequest Creation
-   *
-   * This test verifies that when RequestInfo construction throws an exception after
-   * PutRequest is created (which contains a retainedDuplicate), the fix properly
-   * releases the abandoned PutRequest.
-   *
-   * Location: PutOperation.java:1827-1863 (fetchRequests method)
+   * RequestInfo exception after PutRequest creation in PutOperation does not leak
    */
   @Test
-  public void testFetchRequestsExceptionReleasesPutRequest() throws Exception {
-    ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(1024);
-    buf.writeBytes(TestUtils.getRandomBytes(1024));
+  public void testProductionBug_RequestInfoExceptionAfterPutRequestCreationLeaksBuffer_DISABLED() throws Exception {
+    // Create router config
+    Properties routerProps = createBasicRouterProperties();
+    VerifiableProperties vProps = new VerifiableProperties(routerProps);
+    RouterConfig testRouterConfig = new RouterConfig(vProps);
 
-    // Simulate createPutRequest() with retained duplicate
-    ByteBuf retainedCopy = buf.retainedDuplicate();
-    assertEquals(1, retainedCopy.refCnt());
+    // Create blob properties and content
+    BlobProperties blobProperties =
+        new BlobProperties(chunkSize, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
+            Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
+    byte[] userMetadata = new byte[10];
+    byte[] content = new byte[chunkSize];
+    random.nextBytes(content);
+    ReadableStreamChannel channel = new ByteBufferReadableStreamChannel(ByteBuffer.wrap(content));
 
-    BlobId blobId = new BlobId(BlobId.BLOB_ID_V6, BlobId.BlobIdType.NATIVE, (byte) 0, (short) 1, (short) 1,
-        mockClusterMap.getWritablePartitionIds(null).get(0), false, BlobId.BlobDataType.DATACHUNK);
+    MockNetworkClient mockNetworkClient = new MockNetworkClient();
+    FutureResult<String> future = new FutureResult<>();
 
-    PutRequest putRequest = null;
+    // Create a RequestRegistrationCallback that throws when registerRequestToSend is called
+    // This simulates an exception during the request registration process (after PutRequest is created)
+    RequestRegistrationCallback<PutOperation> throwingCallback =
+        new RequestRegistrationCallback<PutOperation>(correlationIdToPutOperation) {
+          @Override
+          public void registerRequestToSend(PutOperation putOperation, RequestInfo requestInfo) {
+            // Throw exception to simulate failure after PutRequest creation but before successful storage
+            throw new RuntimeException("Simulated RequestInfo registration failure");
+          }
+        };
+
+    // Create PutOperation (no encryption, so it goes straight to request creation)
+    PutOperation op =
+        PutOperation.forUpload(testRouterConfig, routerMetrics, mockClusterMap, new LoggingNotificationSystem(),
+            new InMemAccountService(true, false), userMetadata, channel, PutBlobOptions.DEFAULT, future, null, null,
+            null, null, time, blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback,
+            compressionService);
+
+    op.startOperation();
+
+    // Fill chunks to prepare data
+    op.fillChunks();
+
+    // Poll for requests - this triggers fetchRequests() which will throw when trying to register
     try {
-      // PutRequest takes ownership of retained duplicate
-      putRequest = new PutRequest(1, "clientId", blobId,
-          new BlobProperties(1024, "test", (short) 1, (short) 1, false),
-          ByteBuffer.allocate(0), retainedCopy, 1024,
-          com.github.ambry.messageformat.BlobType.DataBlob, null, false);
-
-      assertEquals(1, retainedCopy.refCnt());
-
-      // Simulate RequestInfo construction throwing exception
-      throw new IllegalArgumentException("Simulated RequestInfo failure");
-
-    } catch (IllegalArgumentException e) {
-      // The fix: release PutRequest if not successfully stored
-      if (putRequest != null) {
-        putRequest.release();
-        putRequest = null;
-      }
+      op.poll(throwingCallback);
+      fail("Expected exception from callback");
+    } catch (RuntimeException e) {
+      assertEquals("Simulated RequestInfo registration failure", e.getMessage());
     }
 
-    // Verify no leak - PutRequest.release() released the retained duplicate
-    assertNull(putRequest);
-    assertEquals(0, retainedCopy.refCnt());
-    buf.release();
+    // Let afterTest() check for leaks (the fix should have released the PutRequest)
   }
 
   /**
