@@ -1409,7 +1409,10 @@ public class PutOperationTest {
 
     cryptoJobHandler.close();
 
-    // Let afterTest() check for leaks (it will pass or fail based on actual memory state)
+    // Explicitly check for ByteBuf leaks using the ByteBuf Flow Tracker
+    // Without the fix, this will detect the leaked retainedDuplicate() from encryptChunk()
+    int activeFlows = com.example.bytebuf.tracker.ByteBufFlowTracker.getInstance().getActiveFlowCount();
+    assertEquals("ByteBuf leak detected: retainedDuplicate() not released in encryptChunk()", 0, activeFlows);
   }
 
   /**
@@ -1468,7 +1471,10 @@ public class PutOperationTest {
       assertEquals("Simulated RequestInfo registration failure", e.getMessage());
     }
 
-    // Let afterTest() check for leaks (the fix should have released the PutRequest)
+    // Explicitly check for ByteBuf leaks using the ByteBuf Flow Tracker
+    // Without the fix, this will detect the leaked PutRequest from fetchRequests()
+    int activeFlows = com.example.bytebuf.tracker.ByteBufFlowTracker.getInstance().getActiveFlowCount();
+    assertEquals("ByteBuf leak detected: PutRequest not released in fetchRequests()", 0, activeFlows);
   }
 
   /**
