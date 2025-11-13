@@ -345,4 +345,265 @@ public class CompressionServiceTest {
     Assert.assertFalse(compressionService.isCompressibleContentType("unknown/111"));
     Assert.assertFalse(compressionService.isCompressibleContentType(""));
   }
+
+  /**
+   * Tests that CompositeByteBuf (multiple underlying buffers) is properly handled.
+   * CompositeByteBuf must be consolidated into a single contiguous buffer for compression.
+   */
+  @Test
+  public void testCompressWithCompositeByteBuf() throws CompressionException {
+    byte[] part1 = "First part of message. ".getBytes();
+    byte[] part2 = "Second part of message. ".getBytes();
+    byte[] part3 = "Third part of message.".getBytes();
+
+    // Create CompositeByteBuf with multiple components
+    ByteBuf composite = PooledByteBufAllocator.DEFAULT.compositeBuffer();
+    composite.addComponent(true, Unpooled.wrappedBuffer(part1));
+    composite.addComponent(true, Unpooled.wrappedBuffer(part2));
+    composite.addComponent(true, Unpooled.wrappedBuffer(part3));
+    Assert.assertTrue(composite.nioBufferCount() > 1); // Verify it's actually composite
+
+    try {
+      CompressionMetrics metrics = new CompressionMetrics(new MetricRegistry());
+      CompressionService service = new CompressionService(config, metrics);
+      service.minimalSourceDataSizeInBytes = 1;
+      service.minimalCompressRatio = 1.0;
+
+      // Compress CompositeByteBuf
+      int originalReaderIndex = composite.readerIndex();
+      int originalWriterIndex = composite.writerIndex();
+      int originalRefCount = composite.refCnt();
+
+      ByteBuf compressed = service.compressChunk(composite, false, false);
+      try {
+        Assert.assertNotNull(compressed);
+        // Verify contract: indices unchanged
+        Assert.assertEquals(originalReaderIndex, composite.readerIndex());
+        Assert.assertEquals(originalWriterIndex, composite.writerIndex());
+        // Verify contract: refCount unchanged
+        Assert.assertEquals(originalRefCount, composite.refCnt());
+
+        // Verify decompression works
+        ByteBuf decompressed = service.decompress(compressed, composite.readableBytes(), false);
+        try {
+          Assert.assertEquals(composite.readableBytes(), decompressed.readableBytes());
+          byte[] originalData = new byte[composite.readableBytes()];
+          byte[] decompressedData = new byte[decompressed.readableBytes()];
+          composite.getBytes(composite.readerIndex(), originalData);
+          decompressed.readBytes(decompressedData);
+          Assert.assertArrayEquals(originalData, decompressedData);
+        } finally {
+          decompressed.release();
+        }
+      } finally {
+        compressed.release();
+      }
+    } finally {
+      composite.release();
+    }
+  }
+
+  /**
+   * Tests LZ4 compression with mismatched buffer types (heap input, direct output).
+   * LZ4 allows type mixing, so this should use the optimized path (no intermediate copy).
+   */
+  @Test
+  public void testLZ4CompressWithTypeMismatch() throws CompressionException {
+    byte[] sourceBuffer = ("Test Message for testing purpose. The Message is part of the testing message."
+        + "Test Message for testing purpose. The Message is part of the testing message."
+        + "Test Message for testing purpose. The Message is part of the testing message.").getBytes();
+
+    // Create heap buffer
+    ByteBuf heapBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(sourceBuffer.length);
+    heapBuffer.writeBytes(sourceBuffer);
+    Assert.assertFalse(heapBuffer.isDirect()); // Verify it's heap
+    Assert.assertEquals(1, heapBuffer.nioBufferCount()); // Verify it's single buffer
+
+    try {
+      CompressionMetrics metrics = new CompressionMetrics(new MetricRegistry());
+      CompressionService service = new CompressionService(config, metrics);
+      service.minimalSourceDataSizeInBytes = 1;
+      service.minimalCompressRatio = 1.0;
+      service.defaultCompressor = service.allCompressions.get(LZ4Compression.ALGORITHM_NAME);
+
+      // Verify LZ4 doesn't require matching buffer types
+      Assert.assertFalse(service.defaultCompressor.requireMatchingBufferType());
+
+      int originalReaderIndex = heapBuffer.readerIndex();
+      int originalWriterIndex = heapBuffer.writerIndex();
+      int originalRefCount = heapBuffer.refCnt();
+
+      // Compress: heap → direct (type mismatch, but LZ4 allows it)
+      ByteBuf compressed = service.compressChunk(heapBuffer, false, true);
+      try {
+        Assert.assertNotNull(compressed);
+        Assert.assertTrue(compressed.isDirect()); // Output is direct as requested
+        // Verify contract: indices unchanged
+        Assert.assertEquals(originalReaderIndex, heapBuffer.readerIndex());
+        Assert.assertEquals(originalWriterIndex, heapBuffer.writerIndex());
+        // Verify contract: refCount unchanged (optimization doesn't leak references)
+        Assert.assertEquals(originalRefCount, heapBuffer.refCnt());
+
+        // Verify decompression works
+        ByteBuf decompressed = service.decompress(compressed, sourceBuffer.length, false);
+        try {
+          byte[] decompressedData = new byte[decompressed.readableBytes()];
+          decompressed.readBytes(decompressedData);
+          Assert.assertArrayEquals(sourceBuffer, decompressedData);
+        } finally {
+          decompressed.release();
+        }
+      } finally {
+        compressed.release();
+      }
+    } finally {
+      heapBuffer.release();
+    }
+  }
+
+  /**
+   * Tests Zstd compression with mismatched buffer types (heap input, direct output).
+   * Zstd requires matching buffer types, so this must create an intermediate copy.
+   */
+  @Test
+  public void testZstdCompressWithTypeMismatch() throws CompressionException {
+    byte[] sourceBuffer = ("Test Message for testing purpose. The Message is part of the testing message."
+        + "Test Message for testing purpose. The Message is part of the testing message."
+        + "Test Message for testing purpose. The Message is part of the testing message.").getBytes();
+
+    // Create heap buffer
+    ByteBuf heapBuffer = PooledByteBufAllocator.DEFAULT.heapBuffer(sourceBuffer.length);
+    heapBuffer.writeBytes(sourceBuffer);
+    Assert.assertFalse(heapBuffer.isDirect()); // Verify it's heap
+
+    try {
+      CompressionMetrics metrics = new CompressionMetrics(new MetricRegistry());
+      CompressionService service = new CompressionService(config, metrics);
+      service.minimalSourceDataSizeInBytes = 1;
+      service.minimalCompressRatio = 1.0;
+      service.defaultCompressor = service.allCompressions.get(ZstdCompression.ALGORITHM_NAME);
+
+      // Verify Zstd requires matching buffer types
+      Assert.assertTrue(service.defaultCompressor.requireMatchingBufferType());
+
+      int originalReaderIndex = heapBuffer.readerIndex();
+      int originalWriterIndex = heapBuffer.writerIndex();
+      int originalRefCount = heapBuffer.refCnt();
+
+      // Compress: heap → direct (type mismatch, Zstd must copy to match types)
+      ByteBuf compressed = service.compressChunk(heapBuffer, false, true);
+      try {
+        Assert.assertNotNull(compressed);
+        Assert.assertTrue(compressed.isDirect()); // Output is direct as requested
+        // Verify contract: indices unchanged
+        Assert.assertEquals(originalReaderIndex, heapBuffer.readerIndex());
+        Assert.assertEquals(originalWriterIndex, heapBuffer.writerIndex());
+        // Verify contract: refCount unchanged
+        Assert.assertEquals(originalRefCount, heapBuffer.refCnt());
+
+        // Verify decompression works
+        ByteBuf decompressed = service.decompress(compressed, sourceBuffer.length, false);
+        try {
+          byte[] decompressedData = new byte[decompressed.readableBytes()];
+          decompressed.readBytes(decompressedData);
+          Assert.assertArrayEquals(sourceBuffer, decompressedData);
+        } finally {
+          decompressed.release();
+        }
+      } finally {
+        compressed.release();
+      }
+    } finally {
+      heapBuffer.release();
+    }
+  }
+
+  /**
+   * Tests that compression preserves input buffer indices across all paths.
+   * This verifies the documented contract that indices remain unchanged.
+   */
+  @Test
+  public void testCompressionPreservesIndices() {
+    byte[] sourceBuffer = ("Test Message for testing purpose. The Message is part of the testing message."
+        + "Test Message for testing purpose. The Message is part of the testing message.").getBytes();
+
+    ByteBuf buffer = PooledByteBufAllocator.DEFAULT.heapBuffer(sourceBuffer.length + 20);
+    buffer.writeBytes(new byte[10]); // Add some offset
+    int startIndex = buffer.writerIndex();
+    buffer.writeBytes(sourceBuffer);
+    buffer.writeBytes(new byte[10]); // Add trailing bytes
+
+    // Set reader/writer to specific positions
+    buffer.readerIndex(startIndex);
+    buffer.writerIndex(startIndex + sourceBuffer.length);
+
+    try {
+      CompressionMetrics metrics = new CompressionMetrics(new MetricRegistry());
+      CompressionService service = new CompressionService(config, metrics);
+      service.minimalSourceDataSizeInBytes = 1;
+      service.minimalCompressRatio = 1.0;
+
+      int originalReaderIndex = buffer.readerIndex();
+      int originalWriterIndex = buffer.writerIndex();
+
+      ByteBuf compressed = service.compressChunk(buffer, false, false);
+      try {
+        Assert.assertNotNull(compressed);
+        // Verify indices completely unchanged
+        Assert.assertEquals(originalReaderIndex, buffer.readerIndex());
+        Assert.assertEquals(originalWriterIndex, buffer.writerIndex());
+        // Verify data still readable from original indices
+        Assert.assertEquals(sourceBuffer.length, buffer.readableBytes());
+      } finally {
+        if (compressed != null) {
+          compressed.release();
+        }
+      }
+    } finally {
+      buffer.release();
+    }
+  }
+
+  /**
+   * Tests decompression also preserves input buffer state.
+   */
+  @Test
+  public void testDecompressionPreservesIndices() throws CompressionException {
+    byte[] sourceBuffer = ("Test Message for testing purpose. The Message is part of the testing message."
+        + "Test Message for testing purpose. The Message is part of the testing message.").getBytes();
+
+    CompressionMetrics metrics = new CompressionMetrics(new MetricRegistry());
+    CompressionService service = new CompressionService(config, metrics);
+    service.minimalSourceDataSizeInBytes = 1;
+    service.minimalCompressRatio = 1.0;
+
+    ByteBuf original = PooledByteBufAllocator.DEFAULT.heapBuffer(sourceBuffer.length);
+    original.writeBytes(sourceBuffer);
+
+    try {
+      ByteBuf compressed = service.compressChunk(original, false, false);
+      try {
+        Assert.assertNotNull(compressed);
+
+        int originalReaderIndex = compressed.readerIndex();
+        int originalWriterIndex = compressed.writerIndex();
+        int originalRefCount = compressed.refCnt();
+
+        ByteBuf decompressed = service.decompress(compressed, sourceBuffer.length, false);
+        try {
+          // Verify indices unchanged on compressed buffer
+          Assert.assertEquals(originalReaderIndex, compressed.readerIndex());
+          Assert.assertEquals(originalWriterIndex, compressed.writerIndex());
+          // Verify refCount unchanged
+          Assert.assertEquals(originalRefCount, compressed.refCnt());
+        } finally {
+          decompressed.release();
+        }
+      } finally {
+        compressed.release();
+      }
+    } finally {
+      original.release();
+    }
+  }
 }
