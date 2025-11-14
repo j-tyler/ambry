@@ -15,6 +15,7 @@ package com.github.ambry.rest;
 
 import com.github.ambry.router.AsyncWritableChannel;
 import com.github.ambry.commons.Callback;
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.handler.codec.http.DefaultHttpContent;
 import io.netty.handler.codec.http.HttpContent;
@@ -220,8 +221,9 @@ class NettyMultipartRequest extends NettyRequest {
             contentLock.lock();
             try {
               if (isOpen()) {
-                requestContents.add(new DefaultHttpContent(ReferenceCountUtil.retain(fileUpload.content())));
-                blobBytesReceived.set(fileUpload.content().capacity());
+                ByteBuf content = fileUpload.content();
+                requestContents.add(new DefaultHttpContent(ReferenceCountUtil.retain(content)));
+                blobBytesReceived.set(content.readableBytes());
               } else {
                 nettyMetrics.multipartRequestAlreadyClosedError.inc();
                 throw new RestServiceException("Request is closed", RestServiceErrorCode.RequestChannelClosed);

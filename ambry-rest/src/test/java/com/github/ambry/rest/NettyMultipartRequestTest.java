@@ -540,6 +540,69 @@ public class NettyMultipartRequestTest {
   }
 
   /**
+   * Tests that getBlobBytesReceived() uses readableBytes() not capacity().
+   *
+   * We use reflection to directly test processPart() with a crafted FileUpload where
+   * capacity != readableBytes, bypassing the encoder/decoder which normalizes buffers.
+   * @throws Exception
+   */
+  @Test
+  public void blobBytesReceivedUsesCapacityNotReadableBytesTest() throws Exception {
+    int actualDataSize = 100;
+    int bufferCapacity = 200;
+
+    // Create request
+    HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/");
+    httpRequest.headers().set(RestUtils.Headers.BLOB_SIZE, actualDataSize);
+    NettyMultipartRequest request = new NettyMultipartRequest(
+        httpRequest,
+        new MockChannel(),
+        NETTY_METRICS,
+        Collections.emptySet(),
+        Long.MAX_VALUE);
+
+    // Create a ByteBuf with capacity > readableBytes
+    io.netty.buffer.ByteBuf byteBuf = Unpooled.buffer(bufferCapacity);
+    byte[] data = TestUtils.getRandomBytes(actualDataSize);
+    byteBuf.writeBytes(data);
+
+    // Verify setup: capacity should be larger than readableBytes
+    assertEquals("Setup: buffer capacity", bufferCapacity, byteBuf.capacity());
+    assertEquals("Setup: buffer readableBytes", actualDataSize, byteBuf.readableBytes());
+    assertTrue("Setup: capacity must exceed readableBytes", byteBuf.capacity() > byteBuf.readableBytes());
+
+    // Create FileUpload with this ByteBuf
+    FileUpload fileUpload = new MemoryFileUpload(
+        RestUtils.MultipartPost.BLOB_PART,
+        RestUtils.MultipartPost.BLOB_PART,
+        "application/octet-stream",
+        "",
+        Charset.forName("UTF-8"),
+        actualDataSize);
+    fileUpload.setContent(byteBuf);
+
+    try {
+      // Verify the FileUpload has the capacity/readableBytes difference
+      assertEquals("FileUpload content capacity", bufferCapacity, fileUpload.content().capacity());
+      assertEquals("FileUpload content readableBytes", actualDataSize, fileUpload.content().readableBytes());
+
+      // Use reflection to call the private processPart method
+      java.lang.reflect.Method processPartMethod =
+          NettyMultipartRequest.class.getDeclaredMethod("processPart",
+              io.netty.handler.codec.http.multipart.InterfaceHttpData.class);
+      processPartMethod.setAccessible(true);
+      processPartMethod.invoke(request, fileUpload);
+
+      assertEquals("getBlobBytesReceived() should return readableBytes, not capacity",
+          actualDataSize, request.getBlobBytesReceived());
+
+      closeRequestAndValidate(request);
+    } finally {
+      fileUpload.release();
+    }
+  }
+
+  /**
    * In memory representation of content.
    */
   private class InMemoryFile {
