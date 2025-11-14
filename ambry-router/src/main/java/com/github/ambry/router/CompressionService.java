@@ -225,6 +225,20 @@ public class CompressionService {
    * the compressed data is accepted and return compressed data; otherwise, compression is discarded.
    * This method emits metrics along the process.  It returns null if failed instead of throwing exceptions.
    *
+   * <p><b>Contract Guarantees (what this method promises):</b>
+   * <ul>
+   *   <li>Input buffer's reader/writer indices remain unchanged after method returns</li>
+   *   <li>Input buffer is never released (refCount unchanged)</li>
+   *   <li>Input buffer's content is never modified</li>
+   * </ul>
+   *
+   * <p><b>Contract Requirements (what caller must ensure):</b>
+   * <ul>
+   *   <li>Caller must have exclusive access to input buffer during this call (no concurrent access)</li>
+   *   <li>Input buffer must remain valid (refCount &gt; 0) for entire duration of this call</li>
+   *   <li>Caller must not modify input buffer's contents during this call</li>
+   * </ul>
+   *
    * @param chunkByteBuf The PutChunk buffer to compress.  The chunkBuffer index will not be updated.
    * @param isFullChunk Whether this is a full size chunk (4MB) or smaller.
    * @param outputDirectBuffer Whether to output in direct buffer (True) or heap buffer (False).
@@ -315,6 +329,20 @@ public class CompressionService {
 
   /**
    * Decompress the specified compressed buffer.  compressedBuffer index will not be updated.
+   *
+   * <p><b>Contract Guarantees (what this method promises):</b>
+   * <ul>
+   *   <li>Input buffer's reader/writer indices remain unchanged after method returns</li>
+   *   <li>Input buffer is never released (refCount unchanged)</li>
+   *   <li>Input buffer's content is never modified</li>
+   * </ul>
+   *
+   * <p><b>Contract Requirements (what caller must ensure):</b>
+   * <ul>
+   *   <li>Caller must have exclusive access to input buffer during this call (no concurrent access)</li>
+   *   <li>Input buffer must remain valid (refCount &gt; 0) for entire duration of this call</li>
+   *   <li>Caller must not modify input buffer's contents during this call</li>
+   * </ul>
    *
    * @param compressedByteBuf The compressed buffer.
    * @param fullChunkSize The size of a full chunk.  It is used to select metrics to emit.
@@ -408,27 +436,39 @@ public class CompressionService {
   }
 
   /**
-   * Convert a ByteBuf to a single buffer.  If source buffer is already single buffer, just return it.
-   * If it is consisted of multiple buffers, combine them into 1 direct buffer.
-   * Since this method may copy the source buffer, it generates a buffer that matches the compressor requirement based
-   * on outputDirectBuffer and compressorRequireMatchingBuffer parameters.
+   * Convert a ByteBuf to a single buffer suitable for compression/decompression.
+   * Avoids unnecessary memory copies when possible.
+   *
+   * <p>This method returns a retained duplicate (sharing underlying memory) when the input is already
+   * a single buffer AND either types match OR the compressor allows type mixing. Otherwise, creates
+   * a new buffer copy.
    *
    * @param byteBuf The source buffer to read from.
-   * @param outputDirectBuffer Whether the output buffer must be direct buffer.
-   *                           True means output is direct buffer; False means output is Heap buffer.
-   * @param compressorRequireMatchingBuffer Whether the source buffer and output buffer must match.
-   * @return The new buffer.  The new buffer must be released when done reading.
+   * @param outputDirectBuffer Whether the output buffer must be direct (true) or heap (false).
+   * @param compressorRequireMatchingBuffer Whether the compressor requires input and output buffers
+   *                                        to be the same type (both heap or both direct).
+   *                                        LZ4 returns false (allows mixing), Zstd returns true.
+   * @return A new buffer that must be released by the caller. Either a retained duplicate (no copy)
+   *         or a new allocated buffer (copy).
    */
   private ByteBuf combineBuffer(ByteBuf byteBuf, boolean outputDirectBuffer, boolean compressorRequireMatchingBuffer) {
-    // We need to copy the buffer if the source and target buffer mismatch, and they are required to match.
-    boolean mustCopyBuffer = compressorRequireMatchingBuffer && (outputDirectBuffer != byteBuf.isDirect());
+    // Fast path: handle single-buffer case with optimized copy avoidance
+    if (byteBuf.nioBufferCount() == 1) {
+      boolean typesMismatch = (outputDirectBuffer != byteBuf.isDirect());
 
-    // If the source buffer is already has 1 buffer, create an index duplicate (not the buffer).
-    if (byteBuf.nioBufferCount() == 1 && !mustCopyBuffer) {
-      return byteBuf.retainedDuplicate();
+      // Only copy if BOTH: (1) types don't match AND (2) compressor requires matching types.
+      // Example: LZ4 allows heap→direct without copy since requireMatchingBuffer=false.
+      boolean mustCopy = typesMismatch && compressorRequireMatchingBuffer;
+
+      if (!mustCopy) {
+        return byteBuf.retainedDuplicate();  // No allocation - just increment refCount
+      }
+      // Fall through to copy when type conversion is required (e.g., Zstd with mismatched types)
     }
 
-    // Copy the buffer out without changing index.
+    // Slow path: copy required because either:
+    // 1. CompositeByteBuf (nioBufferCount > 1) needs consolidation into single contiguous buffer, OR
+    // 2. Single buffer with type mismatch where compressor requires matching types
     ByteBuf newBuffer = outputDirectBuffer ? byteBufAllocator.directBuffer(byteBuf.readableBytes()):
         byteBufAllocator.heapBuffer(byteBuf.readableBytes());
     byteBuf.getBytes(byteBuf.readerIndex(), newBuffer);
