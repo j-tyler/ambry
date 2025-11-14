@@ -823,6 +823,21 @@ public class Utils {
   }
 
   /**
+   * Compute the CRC32 of the ByteBuffer. This method does not modify the buffer's position.
+   * This avoids allocating a byte array, reducing memory overhead.
+   *
+   * @param buffer The ByteBuffer to checksum
+   * @return The CRC32
+   */
+  public static long crc32(ByteBuffer buffer) {
+    CRC32 crc = new CRC32();
+    // Create a duplicate to avoid modifying the original buffer's position
+    ByteBuffer duplicate = buffer.duplicate();
+    crc.update(duplicate);
+    return crc.getValue();
+  }
+
+  /**
    * Read a properties file from the given path
    * @param filename The path of the file to read
    */

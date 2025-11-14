@@ -785,6 +785,43 @@ public class UtilsTest {
     }
     assertTrue(thrownEx instanceof IllegalArgumentException);
   }
+
+  /**
+   * Test that the ByteBuffer overload of crc32() produces the same result as the byte array version.
+   * This verifies that the memory optimization (avoiding byte array allocation) is functionally correct.
+   */
+  @Test
+  public void testCrc32ByteBuffer() {
+    Random random = new Random();
+    // Test various buffer sizes
+    int[] sizes = {0, 1, 100, 1024, 4096, 65536};
+
+    for (int size : sizes) {
+      byte[] data = new byte[size];
+      random.nextBytes(data);
+
+      // Calculate CRC using byte array method
+      long expectedCrc = Utils.crc32(data);
+
+      // Calculate CRC using ByteBuffer method (heap buffer)
+      ByteBuffer heapBuffer = ByteBuffer.wrap(data);
+      long heapCrc = Utils.crc32(heapBuffer);
+
+      // Calculate CRC using ByteBuffer method (direct buffer)
+      ByteBuffer directBuffer = ByteBuffer.allocateDirect(size);
+      directBuffer.put(data);
+      directBuffer.flip();
+      long directCrc = Utils.crc32(directBuffer);
+
+      // All methods should produce the same CRC
+      assertEquals("Heap buffer CRC should match byte array CRC for size " + size, expectedCrc, heapCrc);
+      assertEquals("Direct buffer CRC should match byte array CRC for size " + size, expectedCrc, directCrc);
+
+      // Verify that buffer positions are not modified
+      assertEquals("Heap buffer position should not change", 0, heapBuffer.position());
+      assertEquals("Direct buffer position should not change", 0, directBuffer.position());
+    }
+  }
 }
 
 class MockClassForTesting {

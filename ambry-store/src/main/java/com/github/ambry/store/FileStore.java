@@ -576,14 +576,14 @@ public class FileStore implements PartitionFileStore {
         }
         try (RandomAccessFile raf = new RandomAccessFile(file, "r"); FileChannel channel = raf.getChannel()) {
           long size = range.getSecond() - range.getFirst();
-          ByteBuffer buffer = ByteBuffer.allocateDirect((int) size);
+          // Use heap buffer to avoid double allocation (direct buffer -> byte array)
+          ByteBuffer buffer = ByteBuffer.allocate((int) size);
           channel.position(range.getFirst());
           channel.read(buffer);
           buffer.flip();
 
-          byte[] arr = new byte[buffer.remaining()];
-          buffer.get(arr);
-          checksums.add(Long.toString(Utils.crc32(arr)));
+          // Directly compute CRC32 on ByteBuffer, avoiding byte array allocation
+          checksums.add(Long.toString(Utils.crc32(buffer)));
         }
       }
     } catch (FileNotFoundException e) {
