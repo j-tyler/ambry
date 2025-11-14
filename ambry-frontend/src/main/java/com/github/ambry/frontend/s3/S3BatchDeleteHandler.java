@@ -32,8 +32,9 @@ import com.github.ambry.rest.WrappedRestRequest;
 import com.github.ambry.router.ReadableStreamChannel;
 import io.netty.buffer.ByteBuf;
 import java.io.ByteArrayOutputStream;
-import java.nio.ByteBuffer;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -184,12 +185,15 @@ public class S3BatchDeleteHandler extends S3BaseHandler<ReadableStreamChannel> {
 
   /**
    * Deserialize the request body into an S3BatchDeleteObjects.
+   *
+   * IMPORTANT: Uses consumeContentAsInputStream() instead of consumeContentAsBytes() to avoid allocating
+   * and copying the entire XML payload into a temporary byte array. The InputStream is backed directly by
+   * the channel's ByteBuf, which is automatically released when the stream is closed (via try-with-resources).
    */
   public S3MessagePayload.S3BatchDeleteObjects deserializeRequest(RetainingAsyncWritableChannel channel)
       throws RestServiceException {
-    try {
-      byte[] byteArray = channel.consumeContentAsBytes();
-      return new XmlMapper().readValue(byteArray, S3MessagePayload.S3BatchDeleteObjects.class);
+    try (InputStream inputStream = channel.consumeContentAsInputStream()) {
+      return xmlMapper.readValue(inputStream, S3MessagePayload.S3BatchDeleteObjects.class);
     } catch (Exception e) {
       logger.trace("s3batchdelete failed to deserialize request");
       throw new RestServiceException("failed to deserialize", e, RestServiceErrorCode.BadRequest);

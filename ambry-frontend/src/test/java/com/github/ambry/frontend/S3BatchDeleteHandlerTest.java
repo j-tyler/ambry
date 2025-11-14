@@ -142,43 +142,6 @@ public class S3BatchDeleteHandlerTest {
   }
 
   @Test
-  public void testConsumeContentAsBytesReleasesBuffer() {
-    // Arrange: Create a ByteBuf with some data
-    ByteBuf testBuf = Unpooled.buffer();
-    String validXml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-        "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01\">" +
-        "<Object>" +
-        "<Key>key-success</Key>" +
-        "</Object>" +
-        "<Object>" +
-        "<Key>key-error</Key>" +
-        "</Object>" +
-        "<Object>" +
-        "<Key>key-error2</Key>" +
-        "</Object>" +
-        "<Object>" +
-        "<Key>key-success-2</Key>" +
-        "</Object>" +
-        "</Delete>";
-    byte[] xmlBytes = validXml.getBytes();
-    testBuf.writeBytes(xmlBytes);
-    // Wrap the consumeContentAsByteBuf method to return the test buffer
-    RetainingAsyncWritableChannel channel = new RetainingAsyncWritableChannel() {
-      @Override
-      public ByteBuf consumeContentAsByteBuf() {
-        return testBuf;
-      }
-    };
-
-    // Act: Call the method
-    byte[] result = channel.consumeContentAsBytes();
-
-    // Assert: Verify the buffer was released and the data matches
-    assertArrayEquals(xmlBytes, result);
-    assertEquals("Buffer should be released", 0, testBuf.refCnt());
-  }
-
-  @Test
   public void testDeserializeRequestWithRealChannel() throws Exception {
     // Arrange
     String validXml =

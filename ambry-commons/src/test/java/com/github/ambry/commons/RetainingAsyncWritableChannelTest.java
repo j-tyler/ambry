@@ -219,6 +219,196 @@ public class RetainingAsyncWritableChannelTest {
   }
 
   /**
+   * Test that {@link RetainingAsyncWritableChannel#consumeContentAsBytes()} properly releases the underlying buffer.
+   */
+  @Test
+  public void testConsumeContentAsBytesReleasesBuffer() {
+    // Arrange: Create a ByteBuf with test data
+    ByteBuf testBuf = Unpooled.buffer();
+    byte[] testData = TestUtils.getRandomBytes(1024);
+    testBuf.writeBytes(testData);
+
+    // Wrap the consumeContentAsByteBuf method to return the test buffer
+    RetainingAsyncWritableChannel channel = new RetainingAsyncWritableChannel() {
+      @Override
+      public ByteBuf consumeContentAsByteBuf() {
+        return testBuf;
+      }
+    };
+
+    // Act: Call consumeContentAsBytes which should copy and release
+    byte[] result = channel.consumeContentAsBytes();
+
+    // Assert: Verify the buffer was released and the data matches
+    assertArrayEquals("Content should match", testData, result);
+    assertEquals("Buffer should be released after consumption", 0, testBuf.refCnt());
+  }
+
+  /**
+   * Test that content cannot be consumed twice.
+   *
+   * WHY: consumeContentAsByteBuf() nulls out the internal buffer after consumption. Attempting to consume
+   * again should throw IllegalStateException. This validates the API contract and ensures single-consumer semantics.
+   */
+  @Test
+  public void testCannotConsumeTwice() throws Exception {
+    RetainingAsyncWritableChannel channel = new RetainingAsyncWritableChannel();
+    byte[] data = TestUtils.getRandomBytes(100);
+    channel.write(ByteBuffer.wrap(data), null);
+
+    // First consumption should succeed
+    try (InputStream is = channel.consumeContentAsInputStream()) {
+      assertNotNull("First consumption should succeed", is);
+    }
+
+    // Second consumption should fail
+    try {
+      channel.consumeContentAsInputStream();
+      fail("Should not be able to consume content twice");
+    } catch (IllegalStateException e) {
+      assertTrue("Expected 'already consumed' message",
+          e.getMessage().contains("already consumed") || e.getMessage().contains("channel was closed"));
+    }
+  }
+
+  /**
+   * Test that writes are not allowed after content has been consumed.
+   *
+   * WHY: After consumption, the internal compositeBuffer is set to null. Writes check for this and throw
+   * IllegalStateException, ensuring single-consumer semantics.
+   */
+  @Test
+  public void testCannotWriteAfterConsumption() throws Exception {
+    RetainingAsyncWritableChannel channel = new RetainingAsyncWritableChannel();
+    byte[] data1 = TestUtils.getRandomBytes(100);
+    channel.write(ByteBuffer.wrap(data1), null);
+
+    // Consume the content
+    try (InputStream is = channel.consumeContentAsInputStream()) {
+      assertNotNull("Consumption should succeed", is);
+    }
+
+    // Try to write after consumption - should fail
+    byte[] data2 = TestUtils.getRandomBytes(50);
+    FutureResult<Long> result = new FutureResult<>();
+    channel.write(ByteBuffer.wrap(data2), result::done);
+
+    // Verify the write failed with IllegalStateException
+    assertTrue("Write operation should be completed", result.isDone());
+    TestUtils.assertException(ExecutionException.class, result::get, e -> {
+      IllegalStateException cause = (IllegalStateException) e.getCause();
+      assertTrue("Expected 'cannot write' message",
+          cause.getMessage().contains("Cannot write") || cause.getMessage().contains("already consumed"));
+    });
+  }
+
+  /**
+   * Test that {@link RetainingAsyncWritableChannel#consumeContentAsInputStream()} properly releases
+   * the underlying ByteBuf when the InputStream is closed.
+   *
+   * WHY: consumeContentAsInputStream() creates a ByteBufInputStream with releaseOnClose=true.
+   * This test validates the critical resource management contract: closing the InputStream MUST release
+   * the underlying ByteBuf to prevent memory leaks. This is essential for the InputStream API to be safe
+   * when used with try-with-resources (as in S3BatchDeleteHandler.deserializeRequest()).
+   */
+  @Test
+  public void testInputStreamReleasesByteBufOnClose() throws Exception {
+    RetainingAsyncWritableChannel channel = new RetainingAsyncWritableChannel();
+    byte[] data = TestUtils.getRandomBytes(1024);
+    ByteBuf byteBuf = ByteBufAllocator.DEFAULT.heapBuffer(data.length);
+    byteBuf.writeBytes(data);
+
+    // Write using ByteBuf so we can track refcount
+    FutureResult<Long> writeResult = new FutureResult<>();
+    channel.write(byteBuf, (result, exception) -> {
+      byteBuf.release(); // Release our reference
+      writeResult.done(result, exception);
+    });
+
+    // At this point, channel holds one reference
+    assertEquals("Channel should hold reference to buffer", 1, byteBuf.refCnt());
+
+    // Get InputStream (transfers ownership to InputStream)
+    InputStream is = channel.consumeContentAsInputStream();
+
+    // Read some data to verify it works
+    byte[] readBuf = new byte[100];
+    int read = is.read(readBuf);
+    assertEquals("Should read 100 bytes", 100, read);
+
+    // Close the InputStream - should release the ByteBuf
+    is.close();
+
+    // Verify the ByteBuf was released
+    assertEquals("ByteBuf should be released after InputStream close", 0, byteBuf.refCnt());
+  }
+
+  /**
+   * Test consuming content from an empty channel (no writes).
+   *
+   * WHY: Edge case validation. An empty CompositeByteBuf is still valid and should return an InputStream
+   * that immediately returns EOF (-1 on read). This ensures the API doesn't NPE or fail on empty payloads.
+   */
+  @Test
+  public void testConsumeEmptyChannel() throws Exception {
+    RetainingAsyncWritableChannel channel = new RetainingAsyncWritableChannel();
+
+    // Don't write anything, just consume
+    try (InputStream is = channel.consumeContentAsInputStream()) {
+      assertNotNull("InputStream should be created even for empty channel", is);
+      assertEquals("Empty channel should return 0 bytes available", 0, is.available());
+      assertEquals("Reading from empty stream should return -1", -1, is.read());
+    }
+  }
+
+  /**
+   * Test that consuming content after closing the channel fails.
+   *
+   * WHY: close() releases the internal buffer and sets it to null. Consumption after close should fail
+   * with IllegalStateException. This validates proper lifecycle management.
+   */
+  @Test
+  public void testCannotConsumeAfterClose() throws Exception {
+    RetainingAsyncWritableChannel channel = new RetainingAsyncWritableChannel();
+    byte[] data = TestUtils.getRandomBytes(100);
+    channel.write(ByteBuffer.wrap(data), null);
+
+    // Close the channel
+    channel.close();
+
+    // Try to consume - should fail
+    try {
+      channel.consumeContentAsInputStream();
+      fail("Should not be able to consume after channel is closed");
+    } catch (IllegalStateException e) {
+      assertTrue("Expected 'channel was closed' message",
+          e.getMessage().contains("channel was closed") || e.getMessage().contains("already consumed"));
+    }
+  }
+
+  /**
+   * Test single-byte reads from InputStream work correctly.
+   *
+   * WHY: Validates the InputStream.read() single-byte API works correctly on ByteBufInputStream.
+   * Some XML parsers may read byte-by-byte, so this ensures compatibility with all InputStream consumers.
+   */
+  @Test
+  public void testInputStreamSingleByteReads() throws Exception {
+    RetainingAsyncWritableChannel channel = new RetainingAsyncWritableChannel();
+    byte[] data = new byte[]{1, 2, 3, 4, 5};
+    channel.write(ByteBuffer.wrap(data), null);
+
+    try (InputStream is = channel.consumeContentAsInputStream()) {
+      for (byte expected : data) {
+        int read = is.read();
+        assertTrue("Should read valid byte", read >= 0);
+        assertEquals("Byte should match", expected, (byte) read);
+      }
+      assertEquals("Should reach end of stream", -1, is.read());
+    }
+  }
+
+  /**
    * Check that the content in the stream returned by {@link RetainingAsyncWritableChannel#consumeContentAsInputStream()}
    * matches expectations.
    * @param expectedContent the expected content.
