@@ -1157,6 +1157,109 @@ public class PutOperationTest {
   }
 
   /**
+   * Tests that CompositeByteBuf created during chunk filling uses a reasonable maxComponents value
+   * calculated from the chunk size, rather than using routerMaxPutChunkSizeBytes directly.
+   *
+   * The bug: Using routerMaxPutChunkSizeBytes (4MB = 4,194,304) as maxComponents
+   * The fix: Calculate as (routerMaxPutChunkSizeBytes / 128) + 16
+   *
+   * For default 4MB chunks: (4,194,304 / 128) + 16 = 32,784 components
+   *
+   * Why we can't know exact count: Unlike PutRequest/MessageFormatSend which compose known
+   * components upfront, fillFrom() is called incrementally as data arrives. We must estimate
+   * worst-case based on minimum write size.
+   *
+   * Why 128-byte minimum (conservative choice):
+   *   - Prevents catastrophic copying even with pathological sub-KB writes
+   *   - Memory cost: ~2MB per CompositeByteBuf (vs 259MB bug, 130x improvement)
+   *   - Tradeoff: Higher memory vs preventing 510x copy overhead with tiny writes
+   *   - Defensive: Handles unknown usage patterns without performance cliff
+   *
+   * Worst-case scenario (1-byte writes): 63.5x copy overhead vs 510x with less conservative choice
+   * Normal case (≥128-byte writes): Zero consolidation overhead
+   */
+  @Test
+  public void testCompositeByteBufMaxComponentsIsReasonable() throws Exception {
+    BlobProperties blobProperties =
+        new BlobProperties(-1, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
+            Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
+
+    byte[] userMetadata = new byte[10];
+    byte[] content = new byte[chunkSize];
+    random.nextBytes(content);
+
+    MockNetworkClient mockNetworkClient = new MockNetworkClient();
+    PutOperation op =
+        PutOperation.forUpload(routerConfig, routerMetrics, mockClusterMap, new LoggingNotificationSystem(),
+            new InMemAccountService(true, false), userMetadata, new ByteBufferReadableStreamChannel(ByteBuffer.wrap(content)),
+            PutBlobOptions.DEFAULT, new FutureResult<>(), null,
+            new RouterCallback(mockNetworkClient, new ArrayList<>()), null, null, null, null, time,
+            blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
+
+    // Create a PutChunk to test fillFrom behavior
+    PutOperation.PutChunk putChunk = op.new PutChunk();
+
+    // Create two small ByteBuf slices to simulate incremental filling
+    // First slice: 1KB
+    ByteBuf firstSlice = PooledByteBufAllocator.DEFAULT.heapBuffer(1024);
+    firstSlice.writeBytes(new byte[1024]);
+
+    // Second slice: 1KB
+    ByteBuf secondSlice = PooledByteBufAllocator.DEFAULT.heapBuffer(1024);
+    secondSlice.writeBytes(new byte[1024]);
+
+    try {
+      // First fillFrom: buf is null, so it just assigns the first slice
+      int written1 = (int) MethodUtils.invokeMethod(putChunk, true, "fillFrom", firstSlice);
+      assertEquals("First fill should write 1KB", 1024, written1);
+
+      // Get the buf field
+      ByteBuf bufAfterFirst = (ByteBuf) FieldUtils.readField(putChunk, "buf", true);
+      assertNotNull("Buffer should not be null after first fill", bufAfterFirst);
+      assertFalse("Buffer should NOT be CompositeByteBuf after first fill",
+          bufAfterFirst instanceof io.netty.buffer.CompositeByteBuf);
+
+      // Second fillFrom: buf is not null and not CompositeByteBuf, so it creates CompositeByteBuf
+      int written2 = (int) MethodUtils.invokeMethod(putChunk, true, "fillFrom", secondSlice);
+      assertEquals("Second fill should write 1KB", 1024, written2);
+
+      // Get the buf field again
+      ByteBuf bufAfterSecond = (ByteBuf) FieldUtils.readField(putChunk, "buf", true);
+      assertNotNull("Buffer should not be null after second fill", bufAfterSecond);
+      assertTrue("Buffer SHOULD be CompositeByteBuf after second fill",
+          bufAfterSecond instanceof io.netty.buffer.CompositeByteBuf);
+
+      // Use reflection to get the maxNumComponents field from CompositeByteBuf
+      io.netty.buffer.CompositeByteBuf compositeBuf = (io.netty.buffer.CompositeByteBuf) bufAfterSecond;
+      Field maxNumComponentsField = io.netty.buffer.CompositeByteBuf.class.getDeclaredField("maxNumComponents");
+      maxNumComponentsField.setAccessible(true);
+      int maxNumComponents = maxNumComponentsField.getInt(compositeBuf);
+
+      // Calculate expected value using the formula from PutOperation
+      // maxComponents = (routerMaxPutChunkSizeBytes / 128) + 16
+      int expectedMaxComponents = (routerConfig.routerMaxPutChunkSizeBytes / 128) + 16;
+
+      // Assert that maxComponents matches our formula (not the buggy value of 4,194,304)
+      assertEquals(
+          String.format("maxNumComponents should be calculated as (chunkSize/128)+16 = %d, but was %d. " +
+              "Bug value would be routerMaxPutChunkSizeBytes = 4,194,304", expectedMaxComponents, maxNumComponents),
+          expectedMaxComponents, maxNumComponents);
+
+      // Additional sanity check: it should be reasonable (not millions)
+      // For 4MB chunks: (4,194,304 / 128) + 16 = 32,784
+      assertTrue(
+          String.format("maxNumComponents should be reasonable (< 100,000), but was %d. " +
+              "This indicates the bug where routerMaxPutChunkSizeBytes (bytes) is used as component count!", maxNumComponents),
+          maxNumComponents < 100000);
+    } finally {
+      // Clean up
+      putChunk.releaseBlobContent();
+      firstSlice.release();
+      secondSlice.release();
+    }
+  }
+
+  /**
    * Tests that if we cannot find a partition with a valid number of replicas, we will retry
    * rather than throw an exception
    * This case ensures that one partition fails and then another one passes.
