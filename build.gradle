@@ -213,6 +213,9 @@ subprojects {
         if (project.hasProperty('withByteBufTracking') || project.hasProperty('enableByteBufTracking') || System.getProperty('enableByteBufTracking') == 'true') {
             dependsOn rootProject.tasks.buildByteBufTrackerAgent
 
+            // Disable caching to ensure tests run with tracking
+            outputs.upToDateWhen { false }
+
             def trackerJar = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar")
             doFirst {
                 if (!trackerJar.exists()) {
@@ -259,6 +262,9 @@ subprojects {
         if (project.hasProperty('withByteBufTracking') || project.hasProperty('enableByteBufTracking') || System.getProperty('enableByteBufTracking') == 'true') {
             // Ensure the submodule is initialized and tracker is built before tests run
             dependsOn rootProject.tasks.buildByteBufTrackerAgent
+
+            // Disable caching to ensure tests run with tracking
+            outputs.upToDateWhen { false }
 
             // Add the tracker agent
             def trackerJar = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar")
@@ -812,10 +818,6 @@ task codeCoverageReport(type: JacocoReport) {
 
 // ByteBuf Flow Tracker report consolidation
 // When tests complete with tracking enabled, print all reports to console
-def byteBufTrackingEnabled = project.hasProperty('withByteBufTracking') ||
-                             project.hasProperty('enableByteBufTracking') ||
-                             System.getProperty('enableByteBufTracking') == 'true'
-
 if (byteBufTrackingEnabled) {
     gradle.buildFinished {
         println "\n"
