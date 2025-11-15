@@ -186,8 +186,8 @@ subprojects {
                                      System.getProperty('enableByteBufTracking') == 'true'
 
         if (byteBufTrackingEnabled) {
-            // Ensure the tracker is built before tests run
-            dependsOn ':bytebuf-tracker:agentJar'
+            // Ensure the submodule is initialized and tracker is built before tests run
+            dependsOn initByteBufTrackerSubmodule, ':bytebuf-tracker:agentJar'
 
             // Add the tracker agent
             def trackerJar = file("${rootProject.projectDir}/bytebuf-tracker/build/libs/bytebuf-tracker-agent.jar")
@@ -228,70 +228,55 @@ subprojects {
                                  project.hasProperty('enableByteBufTracking')
 
     if (byteBufTrackingEnabled) {
-        // Default agent path (can be overridden with -Dbytebuf.agent.path=...)
-        // Try multiple common locations
-        def agentPath = System.getProperty('bytebuf.agent.path')
-        if (agentPath == null) {
-            def possiblePaths = [
-                System.getProperty('user.home') + '/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar',
-                System.getProperty('user.home') + '/personal-ws/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar',
-                System.getProperty('user.home') + '/workspace/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar'
-            ]
-            // Find the first path that exists
-            agentPath = possiblePaths.find { file(it).exists() }
-            if (agentPath == null) {
-                agentPath = possiblePaths[0] // Use first as default for error message
+        // Task to ensure ByteBuf tracker submodule is initialized
+        task initByteBufTrackerSubmodule(type: Exec) {
+            description = 'Initialize and update the bytebuddy-bytebuf-tracer submodule'
+            group = 'build setup'
+
+            // Check if submodule is already initialized (has files)
+            def submoduleDir = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer")
+            def submoduleInitialized = submoduleDir.exists() && submoduleDir.listFiles()?.length > 1
+
+            onlyIf {
+                !submoduleInitialized
             }
+
+            workingDir rootProject.projectDir
+            commandLine 'git', 'submodule', 'update', '--init', '--recursive', 'modules/bytebuddy-bytebuf-tracer'
+
+            doFirst {
+                logger.lifecycle("Initializing ByteBuf tracker submodule...")
+            }
+
+            doLast {
+                logger.lifecycle("ByteBuf tracker submodule initialized at modules/bytebuddy-bytebuf-tracer")
+            }
+
+            // Ignore failures if not in a git repository or submodule doesn't exist
+            ignoreExitValue = true
         }
-        def agentJar = file(agentPath)
 
         // Configure test task with ByteBuf tracker
         test {
+            // Ensure the submodule is initialized and tracker is built before tests run
+            dependsOn initByteBufTrackerSubmodule, ':bytebuf-tracker:agentJar'
+
+            // Add the tracker agent
+            def trackerJar = file("${rootProject.projectDir}/bytebuf-tracker/build/libs/bytebuf-tracker-agent.jar")
             doFirst {
-                if (!agentJar.exists()) {
+                if (!trackerJar.exists()) {
                     throw new GradleException(
-                        "ByteBuf tracker agent JAR not found at: ${agentJar}\n\n" +
-                        "To build the agent:\n" +
-                        "  1. Clone the repository (if not already cloned):\n" +
-                        "     git clone https://github.com/j-tyler/bytebuddy-bytebuf-tracer.git\n" +
-                        "  2. Build with Maven:\n" +
-                        "     cd /path/to/bytebuddy-bytebuf-tracer\n" +
-                        "     mvn clean package -DskipTests\n\n" +
-                        "IMPORTANT: Use the agent JAR from bytebuf-flow-tracker module:\n" +
-                        "  .../bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar\n" +
-                        "  (NOT bytebuf-flow-integration-tests or other modules)\n\n" +
-                        "Or specify the correct path:\n" +
-                        "  ./gradlew test -PwithByteBufTracking -Dbytebuf.agent.path=/path/to/bytebuf-flow-tracker-agent.jar"
+                        "ByteBuf tracker agent JAR not found at ${trackerJar}. " +
+                        "Ensure bytebuf-tracker module is built."
                     )
                 }
                 logger.lifecycle("ByteBuf Flow Tracker ENABLED")
-                logger.lifecycle("Using agent: ${agentJar}")
+                logger.lifecycle("Using agent: ${trackerJar}")
             }
 
             // Attach the Java agent with configuration
             // Exclude Mockito internals to avoid ByteBuddy conflicts (Mockito uses ByteBuddy internally)
-            jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry;exclude=org.mockito"
-
-            // Register test listener to print tracker output
-            systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
-        }
-
-        // Configure intTest task with ByteBuf tracker
-        intTest {
-            doFirst {
-                if (!agentJar.exists()) {
-                    throw new GradleException(
-                        "ByteBuf tracker agent JAR not found at: ${agentJar}\n\n" +
-                        "Build it with:\n" +
-                        "  cd ~/bytebuddy-bytebuf-tracer && mvn clean package -DskipTests"
-                    )
-                }
-                logger.lifecycle("ByteBuf Flow Tracker ENABLED (integration tests)")
-                logger.lifecycle("Using agent: ${agentJar}")
-            }
-
-            // Exclude Mockito internals to avoid ByteBuddy conflicts
-            jvmArgs "-javaagent:${agentJar.absolutePath}=include=com.github.ambry;exclude=org.mockito"
+            jvmArgs "-javaagent:${trackerJar.absolutePath}=include=com.github.ambry;exclude=org.mockito"
 
             // Register test listener to print tracker output
             systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
