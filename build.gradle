@@ -59,6 +59,61 @@ allprojects {
     }
 }
 
+// ByteBuf Flow Tracker integration using submodule
+// Define at root level so tasks only run once per build, not per subproject
+def byteBufTrackingEnabled = project.hasProperty('withByteBufTracking') ||
+                             project.hasProperty('enableByteBufTracking') ||
+                             System.getProperty('enableByteBufTracking') == 'true'
+
+if (byteBufTrackingEnabled) {
+    // Task 1: Update submodule to latest (runs once per build)
+    task updateByteBufTrackerSubmodule(type: Exec) {
+        description = 'Update the bytebuddy-bytebuf-tracer submodule to latest'
+        group = 'build setup'
+
+        workingDir projectDir
+        commandLine 'git', 'submodule', 'update', '--init', '--remote', 'modules/bytebuddy-bytebuf-tracer'
+
+        doFirst {
+            logger.lifecycle("Updating ByteBuf tracker submodule to latest...")
+        }
+
+        doLast {
+            logger.lifecycle("ByteBuf tracker submodule updated at modules/bytebuddy-bytebuf-tracer")
+        }
+
+        // Ignore failures if not in a git repository or submodule doesn't exist
+        ignoreExitValue = true
+    }
+
+    // Task 2: Build the agent using Maven (runs once per build)
+    task buildByteBufTrackerAgent(type: Exec) {
+        description = 'Build the ByteBuf Flow Tracker agent JAR using Maven'
+        group = 'build'
+
+        dependsOn updateByteBufTrackerSubmodule
+
+        workingDir file("${projectDir}/modules/bytebuddy-bytebuf-tracer")
+        commandLine 'mvn', 'clean', 'install', '-pl', 'bytebuf-flow-tracker', '-am', '-DskipTests'
+
+        doFirst {
+            logger.lifecycle("Building ByteBuf tracker agent with Maven...")
+        }
+
+        doLast {
+            def agentJar = file("${projectDir}/modules/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar")
+            if (agentJar.exists()) {
+                logger.lifecycle("ByteBuf tracker agent built successfully: ${agentJar}")
+            } else {
+                logger.warn("ByteBuf tracker agent JAR not found at expected location: ${agentJar}")
+            }
+        }
+
+        // Fail if Maven build fails
+        ignoreExitValue = false
+    }
+}
+
 subprojects {
     apply plugin: 'java'
 
@@ -130,61 +185,6 @@ subprojects {
         }
     }
 
-    // ByteBuf Flow Tracker integration using submodule
-    // This is defined early so it can be referenced by test and intTest tasks
-    def byteBufTrackingEnabled = project.hasProperty('withByteBufTracking') ||
-                                 project.hasProperty('enableByteBufTracking') ||
-                                 System.getProperty('enableByteBufTracking') == 'true'
-
-    if (byteBufTrackingEnabled) {
-        // Task 1: Initialize and update submodule
-        task updateByteBufTrackerSubmodule(type: Exec) {
-            description = 'Update the bytebuddy-bytebuf-tracer submodule to latest'
-            group = 'build setup'
-
-            workingDir rootProject.projectDir
-            commandLine 'git', 'submodule', 'update', '--init', '--remote', 'modules/bytebuddy-bytebuf-tracer'
-
-            doFirst {
-                logger.lifecycle("Updating ByteBuf tracker submodule to latest...")
-            }
-
-            doLast {
-                logger.lifecycle("ByteBuf tracker submodule updated at modules/bytebuddy-bytebuf-tracer")
-            }
-
-            // Ignore failures if not in a git repository or submodule doesn't exist
-            ignoreExitValue = true
-        }
-
-        // Task 2: Build the agent using Maven (as per upstream README)
-        task buildByteBufTrackerAgent(type: Exec) {
-            description = 'Build the ByteBuf Flow Tracker agent JAR using Maven'
-            group = 'build'
-
-            dependsOn updateByteBufTrackerSubmodule
-
-            workingDir file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer")
-            commandLine 'mvn', 'clean', 'install', '-pl', 'bytebuf-flow-tracker', '-am', '-DskipTests'
-
-            doFirst {
-                logger.lifecycle("Building ByteBuf tracker agent with Maven...")
-            }
-
-            doLast {
-                def agentJar = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar")
-                if (agentJar.exists()) {
-                    logger.lifecycle("ByteBuf tracker agent built successfully: ${agentJar}")
-                } else {
-                    logger.warn("ByteBuf tracker agent JAR not found at expected location: ${agentJar}")
-                }
-            }
-
-            // Fail if Maven build fails
-            ignoreExitValue = false
-        }
-    }
-
     test {
         testLogging {
             exceptionFormat = 'full'
@@ -210,8 +210,8 @@ subprojects {
         systemProperty 'io.netty.allocator.maxCachedBufferCapacity', '0'
 
         // ByteBuf Flow Tracker configuration for unit tests
-        if (byteBufTrackingEnabled) {
-            dependsOn buildByteBufTrackerAgent
+        if (project.hasProperty('withByteBufTracking') || project.hasProperty('enableByteBufTracking') || System.getProperty('enableByteBufTracking') == 'true') {
+            dependsOn rootProject.tasks.buildByteBufTrackerAgent
 
             def trackerJar = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar")
             doFirst {
@@ -255,10 +255,10 @@ subprojects {
         maxHeapSize = "6g"
         systemProperty 'io.netty.leakDetection.level', 'paranoid'
 
-        // ByteBuf Flow Tracker configuration (uses outer byteBufTrackingEnabled variable)
-        if (byteBufTrackingEnabled) {
+        // ByteBuf Flow Tracker configuration
+        if (project.hasProperty('withByteBufTracking') || project.hasProperty('enableByteBufTracking') || System.getProperty('enableByteBufTracking') == 'true') {
             // Ensure the submodule is initialized and tracker is built before tests run
-            dependsOn buildByteBufTrackerAgent
+            dependsOn rootProject.tasks.buildByteBufTrackerAgent
 
             // Add the tracker agent
             def trackerJar = file("${rootProject.projectDir}/modules/bytebuddy-bytebuf-tracer/bytebuf-flow-tracker/target/bytebuf-flow-tracker-1.0.0-SNAPSHOT-agent.jar")
