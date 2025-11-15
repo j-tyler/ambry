@@ -235,11 +235,7 @@ subprojects {
         maxHeapSize = "6g"
         systemProperty 'io.netty.leakDetection.level', 'paranoid'
 
-        // ByteBuf Flow Tracker configuration
-        def byteBufTrackingEnabled = project.hasProperty('withByteBufTracking') ||
-                                     project.hasProperty('enableByteBufTracking') ||
-                                     System.getProperty('enableByteBufTracking') == 'true'
-
+        // ByteBuf Flow Tracker configuration (uses outer byteBufTrackingEnabled variable)
         if (byteBufTrackingEnabled) {
             // Ensure the submodule is initialized and tracker is built before tests run
             dependsOn initByteBufTrackerSubmodule, ':bytebuf-tracker:agentJar'
