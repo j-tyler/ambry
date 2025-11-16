@@ -21,7 +21,18 @@ import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.ChannelProgressivePromise;
+import io.netty.channel.ChannelPromise;
+import io.netty.channel.DefaultChannelProgressivePromise;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.util.Attribute;
+import io.netty.util.AttributeKey;
+import io.netty.util.concurrent.EventExecutor;
 import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.HttpContent;
 import io.netty.handler.codec.http.HttpHeaderNames;
@@ -31,10 +42,12 @@ import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.stream.ChunkedWriteHandler;
+import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
@@ -61,11 +74,18 @@ public class ByteBufLeakAnalysisFlowTest {
   private NettyByteBufLeakHelper nettyByteBufLeakHelper = new NettyByteBufLeakHelper();
   private EmbeddedChannel channel;
   private NettyMetrics nettyMetrics;
+  private NettyConfig nettyConfig;
+  private PerformanceConfig performanceConfig;
 
   @Before
   public void setUp() {
     nettyByteBufLeakHelper.beforeTest();
     nettyMetrics = new NettyMetrics(new MetricRegistry());
+
+    Properties properties = new Properties();
+    VerifiableProperties verifiableProperties = new VerifiableProperties(properties);
+    nettyConfig = new NettyConfig(verifiableProperties);
+    performanceConfig = new PerformanceConfig(verifiableProperties);
 
     // Create channel with ChunkedWriteHandler like production
     channel = new EmbeddedChannel();
@@ -100,10 +120,9 @@ public class ByteBufLeakAnalysisFlowTest {
   @Test
   public void testNormalWriteWithByteBuffer_ProductionPattern() throws Exception {
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/test");
-    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, System.currentTimeMillis());
+    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().lastContext(), nettyMetrics,
-        new PerformanceConfig(new VerifiableProperties(new Properties())), request);
+        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
@@ -141,10 +160,9 @@ public class ByteBufLeakAnalysisFlowTest {
   @Test
   public void testMultipleChunks_ProductionPattern() throws Exception {
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/multi");
-    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, System.currentTimeMillis());
+    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().lastContext(), nettyMetrics,
-        new PerformanceConfig(new VerifiableProperties(new Properties())), request);
+        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
@@ -188,10 +206,9 @@ public class ByteBufLeakAnalysisFlowTest {
   @Test
   public void testCloseWithPendingChunks_CriticalLeak() throws Exception {
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/close");
-    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, System.currentTimeMillis());
+    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().lastContext(), nettyMetrics,
-        new PerformanceConfig(new VerifiableProperties(new Properties())), request);
+        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
@@ -221,10 +238,9 @@ public class ByteBufLeakAnalysisFlowTest {
   @Test
   public void testErrorBeforeChunksProcessed_Leak() throws Exception {
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/error");
-    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, System.currentTimeMillis());
+    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().lastContext(), nettyMetrics,
-        new PerformanceConfig(new VerifiableProperties(new Properties())), request);
+        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
@@ -253,10 +269,9 @@ public class ByteBufLeakAnalysisFlowTest {
   @Test
   public void testContentLength_LastChunk() throws Exception {
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/length");
-    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, System.currentTimeMillis());
+    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().lastContext(), nettyMetrics,
-        new PerformanceConfig(new VerifiableProperties(new Properties())), request);
+        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
 
@@ -302,5 +317,221 @@ public class ByteBufLeakAnalysisFlowTest {
     boolean awaitCompletion(long timeoutMs) throws InterruptedException {
       return latch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
+  }
+}
+
+/**
+ * Mock class for ChannelHandlerContext used in tests.
+ */
+class MockChannelHandlerContext implements ChannelHandlerContext {
+  private final EmbeddedChannel embeddedChannel;
+
+  MockChannelHandlerContext(EmbeddedChannel embeddedChannel) {
+    this.embeddedChannel = embeddedChannel;
+  }
+
+  @Override
+  public Channel channel() {
+    return embeddedChannel;
+  }
+
+  @Override
+  public EventExecutor executor() {
+    return null;
+  }
+
+  @Override
+  public String name() {
+    return null;
+  }
+
+  @Override
+  public ChannelHandler handler() {
+    return null;
+  }
+
+  @Override
+  public boolean isRemoved() {
+    return false;
+  }
+
+  @Override
+  public ChannelHandlerContext fireChannelRegistered() {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext fireChannelUnregistered() {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext fireChannelActive() {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext fireChannelInactive() {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext fireExceptionCaught(Throwable cause) {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext fireUserEventTriggered(Object evt) {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext fireChannelRead(Object msg) {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext fireChannelReadComplete() {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext fireChannelWritabilityChanged() {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture bind(SocketAddress localAddress) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture connect(SocketAddress remoteAddress) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture connect(SocketAddress remoteAddress, SocketAddress localAddress) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture disconnect() {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture close() {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture deregister() {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture bind(SocketAddress localAddress, ChannelPromise promise) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture connect(SocketAddress remoteAddress, ChannelPromise promise) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture connect(SocketAddress remoteAddress, SocketAddress localAddress, ChannelPromise promise) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture disconnect(ChannelPromise promise) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture close(ChannelPromise promise) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture deregister(ChannelPromise promise) {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext read() {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture write(Object msg) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture write(Object msg, ChannelPromise promise) {
+    return null;
+  }
+
+  @Override
+  public ChannelHandlerContext flush() {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture writeAndFlush(Object msg, ChannelPromise promise) {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture writeAndFlush(Object msg) {
+    return null;
+  }
+
+  @Override
+  public ChannelPromise newPromise() {
+    return null;
+  }
+
+  @Override
+  public ChannelProgressivePromise newProgressivePromise() {
+    return new DefaultChannelProgressivePromise(embeddedChannel);
+  }
+
+  @Override
+  public ChannelFuture newSucceededFuture() {
+    return null;
+  }
+
+  @Override
+  public ChannelFuture newFailedFuture(Throwable cause) {
+    return null;
+  }
+
+  @Override
+  public ChannelPromise voidPromise() {
+    return null;
+  }
+
+  @Override
+  public ChannelPipeline pipeline() {
+    return embeddedChannel.pipeline();
+  }
+
+  @Override
+  public ByteBufAllocator alloc() {
+    return null;
+  }
+
+  @Override
+  public <T> Attribute<T> attr(AttributeKey<T> key) {
+    return null;
+  }
+
+  @Override
+  public <T> boolean hasAttr(AttributeKey<T> key) {
+    return false;
   }
 }
