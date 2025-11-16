@@ -10,13 +10,19 @@
 
 package com.github.ambry.router;
 
+import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.MockClusterMap;
+import com.github.ambry.clustermap.PartitionId;
+import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.Callback;
+import com.github.ambry.commons.CommonTestUtils;
 import com.github.ambry.config.CryptoServiceConfig;
 import com.github.ambry.config.KMSConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.network.BoundedNettyByteBufReceive;
 import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.TestUtils;
+import com.github.ambry.utils.Utils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCountUtil;
@@ -57,6 +63,7 @@ public class ByteBufFlowCharacterizationTest {
   private MockCryptoService cryptoService;
   private MockKeyManagementService kms;
   private CryptoJobMetricsTracker metricsTracker;
+  private ClusterMap clusterMap;
   private static final int DEFAULT_KEY_SIZE = 64;
 
   @Before
@@ -69,11 +76,25 @@ public class ByteBufFlowCharacterizationTest {
     String defaultKey = TestUtils.getRandomKey(DEFAULT_KEY_SIZE);
     kms = new MockKeyManagementService(new KMSConfig(verifiableProperties), defaultKey);
     metricsTracker = new CryptoJobMetricsTracker(null);
+    clusterMap = new MockClusterMap();
   }
 
   @After
   public void tearDown() {
     // No assertions - let the tracer observe the flows
+  }
+
+  /**
+   * Generate a new test BlobId - replicates CryptoJobHandlerTest.getNewBlobId()
+   * @return newly generated {@link BlobId}
+   */
+  private BlobId getNewBlobId() {
+    byte dc = (byte) TestUtils.RANDOM.nextInt(3);
+    BlobId.BlobIdType type = TestUtils.RANDOM.nextBoolean() ? BlobId.BlobIdType.NATIVE : BlobId.BlobIdType.CRAFTED;
+    PartitionId partition = clusterMap.getRandomWritablePartition(MockClusterMap.DEFAULT_PARTITION_CLASS, null);
+    return new BlobId(CommonTestUtils.getCurrentBlobIdVersion(), type, dc,
+        Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM),
+        partition, false, BlobId.BlobDataType.DATACHUNK);
   }
 
   // ============================================================================
@@ -117,7 +138,7 @@ public class ByteBufFlowCharacterizationTest {
 
     // PRODUCTION PATTERN: pass buffer, DecryptJob will duplicate() it (line 1248)
     ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
+    DecryptJob job = new DecryptJob(getNewBlobId(), encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
     // Job runs (simulating ExecutorService.execute)
@@ -161,7 +182,7 @@ public class ByteBufFlowCharacterizationTest {
     ByteBuffer encryptedMetadata = ByteBuffer.wrap("metadata".getBytes());
 
     // PRODUCTION PATTERN: null blob content (GetBlobInfoOperation line 429)
-    DecryptJob job = new DecryptJob(null, encryptedKey.duplicate(), null, encryptedMetadata,
+    DecryptJob job = new DecryptJob(getNewBlobId(), encryptedKey.duplicate(), null, encryptedMetadata,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
@@ -215,7 +236,7 @@ public class ByteBufFlowCharacterizationTest {
     };
 
     ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
+    DecryptJob job = new DecryptJob(getNewBlobId(), encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
@@ -271,7 +292,7 @@ public class ByteBufFlowCharacterizationTest {
 
     ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
     ByteBuffer metadata = ByteBuffer.wrap("metadata".getBytes());
-    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), metadata,
+    DecryptJob job = new DecryptJob(getNewBlobId(), encryptedKey, encryptedChunk.duplicate(), metadata,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
@@ -313,7 +334,7 @@ public class ByteBufFlowCharacterizationTest {
     };
 
     ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
+    DecryptJob job = new DecryptJob(getNewBlobId(), encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
@@ -363,7 +384,7 @@ public class ByteBufFlowCharacterizationTest {
     };
 
     ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
+    DecryptJob job = new DecryptJob(getNewBlobId(), encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
     // PRODUCTION PATTERN: CryptoJobHandler.close() calls closeJob() on pending jobs
@@ -399,7 +420,7 @@ public class ByteBufFlowCharacterizationTest {
       };
 
       ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-      DecryptJob job = new DecryptJob(null, encryptedKey, buffers[i].duplicate(), null,
+      DecryptJob job = new DecryptJob(getNewBlobId(), encryptedKey, buffers[i].duplicate(), null,
           cryptoService, kms, null, metricsTracker, callback);
 
       // Simulate shutdown
@@ -443,7 +464,7 @@ public class ByteBufFlowCharacterizationTest {
     };
 
     ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
+    DecryptJob job = new DecryptJob(getNewBlobId(), encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
