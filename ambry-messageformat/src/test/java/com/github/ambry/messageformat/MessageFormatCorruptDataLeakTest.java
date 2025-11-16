@@ -292,18 +292,18 @@ public class MessageFormatCorruptDataLeakTest {
   }
 
   /**
-   * Test corrupt blob deserialization with CRC mismatch - demonstrates the ByteBuf leak.
+   * Test corrupt blob deserialization with CRC mismatch - verifies ByteBuf cleanup on error path.
    *
-   * This test exposes the leak in MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord.
+   * This test exposes the leak in MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord (line 1687).
    * When using NettyByteBufDataInputStream, Utils.readNettyByteBufFromCrcInputStream creates
    * a slice of the input ByteBuf. When CRC validation fails, this slice is never released.
    *
    * The test uses a capturing wrapper to intercept slice() calls and obtain a reference to
-   * the leaked slice, then verifies its refCount is > 0 after deserialization fails.
+   * the created slice, then verifies its refCount = 0 after deserialization fails (proving cleanup).
    *
    * Expected behavior:
-   * - FAILS (detects leak via slice refCnt > 0) when bug exists
-   * - PASSES (slice refCnt = 0) when bug is fixed
+   * - FAILS with "refCnt is 1 but should be 0" when bug exists (leak detected)
+   * - PASSES when bug is fixed (slice properly released in try-finally block)
    */
   @Test
   public void testDeserializeBlobWithCorruptCrc() throws Exception {
@@ -347,20 +347,24 @@ public class MessageFormatCorruptDataLeakTest {
       List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
       assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());
 
-      ByteBuf leakedSlice = capturedSlices.get(0);
-      int sliceRefCnt = leakedSlice.refCnt();
+      ByteBuf slice = capturedSlices.get(0);
+      int sliceRefCnt = slice.refCnt();
 
-      logger.info("Leaked slice refCnt after exception: {}", sliceRefCnt);
+      logger.info("Slice refCnt after exception: {}", sliceRefCnt);
 
-      // Track for cleanup
+      // Track for cleanup if leaked
       if (sliceRefCnt > 0) {
-        leakedBuffersToClean.add(leakedSlice);
+        leakedBuffersToClean.add(slice);
       }
 
-      // Assert leak detected: slice should have refCnt > 0
-      // When bug is fixed, deserializeBlob will release the slice in a try-finally block
-      assertTrue("Expected ByteBuf slice leak: refCnt should be > 0, but was " + sliceRefCnt,
-          sliceRefCnt > 0);
+      // Assert slice is properly released even when exception is thrown
+      // BUG: Currently this will FAIL because deserializeBlobRecord doesn't release the slice
+      // FIX: Add try-finally block in deserializeBlobRecord to release ByteBuf on error
+      assertEquals("ByteBuf slice must be released after CRC validation failure. " +
+              "LEAK DETECTED: slice refCnt is " + sliceRefCnt + " but should be 0. " +
+              "Fix: Add try-finally block in MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord (line 1687) " +
+              "to release the ByteBuf when CRC validation fails.",
+          0, sliceRefCnt);
 
     } finally {
       // Release parent buffer
