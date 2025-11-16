@@ -337,6 +337,7 @@ public class MessageFormatCorruptDataLeakTest {
   @After
   public void cleanup() {
     // Clean up any leaked buffers to prevent cross-test contamination
+    // This runs after test assertions, so it doesn't mask production bugs
     for (ByteBuf leaked : leakedBuffersToClean) {
       if (leaked.refCnt() > 0) {
         leaked.release(leaked.refCnt());
@@ -367,63 +368,58 @@ public class MessageFormatCorruptDataLeakTest {
     // Allocate pooled ByteBuf (pooled to test production scenario)
     ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 1024 + 8);
 
+    // Track inputBuf for cleanup in @After (don't clean up in test - we're detecting production bugs)
+    leakedBuffersToClean.add(inputBuf);
+
+    // Serialize blob data with CORRUPT CRC
+    // Note: Content doesn't matter since CRC will be corrupted anyway
+    byte[] blobContent = new byte[1024];
+
+    inputBuf.writeShort(MessageFormatRecord.Blob_Version_V1);
+    inputBuf.writeLong(1024);
+    inputBuf.writeBytes(blobContent);
+
+    // Calculate correct CRC but write WRONG value to trigger validation failure
+    CRC32 crc = new CRC32();
+    crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
+    inputBuf.writeLong(crc.getValue() + 1); // Corrupt CRC (any non-zero offset corrupts it)
+
+    // Create CapturingInputStream to intercept slice creation
+    // NOTE: Pass CapturingInputStream directly to deserializeBlob() which will wrap it in CrcInputStream
+    CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
+
+    // Attempt deserialization - this creates a ByteBuf slice via Utils.readNettyByteBufFromCrcInputStream
     try {
-      // Serialize blob data with CORRUPT CRC
-      // Note: Content doesn't matter since CRC will be corrupted anyway
-      byte[] blobContent = new byte[1024];
-
-      inputBuf.writeShort(MessageFormatRecord.Blob_Version_V1);
-      inputBuf.writeLong(1024);
-      inputBuf.writeBytes(blobContent);
-
-      // Calculate correct CRC but write WRONG value to trigger validation failure
-      CRC32 crc = new CRC32();
-      crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
-      inputBuf.writeLong(crc.getValue() + 1); // Corrupt CRC (any non-zero offset corrupts it)
-
-      // Create CapturingInputStream to intercept slice creation
-      // NOTE: Pass CapturingInputStream directly to deserializeBlob() which will wrap it in CrcInputStream
-      CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
-
-      // Attempt deserialization - this creates a ByteBuf slice via Utils.readNettyByteBufFromCrcInputStream
-      try {
-        BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
-        fail("Should have thrown MessageFormatException due to corrupt CRC");
-      } catch (MessageFormatException e) {
-        // Expected - CRC validation failed
-        assertEquals(MessageFormatErrorCodes.DataCorrupt, e.getErrorCode());
-        // BUG: ByteBuf slice created by Utils.readNettyByteBufFromCrcInputStream is never released
-      }
-
-      // Verify exactly one slice was created during deserialization
-      List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
-      assertEquals("Expected exactly one slice to be created by Utils.readNettyByteBufFromCrcInputStream",
-          1, capturedSlices.size());
-
-      ByteBuf slice = capturedSlices.get(0);
-      int sliceRefCnt = slice.refCnt();
-
-      // Track for cleanup to prevent cross-test contamination
-      if (sliceRefCnt > 0) {
-        leakedBuffersToClean.add(slice);
-      }
-
-      // Assert slice is properly released even when exception is thrown
-      // When bug exists: refCnt = 1 (leak)
-      // When bug fixed: refCnt = 0 (properly released in try-finally)
-      assertEquals("ByteBuf slice must be released after CRC validation failure.\n" +
-              "LEAK DETECTED: slice refCnt is " + sliceRefCnt + " but should be 0.\n" +
-              "Fix: Add try-finally block in MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord\n" +
-              "to release the ByteBuf allocated by Utils.readNettyByteBufFromCrcInputStream\n" +
-              "when CRC validation fails.",
-          0, sliceRefCnt);
-
-    } finally {
-      // Only release if refCnt > 0 (slice might have already released the parent)
-      if (inputBuf.refCnt() > 0) {
-        inputBuf.release();
-      }
+      BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
+      fail("Should have thrown MessageFormatException due to corrupt CRC");
+    } catch (MessageFormatException e) {
+      // Expected - CRC validation failed
+      assertEquals(MessageFormatErrorCodes.DataCorrupt, e.getErrorCode());
+      // BUG: ByteBuf slice created by Utils.readNettyByteBufFromCrcInputStream is never released
     }
+
+    // Verify exactly one slice was created during deserialization
+    List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
+    assertEquals("Expected exactly one slice to be created by Utils.readNettyByteBufFromCrcInputStream",
+        1, capturedSlices.size());
+
+    ByteBuf slice = capturedSlices.get(0);
+    int sliceRefCnt = slice.refCnt();
+
+    // Track slice for cleanup in @After (don't clean up in test - we're detecting production bugs)
+    if (sliceRefCnt > 0) {
+      leakedBuffersToClean.add(slice);
+    }
+
+    // Assert slice is properly released even when exception is thrown
+    // When bug exists: refCnt = 1 (leak detected - test FAILS)
+    // When bug fixed: refCnt = 0 (properly released - test PASSES)
+    assertEquals("ByteBuf slice must be released after CRC validation failure.\n" +
+            "LEAK DETECTED: slice refCnt is " + sliceRefCnt + " but should be 0.\n" +
+            "Fix: Add try-finally block in MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord\n" +
+            "to release the ByteBuf allocated by Utils.readNettyByteBufFromCrcInputStream\n" +
+            "when CRC validation fails.",
+        0, sliceRefCnt);
   }
 
   /**
@@ -444,58 +440,58 @@ public class MessageFormatCorruptDataLeakTest {
     // Allocate pooled ByteBuf (pooled to test production scenario)
     ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 512 + 8);
 
-    try {
-      // Serialize blob data with CORRECT CRC
-      byte[] blobContent = new byte[512];
+    // Track inputBuf for cleanup in @After (don't clean up in test - we're detecting production bugs)
+    leakedBuffersToClean.add(inputBuf);
 
-      inputBuf.writeShort(MessageFormatRecord.Blob_Version_V1);
-      inputBuf.writeLong(512);
-      inputBuf.writeBytes(blobContent);
+    // Serialize blob data with CORRECT CRC
+    byte[] blobContent = new byte[512];
 
-      // Calculate and write CORRECT CRC (enables successful deserialization)
-      CRC32 crc = new CRC32();
-      crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
-      inputBuf.writeLong(crc.getValue());
+    inputBuf.writeShort(MessageFormatRecord.Blob_Version_V1);
+    inputBuf.writeLong(512);
+    inputBuf.writeBytes(blobContent);
 
-      // Create CapturingInputStream to intercept slice creation
-      // NOTE: Pass CapturingInputStream directly to deserializeBlob() which will wrap it in CrcInputStream
-      CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
+    // Calculate and write CORRECT CRC (enables successful deserialization)
+    CRC32 crc = new CRC32();
+    crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
+    inputBuf.writeLong(crc.getValue());
 
-      // Deserialize successfully
-      BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
+    // Create CapturingInputStream to intercept slice creation
+    // NOTE: Pass CapturingInputStream directly to deserializeBlob() which will wrap it in CrcInputStream
+    CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
 
-      // Verify deserialized content
-      assertEquals("BlobData should contain 512 bytes", 512, blobData.content().readableBytes());
-      byte[] readContent = new byte[512];
-      blobData.content().readBytes(readContent);
+    // Deserialize successfully
+    BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
 
-      // Verify exactly one slice was created
-      List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
-      assertEquals("Expected exactly one slice to be created by Utils.readNettyByteBufFromCrcInputStream",
-          1, capturedSlices.size());
+    // Verify deserialized content
+    assertEquals("BlobData should contain 512 bytes", 512, blobData.content().readableBytes());
+    byte[] readContent = new byte[512];
+    blobData.content().readBytes(readContent);
 
-      ByteBuf slice = capturedSlices.get(0);
-      int refCntBeforeRelease = slice.refCnt();
+    // Verify exactly one slice was created
+    List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
+    assertEquals("Expected exactly one slice to be created by Utils.readNettyByteBufFromCrcInputStream",
+        1, capturedSlices.size());
 
-      // Sanity check: slice should be retained at this point (refCnt > 0)
-      assertTrue("Slice should have refCnt > 0 before BlobData.release(), was: " + refCntBeforeRelease,
-          refCntBeforeRelease > 0);
+    ByteBuf slice = capturedSlices.get(0);
+    int refCntBeforeRelease = slice.refCnt();
 
-      // Release BlobData - this should release the slice
-      blobData.release();
+    // Sanity check: slice should be retained at this point (refCnt > 0)
+    assertTrue("Slice should have refCnt > 0 before BlobData.release(), was: " + refCntBeforeRelease,
+        refCntBeforeRelease > 0);
 
-      int refCntAfterRelease = slice.refCnt();
+    // Release BlobData - this should release the slice
+    blobData.release();
 
-      // Assert no leak: slice should be released (refCnt = 0)
-      assertEquals("Expected no leak: slice refCnt should be 0 after BlobData.release(), " +
-              "but was: " + refCntAfterRelease,
-          0, refCntAfterRelease);
+    int refCntAfterRelease = slice.refCnt();
 
-    } finally {
-      // Only release if refCnt > 0 (slice might have already released the parent)
-      if (inputBuf.refCnt() > 0) {
-        inputBuf.release();
-      }
+    // Track slice for cleanup in @After if it still has references
+    if (refCntAfterRelease > 0) {
+      leakedBuffersToClean.add(slice);
     }
+
+    // Assert no leak: slice should be released (refCnt = 0)
+    assertEquals("Expected no leak: slice refCnt should be 0 after BlobData.release(), " +
+            "but was: " + refCntAfterRelease,
+        0, refCntAfterRelease);
   }
 }
