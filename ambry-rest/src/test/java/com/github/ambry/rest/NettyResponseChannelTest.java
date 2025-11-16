@@ -35,6 +35,7 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelProgressivePromise;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.DefaultChannelProgressivePromise;
+import io.netty.channel.DefaultChannelPromise;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.embedded.EmbeddedChannel;
@@ -2021,17 +2022,17 @@ class MockChannelHandlerContext implements ChannelHandlerContext {
 
   @Override
   public ChannelFuture writeAndFlush(Object msg, ChannelPromise promise) {
-    return null;
+    return embeddedChannel.writeAndFlush(msg, promise);
   }
 
   @Override
   public ChannelFuture writeAndFlush(Object msg) {
-    return null;
+    return embeddedChannel.writeAndFlush(msg);
   }
 
   @Override
   public ChannelPromise newPromise() {
-    return null;
+    return new DefaultChannelPromise(embeddedChannel);
   }
 
   @Override
