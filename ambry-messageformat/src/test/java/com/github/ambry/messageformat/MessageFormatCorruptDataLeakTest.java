@@ -90,11 +90,35 @@ public class MessageFormatCorruptDataLeakTest {
     public ByteBuf slice(int index, int length) {
       ByteBuf slice = delegate.slice(index, length);
       sliceTracker.add(slice);
-      logger.debug("Captured slice: index={}, length={}, refCnt={}", index, length, slice.refCnt());
+      logger.debug("Captured slice(index={}, length={}): refCnt={}", index, length, slice.refCnt());
       return slice;
     }
 
-    // Delegate all methods to underlying buffer
+    @Override
+    public ByteBuf slice() {
+      ByteBuf slice = delegate.slice();
+      sliceTracker.add(slice);
+      logger.debug("Captured slice(): refCnt={}", slice.refCnt());
+      return slice;
+    }
+
+    @Override
+    public ByteBuf retainedSlice() {
+      ByteBuf slice = delegate.retainedSlice();
+      sliceTracker.add(slice);
+      logger.debug("Captured retainedSlice(): refCnt={}", slice.refCnt());
+      return slice;
+    }
+
+    @Override
+    public ByteBuf retainedSlice(int index, int length) {
+      ByteBuf slice = delegate.retainedSlice(index, length);
+      sliceTracker.add(slice);
+      logger.debug("Captured retainedSlice(index={}, length={}): refCnt={}", index, length, slice.refCnt());
+      return slice;
+    }
+
+    // Delegate all other methods to underlying buffer
     @Override public int capacity() { return delegate.capacity(); }
     @Override public ByteBuf capacity(int newCapacity) { return delegate.capacity(newCapacity); }
     @Override public int maxCapacity() { return delegate.maxCapacity(); }
@@ -248,9 +272,7 @@ public class MessageFormatCorruptDataLeakTest {
     @Override public int forEachByteDesc(int index, int length, io.netty.util.ByteProcessor processor) { return delegate.forEachByteDesc(index, length, processor); }
     @Override public ByteBuf copy() { return delegate.copy(); }
     @Override public ByteBuf copy(int index, int length) { return delegate.copy(index, length); }
-    @Override public ByteBuf slice() { return delegate.slice(); }
-    @Override public ByteBuf retainedSlice() { return delegate.retainedSlice(); }
-    @Override public ByteBuf retainedSlice(int index, int length) { return delegate.retainedSlice(index, length); }
+    // slice() methods are implemented above to capture created slices
     @Override public ByteBuf duplicate() { return delegate.duplicate(); }
     @Override public ByteBuf retainedDuplicate() { return delegate.retainedDuplicate(); }
     @Override public int nioBufferCount() { return delegate.nioBufferCount(); }
