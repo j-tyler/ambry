@@ -64,8 +64,8 @@ public class MessageFormatCorruptDataLeakTest {
    */
   @Test
   public void testDeserializeBlobWithCorruptCrc() throws Exception {
-    // Allocate pooled ByteBuf (required for NettyByteBufLeakHelper detection)
-    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.buffer(2 + 8 + 1024 + 8);
+    // Allocate pooled heap ByteBuf (required for NettyByteBufLeakHelper detection)
+    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 1024 + 8);
 
     try {
       // Serialize blob data with CORRUPT CRC
@@ -112,7 +112,7 @@ public class MessageFormatCorruptDataLeakTest {
    */
   @Test
   public void testDeserializeBlobWithValidCrc() throws Exception {
-    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.buffer(2 + 8 + 512 + 8);
+    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 512 + 8);
 
     try {
       // Serialize blob data with CORRECT CRC
