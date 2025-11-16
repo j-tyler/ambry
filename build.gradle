@@ -228,7 +228,24 @@ subprojects {
                 logger.lifecycle("Using agent: ${trackerJar}")
             }
 
-            jvmArgs "-javaagent:${trackerJar.absolutePath}=include=com.github.ambry;exclude=org.mockito"
+            // Configure ByteBuf tracking with constructor tracking for all wrapper classes
+            // trackConstructors enables tracking ByteBufs passed to constructors and stored as fields
+            // Based on comprehensive codebase analysis, these classes wrap ByteBuf in constructors:
+            jvmArgs "-javaagent:${trackerJar.absolutePath}=include=com.github.ambry;exclude=org.mockito;trackConstructors=" +
+                "com.github.ambry.protocol.PutRequest," +                                 // Protocol: PutRequest wraps blob data
+                "com.github.ambry.utils.NettyByteBufDataInputStream," +                   // Utils: ByteBuf to InputStream wrapper
+                "com.github.ambry.network.SocketServerRequest," +                         // Network: Socket-based request wrapper (top-level class)
+                "com.github.ambry.network.NettyServerRequest," +                          // Network: Netty-based request wrapper
+                "com.github.ambry.network.ResponseInfo," +                                // Network: Response wrapper
+                "com.github.ambry.messageformat.BlobData," +                              // Message format: Blob data wrapper
+                "com.github.ambry.commons.ByteBufferAsyncWritableChannel\$ChunkData," +   // Commons: Async channel chunk wrapper (inner class)
+                "com.github.ambry.router.EncryptJob," +                                   // Router: Encryption job with blob content
+                "com.github.ambry.router.EncryptJob\$EncryptJobResult," +                 // Router: Encryption result (inner class)
+                "com.github.ambry.router.DecryptJob," +                                   // Router: Decryption job with blob content
+                "com.github.ambry.router.DecryptJob\$DecryptJobResult," +                 // Router: Decryption result (inner class)
+                "com.github.ambry.network.BoundedNettyByteBufReceive," +                  // Network: Bounded receive wrapper
+                "com.github.ambry.rest.NettyResponseChannel\$Chunk," +                    // REST: Response chunk (inner class)
+                "com.github.ambry.network.http2.GoAwayException"                          // Network: HTTP/2 GoAway exception with debug data
             systemProperty 'junit.listeners', 'com.github.ambry.testutils.ByteBufTrackerListener'
         }
     }
@@ -280,18 +297,22 @@ subprojects {
 
             // Configure ByteBuf tracking with constructor tracking for all wrapper classes
             // trackConstructors enables tracking ByteBufs passed to constructors and stored as fields
-            // Based on codebase analysis, these classes wrap ByteBuf in constructors:
-            jvmArgs "-javaagent:${trackerJar.absolutePath}=include=com.github.ambry;trackConstructors=" +
-                "com.github.ambry.protocol.*," +                                    // PutRequest (and other protocol messages)
-                "com.github.ambry.messageformat.BlobData," +                       // Blob data wrapper
-                "com.github.ambry.network.SocketServerRequest," +                  // Socket-based request wrapper
-                "com.github.ambry.network.NettyServerRequest," +                   // Netty-based request wrapper
-                "com.github.ambry.network.ResponseInfo," +                         // Network response wrapper
-                "com.github.ambry.router.EncryptJob," +                            // Encryption job with blob content
-                "com.github.ambry.router.EncryptJob\$EncryptJobResult," +          // Encryption result (inner class)
-                "com.github.ambry.router.DecryptJob," +                            // Decryption job with blob content
-                "com.github.ambry.rest.NettyResponseChannel\$Chunk," +             // Response chunk (inner class)
-                "com.github.ambry.utils.NettyByteBufDataInputStream"               // ByteBuf to InputStream wrapper
+            // Based on comprehensive codebase analysis, these classes wrap ByteBuf in constructors:
+            jvmArgs "-javaagent:${trackerJar.absolutePath}=include=com.github.ambry;exclude=org.mockito;trackConstructors=" +
+                "com.github.ambry.protocol.PutRequest," +                                 // Protocol: PutRequest wraps blob data
+                "com.github.ambry.utils.NettyByteBufDataInputStream," +                   // Utils: ByteBuf to InputStream wrapper
+                "com.github.ambry.network.SocketServerRequest," +                         // Network: Socket-based request wrapper (top-level class)
+                "com.github.ambry.network.NettyServerRequest," +                          // Network: Netty-based request wrapper
+                "com.github.ambry.network.ResponseInfo," +                                // Network: Response wrapper
+                "com.github.ambry.messageformat.BlobData," +                              // Message format: Blob data wrapper
+                "com.github.ambry.commons.ByteBufferAsyncWritableChannel\$ChunkData," +   // Commons: Async channel chunk wrapper (inner class)
+                "com.github.ambry.router.EncryptJob," +                                   // Router: Encryption job with blob content
+                "com.github.ambry.router.EncryptJob\$EncryptJobResult," +                 // Router: Encryption result (inner class)
+                "com.github.ambry.router.DecryptJob," +                                   // Router: Decryption job with blob content
+                "com.github.ambry.router.DecryptJob\$DecryptJobResult," +                 // Router: Decryption result (inner class)
+                "com.github.ambry.network.BoundedNettyByteBufReceive," +                  // Network: Bounded receive wrapper
+                "com.github.ambry.rest.NettyResponseChannel\$Chunk," +                    // REST: Response chunk (inner class)
+                "com.github.ambry.network.http2.GoAwayException"                          // Network: HTTP/2 GoAway exception with debug data
             systemProperty 'bytebuf.tracker.enabled', 'true'
 
             // Add test listener to print tracker output at end
