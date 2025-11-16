@@ -46,22 +46,26 @@ jvmArgs "-javaagent:${trackerJar}=include=com.github.ambry;trackConstructors=Cla
 
 ### Ambry's Current Configuration
 
-Located in `/home/user/ambry/build.gradle` (lines 186-196 and 259-269):
+Located in `/home/user/ambry/build.gradle` (test task ~lines 231-248, intTest task ~lines 301-315):
 
 ```groovy
-trackConstructors=com.github.ambry.protocol.*,                          // All protocol messages (PutRequest, etc)
-                  com.github.ambry.messageformat.BlobData,              // Blob data wrapper
-                  com.github.ambry.network.SocketServerRequest,         // Socket request wrapper
-                  com.github.ambry.network.NettyServerRequest,          // Netty request wrapper
-                  com.github.ambry.network.ResponseInfo,                // Network response wrapper
-                  com.github.ambry.router.EncryptJob,                   // Encryption job
-                  com.github.ambry.router.EncryptJob$EncryptJobResult,  // Encryption result (inner)
-                  com.github.ambry.router.DecryptJob,                   // Decryption job
-                  com.github.ambry.rest.NettyResponseChannel$Chunk,     // Response chunk (inner)
-                  com.github.ambry.utils.NettyByteBufDataInputStream    // ByteBuf stream wrapper
+trackConstructors=com.github.ambry.protocol.PutRequest,                              // Protocol: PutRequest wraps blob data
+                  com.github.ambry.utils.NettyByteBufDataInputStream,                // Utils: ByteBuf to InputStream wrapper
+                  com.github.ambry.network.SocketServerRequest,                      // Network: Socket-based request wrapper (top-level class)
+                  com.github.ambry.network.NettyServerRequest,                       // Network: Netty-based request wrapper
+                  com.github.ambry.network.ResponseInfo,                             // Network: Response wrapper
+                  com.github.ambry.messageformat.BlobData,                           // Message format: Blob data wrapper
+                  com.github.ambry.commons.ByteBufferAsyncWritableChannel$ChunkData, // Commons: Async channel chunk wrapper (inner class)
+                  com.github.ambry.router.EncryptJob,                                // Router: Encryption job with blob content
+                  com.github.ambry.router.EncryptJob$EncryptJobResult,               // Router: Encryption result (inner class)
+                  com.github.ambry.router.DecryptJob,                                // Router: Decryption job with blob content
+                  com.github.ambry.router.DecryptJob$DecryptJobResult,               // Router: Decryption result (inner class)
+                  com.github.ambry.network.BoundedNettyByteBufReceive,               // Network: Bounded receive wrapper
+                  com.github.ambry.rest.NettyResponseChannel$Chunk,                  // REST: Response chunk (inner class)
+                  com.github.ambry.network.http2.GoAwayException                     // Network: HTTP/2 GoAway exception with debug data
 ```
 
-**Note:** Inner classes use `$` notation (e.g., `OuterClass$InnerClass`).
+**Note:** All classes are listed explicitly (no package wildcards). Inner classes use `$` notation (e.g., `OuterClass$InnerClass`).
 
 ### What Gets Tracked
 
@@ -75,67 +79,103 @@ For each specified class:
 
 ## Ambry Wrapper Classes (All Currently Tracked)
 
-Based on comprehensive codebase analysis, these are **all classes** in Ambry that wrap ByteBuf in constructors:
+Based on comprehensive codebase analysis, these are **all 14 classes** in Ambry that wrap ByteBuf in constructors:
 
-### 1. Protocol Layer (com.github.ambry.protocol.*)
+### 1. Protocol Layer
 
-**PutRequest** - `ambry-protocol/src/main/java/com/github/ambry/protocol/PutRequest.java`
-- **Lines:** 96-98, 116-118
+**com.github.ambry.protocol.PutRequest** - `ambry-protocol/src/main/java/com/github/ambry/protocol/PutRequest.java`
+- **Lines:** 96-101, 116-118
 - **Usage:** Wraps `materializedBlob` ByteBuf containing blob data being uploaded
 - **Why track:** Protocol messages pass through multiple network and storage layers
 
 ### 2. Message Format Layer
 
-**BlobData** - `ambry-messageformat/src/main/java/com/github/ambry/messageformat/BlobData.java`
+**com.github.ambry.messageformat.BlobData** - `ambry-messageformat/src/main/java/com/github/ambry/messageformat/BlobData.java`
 - **Lines:** 35, 46
 - **Usage:** Wraps `content` ByteBuf representing actual blob data
 - **Why track:** Core blob storage wrapper, critical for leak detection
 
 ### 3. Network Layer
 
-**SocketServerRequest** - `ambry-network/src/main/java/com/github/ambry/network/SocketRequestResponseChannel.java`
+**com.github.ambry.network.SocketServerRequest** - `ambry-network/src/main/java/com/github/ambry/network/SocketRequestResponseChannel.java`
 - **Line:** 39
+- **Constructor:** `public SocketServerRequest(int processor, String connectionId, ByteBuf content)`
+- **Type:** Top-level package-private class (same file as SocketRequestResponseChannel)
 - **Usage:** Wraps `content` ByteBuf from socket and provides InputStream access
 - **Why track:** Socket-based request handling with async I/O
 
-**NettyServerRequest** - `ambry-network/src/main/java/com/github/ambry/network/NettyServerRequest.java`
+**com.github.ambry.network.NettyServerRequest** - `ambry-network/src/main/java/com/github/ambry/network/NettyServerRequest.java`
 - **Lines:** 32, 42
+- **Constructor 1:** `public NettyServerRequest(ChannelHandlerContext ctx, ByteBuf content)`
+- **Constructor 2:** `public NettyServerRequest(ChannelHandlerContext ctx, ByteBuf content, long creationTime)`
 - **Usage:** Wraps `content` ByteBuf from Netty channel
 - **Why track:** Netty-based request handling with complex lifecycle
 
-**ResponseInfo** - `ambry-api/src/main/java/com/github/ambry/network/ResponseInfo.java`
-- **Lines:** 61, 73-74
+**com.github.ambry.network.ResponseInfo** - `ambry-api/src/main/java/com/github/ambry/network/ResponseInfo.java`
+- **Line:** 61
+- **Constructor:** `public ResponseInfo(RequestInfo requestInfo, NetworkClientErrorCode error, ByteBuf content)`
 - **Usage:** Wraps `content` ByteBuf with network response data
 - **Why track:** Response objects travel through network client layers
 
-### 4. Router/Crypto Layer
+**com.github.ambry.network.BoundedNettyByteBufReceive** - `ambry-api/src/main/java/com/github/ambry/network/BoundedNettyByteBufReceive.java`
+- **Line:** 43
+- **Constructor:** `BoundedNettyByteBufReceive(ByteBuf buffer, long sizeToRead, long maxRequestSize)`
+- **Usage:** Wraps ByteBuf for bounded network receive operations
+- **Why track:** Network receive buffer management
 
-**EncryptJob** - `ambry-router/src/main/java/com/github/ambry/router/EncryptJob.java`
-- **Lines:** 48-50
+**com.github.ambry.network.http2.GoAwayException** - `ambry-network/src/main/java/com/github/ambry/network/http2/GoAwayException.java`
+- **Line:** 30
+- **Constructor:** `GoAwayException(long errorCode, ByteBuf debugData)`
+- **Usage:** HTTP/2 GoAway exception with debug data buffer
+- **Why track:** Exception handling with ByteBuf payload
+
+### 4. Commons Layer
+
+**com.github.ambry.commons.ByteBufferAsyncWritableChannel$ChunkData** - `ambry-commons/src/main/java/com/github/ambry/commons/ByteBufferAsyncWritableChannel.java`
+- **Line:** 314
+- **Constructor:** `private ChunkData(ByteBuf buf, Callback<Long> callback)`
+- **Usage:** Async channel chunk wrapper (inner class)
+- **Why track:** Async write operations with callbacks
+
+### 5. Router/Crypto Layer
+
+**com.github.ambry.router.EncryptJob** - `ambry-router/src/main/java/com/github/ambry/router/EncryptJob.java`
+- **Line:** 48-50
+- **Constructor:** `EncryptJob(short accountId, short containerId, ByteBuf blobContentToEncrypt, ...)`
 - **Usage:** Wraps `blobContentToEncrypt` ByteBuf for encryption operations
 - **Why track:** Crypto operations have error paths that can leak
 
-**EncryptJob.EncryptJobResult** (Inner Class) - `ambry-router/src/main/java/com/github/ambry/router/EncryptJob.java`
+**com.github.ambry.router.EncryptJob$EncryptJobResult** - `ambry-router/src/main/java/com/github/ambry/router/EncryptJob.java`
 - **Line:** 127
-- **Usage:** Wraps `encryptedBlobContent` ByteBuf as encryption output
+- **Constructor:** `EncryptJobResult(ByteBuffer encryptedKey, ByteBuffer encryptedUserMetadata, ByteBuf encryptedBlobContent)`
+- **Usage:** Wraps `encryptedBlobContent` ByteBuf as encryption output (inner class)
 - **Why track:** Result objects passed through callbacks
 
-**DecryptJob** - `ambry-router/src/main/java/com/github/ambry/router/DecryptJob.java`
-- **Lines:** 50-53
+**com.github.ambry.router.DecryptJob** - `ambry-router/src/main/java/com/github/ambry/router/DecryptJob.java`
+- **Line:** 50-53
+- **Constructor:** `DecryptJob(BlobId blobId, ByteBuffer encryptedPerBlobKey, ByteBuf encryptedBlobContent, ...)`
 - **Usage:** Wraps `encryptedBlobContent` ByteBuf for decryption operations
 - **Why track:** Decryption failures can leave buffers unreleased
 
-### 5. REST Layer
+**com.github.ambry.router.DecryptJob$DecryptJobResult** - `ambry-router/src/main/java/com/github/ambry/router/DecryptJob.java`
+- **Line:** 124
+- **Constructor:** `DecryptJobResult(BlobId blobId, ByteBuf decryptedBlobContent, ByteBuffer decryptedUserMetadata)`
+- **Usage:** Wraps `decryptedBlobContent` ByteBuf as decryption output (inner class)
+- **Why track:** Result objects passed through callbacks
 
-**NettyResponseChannel.Chunk** (Inner Class) - `ambry-rest/src/main/java/com/github/ambry/rest/NettyResponseChannel.java`
+### 6. REST Layer
+
+**com.github.ambry.rest.NettyResponseChannel$Chunk** - `ambry-rest/src/main/java/com/github/ambry/rest/NettyResponseChannel.java`
 - **Line:** 910
-- **Usage:** Wraps `buffer` ByteBuf as response chunk for streaming
+- **Constructor:** `Chunk(ByteBuf buffer, Callback<Long> callback)`
+- **Usage:** Wraps `buffer` ByteBuf as response chunk for streaming (inner class)
 - **Why track:** Response streaming has complex flow control
 
-### 6. Utilities Layer
+### 7. Utilities Layer
 
-**NettyByteBufDataInputStream** - `ambry-utils/src/main/java/com/github/ambry/utils/NettyByteBufDataInputStream.java`
+**com.github.ambry.utils.NettyByteBufDataInputStream** - `ambry-utils/src/main/java/com/github/ambry/utils/NettyByteBufDataInputStream.java`
 - **Line:** 31
+- **Constructor:** `public NettyByteBufDataInputStream(ByteBuf buffer)`
 - **Usage:** Wraps `buffer` ByteBuf to provide InputStream interface
 - **Why track:** Stream wrapper used throughout codebase
 
