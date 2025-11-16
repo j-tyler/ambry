@@ -31,6 +31,8 @@ import io.netty.buffer.Unpooled;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.zip.CRC32;
 import org.junit.After;
@@ -498,10 +500,11 @@ public class ByteBufLeakFlowExplorationTest {
 
   private RequestInfo createMockRequestInfo() {
     ReplicaId mockReplicaId = Mockito.mock(ReplicaId.class);
-    DataNodeId mockDataNode = new MockDataNodeId("localhost",
+    List<Port> ports = Arrays.asList(
         new Port(6667, PortType.PLAINTEXT),
         new Port(6668, PortType.SSL),
         new Port(6669, PortType.HTTP2));
+    DataNodeId mockDataNode = new MockDataNodeId(ports, Collections.emptyList(), "datacenter1");
     Mockito.when(mockReplicaId.getDataNodeId()).thenReturn(mockDataNode);
     return new RequestInfo("localhost", new Port(6667, PortType.PLAINTEXT), null, mockReplicaId, null);
   }
