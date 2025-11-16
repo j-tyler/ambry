@@ -16,6 +16,7 @@ import com.github.ambry.config.KMSConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.network.BoundedNettyByteBufReceive;
 import com.github.ambry.utils.ByteBufferInputStream;
+import com.github.ambry.utils.TestUtils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCountUtil;
@@ -56,7 +57,7 @@ public class ByteBufFlowCharacterizationTest {
   private MockCryptoService cryptoService;
   private MockKeyManagementService kms;
   private CryptoJobMetricsTracker metricsTracker;
-  private static final String DEFAULT_KMS_KEY = "RandomKey1234567";
+  private static final int DEFAULT_KEY_SIZE = 64;
 
   @Before
   public void setUp() throws Exception {
@@ -64,7 +65,9 @@ public class ByteBufFlowCharacterizationTest {
     Properties props = new Properties();
     VerifiableProperties verifiableProperties = new VerifiableProperties(props);
     cryptoService = new MockCryptoService(new CryptoServiceConfig(verifiableProperties));
-    kms = new MockKeyManagementService(new KMSConfig(verifiableProperties), DEFAULT_KMS_KEY);
+    // Generate valid hex-encoded key (same pattern as CryptoJobHandlerTest)
+    String defaultKey = TestUtils.getRandomKey(DEFAULT_KEY_SIZE);
+    kms = new MockKeyManagementService(new KMSConfig(verifiableProperties), defaultKey);
     metricsTracker = new CryptoJobMetricsTracker(null);
   }
 
