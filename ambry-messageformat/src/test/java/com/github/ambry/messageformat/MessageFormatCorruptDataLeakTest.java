@@ -64,8 +64,8 @@ public class MessageFormatCorruptDataLeakTest {
    */
   @Test
   public void testDeserializeBlobWithCorruptCrc() throws Exception {
-    // Allocate pooled heap ByteBuf (required for NettyByteBufLeakHelper detection)
-    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 1024 + 8);
+    // Allocate pooled ByteBuf (required for NettyByteBufLeakHelper detection)
+    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.buffer(2 + 8 + 1024 + 8);
 
     try {
       // Serialize blob data with CORRUPT CRC
@@ -80,7 +80,7 @@ public class MessageFormatCorruptDataLeakTest {
 
       // Calculate correct CRC but write WRONG value
       CRC32 crc = new CRC32();
-      crc.update(inputBuf.array(), inputBuf.arrayOffset(), inputBuf.writerIndex());
+      crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
       inputBuf.writeLong(crc.getValue() + 12345); // Corrupt CRC
 
       // Create NettyByteBufDataInputStream (triggers production code path)
@@ -112,7 +112,7 @@ public class MessageFormatCorruptDataLeakTest {
    */
   @Test
   public void testDeserializeBlobWithValidCrc() throws Exception {
-    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 512 + 8);
+    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.buffer(2 + 8 + 512 + 8);
 
     try {
       // Serialize blob data with CORRECT CRC
@@ -127,7 +127,7 @@ public class MessageFormatCorruptDataLeakTest {
 
       // Calculate and write CORRECT CRC
       CRC32 crc = new CRC32();
-      crc.update(inputBuf.array(), inputBuf.arrayOffset(), inputBuf.writerIndex());
+      crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
       inputBuf.writeLong(crc.getValue());
 
       NettyByteBufDataInputStream inputStream = new NettyByteBufDataInputStream(inputBuf);
