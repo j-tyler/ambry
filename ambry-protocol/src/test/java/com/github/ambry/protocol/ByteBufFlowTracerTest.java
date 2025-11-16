@@ -18,10 +18,6 @@ package com.github.ambry.protocol;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.MockClusterMap;
-import com.github.ambry.clustermap.MockDataNodeId;
-import com.github.ambry.clustermap.Port;
-import com.github.ambry.clustermap.PortType;
-import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.messageformat.BlobType;
@@ -1007,7 +1003,7 @@ public class ByteBufFlowTracerTest {
 
     BlobProperties properties = new BlobProperties(BLOB_SIZE, "service-id",
         "owner-id", "image/jpeg", false, 3600,
-        System.currentTimeMillis(), (short) 1, (short) 1, false, null, null, null);
+        System.currentTimeMillis(), (short) 1, (short) 1, false, null, null, null, null);
 
     ByteBuffer userMetadata = ByteBuffer.wrap(generateRandomBytes(USER_METADATA_SIZE));
 
@@ -1088,6 +1084,84 @@ public class ByteBufFlowTracerTest {
     @Override
     public long sizeInBytes() {
       return internalBuffer != null ? internalBuffer.readableBytes() : 0;
+    }
+
+    @Override
+    public ByteBuf content() {
+      return internalBuffer;
+    }
+
+    @Override
+    public MockSend copy() {
+      return this;
+    }
+
+    @Override
+    public MockSend duplicate() {
+      return this;
+    }
+
+    @Override
+    public MockSend retainedDuplicate() {
+      return this;
+    }
+
+    @Override
+    public MockSend replace(ByteBuf content) {
+      return new MockSend(content);
+    }
+
+    @Override
+    public MockSend retain() {
+      if (internalBuffer != null) {
+        internalBuffer.retain();
+      }
+      return this;
+    }
+
+    @Override
+    public MockSend retain(int increment) {
+      if (internalBuffer != null) {
+        internalBuffer.retain(increment);
+      }
+      return this;
+    }
+
+    @Override
+    public MockSend touch() {
+      if (internalBuffer != null) {
+        internalBuffer.touch();
+      }
+      return this;
+    }
+
+    @Override
+    public MockSend touch(Object hint) {
+      if (internalBuffer != null) {
+        internalBuffer.touch(hint);
+      }
+      return this;
+    }
+
+    @Override
+    public int refCnt() {
+      return internalBuffer != null ? internalBuffer.refCnt() : 0;
+    }
+
+    @Override
+    public boolean release() {
+      if (internalBuffer != null) {
+        return internalBuffer.release();
+      }
+      return false;
+    }
+
+    @Override
+    public boolean release(int decrement) {
+      if (internalBuffer != null) {
+        return internalBuffer.release(decrement);
+      }
+      return false;
     }
   }
 }
