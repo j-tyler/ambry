@@ -75,8 +75,9 @@ public class ByteBufLeakFlowExplorationTest {
     serialized.putLong(2000);
     serialized.put(data);
 
+    // CRC is calculated over version + size + data (entire buffer position)
     CRC32 crc = new CRC32();
-    crc.update(data);
+    crc.update(serialized.array(), 0, serialized.position());
     serialized.putLong(crc.getValue());
     serialized.flip();
 
@@ -104,8 +105,9 @@ public class ByteBufLeakFlowExplorationTest {
     serialized.putShort(MessageFormatRecord.Blob_Version_V1);
     serialized.putLong(100);
     serialized.put(metadataContent);
+    // CRC is calculated over version + size + data
     CRC32 crc = new CRC32();
-    crc.update(metadataContent);
+    crc.update(serialized.array(), 0, serialized.position());
     serialized.putLong(crc.getValue());
     serialized.flip();
 
@@ -140,8 +142,9 @@ public class ByteBufLeakFlowExplorationTest {
     serialized.putShort(MessageFormatRecord.Blob_Version_V1);
     serialized.putLong(500);
     serialized.put(data);
+    // CRC is calculated over version + size + data
     CRC32 crc = new CRC32();
-    crc.update(data);
+    crc.update(serialized.array(), 0, serialized.position());
     serialized.putLong(crc.getValue());
     serialized.flip();
 
@@ -196,8 +199,9 @@ public class ByteBufLeakFlowExplorationTest {
       serialized.putShort(MessageFormatRecord.Blob_Version_V1);
       serialized.putLong(data.length);
       serialized.put(data);
+      // CRC is calculated over version + size + data
       CRC32 crc = new CRC32();
-      crc.update(data);
+      crc.update(serialized.array(), 0, serialized.position());
       serialized.putLong(crc.getValue());
       serialized.flip();
 
@@ -218,8 +222,9 @@ public class ByteBufLeakFlowExplorationTest {
     serialized.putShort(MessageFormatRecord.Blob_Version_V1);
     serialized.putLong(256);
     serialized.put(data);
+    // CRC is calculated over version + size + data
     CRC32 crc = new CRC32();
-    crc.update(data);
+    crc.update(serialized.array(), 0, serialized.position());
     serialized.putLong(crc.getValue());
     serialized.flip();
 
@@ -410,8 +415,9 @@ public class ByteBufLeakFlowExplorationTest {
     serialized.putShort(MessageFormatRecord.Blob_Version_V1);
     serialized.putLong(512);
     serialized.put(blobContent);
+    // CRC is calculated over version + size + data
     CRC32 crc = new CRC32();
-    crc.update(blobContent);
+    crc.update(serialized.array(), 0, serialized.position());
     serialized.putLong(crc.getValue());
     serialized.flip();
 
