@@ -419,8 +419,10 @@ public class MessageFormatCorruptDataLeakTest {
           0, sliceRefCnt);
 
     } finally {
-      // Release parent buffer
-      inputBuf.release();
+      // Only release if refCnt > 0 (slice might have already released the parent)
+      if (inputBuf.refCnt() > 0) {
+        inputBuf.release();
+      }
     }
   }
 
@@ -490,7 +492,10 @@ public class MessageFormatCorruptDataLeakTest {
           0, refCntAfterRelease);
 
     } finally {
-      inputBuf.release();
+      // Only release if refCnt > 0 (slice might have already released the parent)
+      if (inputBuf.refCnt() > 0) {
+        inputBuf.release();
+      }
     }
   }
 }
