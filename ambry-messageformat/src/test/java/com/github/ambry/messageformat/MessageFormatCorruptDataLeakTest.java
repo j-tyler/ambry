@@ -40,13 +40,24 @@ import static org.junit.Assert.fail;
 public class MessageFormatCorruptDataLeakTest {
 
   private NettyByteBufLeakHelper nettyByteBufLeakHelper;
+  private String originalTinyCacheSize;
+  private String originalSmallCacheSize;
+  private String originalNormalCacheSize;
   private String originalMaxCachedBufferCapacity;
 
   @Before
   public void before() {
-    // Disable allocator caching BEFORE creating NettyByteBufLeakHelper
-    // (constructor reads this property to set cachedEnabled)
+    // Disable ALL allocator caching BEFORE creating NettyByteBufLeakHelper
+    // (constructor reads maxCachedBufferCapacity property to set cachedEnabled)
+    // Match build.gradle test configuration (lines 207-210)
+    originalTinyCacheSize = System.getProperty("io.netty.allocator.tinyCacheSize");
+    originalSmallCacheSize = System.getProperty("io.netty.allocator.smallCacheSize");
+    originalNormalCacheSize = System.getProperty("io.netty.allocator.normalCacheSize");
     originalMaxCachedBufferCapacity = System.getProperty("io.netty.allocator.maxCachedBufferCapacity");
+
+    System.setProperty("io.netty.allocator.tinyCacheSize", "0");
+    System.setProperty("io.netty.allocator.smallCacheSize", "0");
+    System.setProperty("io.netty.allocator.normalCacheSize", "0");
     System.setProperty("io.netty.allocator.maxCachedBufferCapacity", "0");
 
     // Now create the helper - it will see caching disabled
@@ -58,7 +69,25 @@ public class MessageFormatCorruptDataLeakTest {
   public void after() {
     nettyByteBufLeakHelper.afterTest();
 
-    // Restore original property
+    // Restore original properties
+    if (originalTinyCacheSize != null) {
+      System.setProperty("io.netty.allocator.tinyCacheSize", originalTinyCacheSize);
+    } else {
+      System.clearProperty("io.netty.allocator.tinyCacheSize");
+    }
+
+    if (originalSmallCacheSize != null) {
+      System.setProperty("io.netty.allocator.smallCacheSize", originalSmallCacheSize);
+    } else {
+      System.clearProperty("io.netty.allocator.smallCacheSize");
+    }
+
+    if (originalNormalCacheSize != null) {
+      System.setProperty("io.netty.allocator.normalCacheSize", originalNormalCacheSize);
+    } else {
+      System.clearProperty("io.netty.allocator.normalCacheSize");
+    }
+
     if (originalMaxCachedBufferCapacity != null) {
       System.setProperty("io.netty.allocator.maxCachedBufferCapacity", originalMaxCachedBufferCapacity);
     } else {
