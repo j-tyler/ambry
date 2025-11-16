@@ -1401,6 +1401,16 @@ public class ByteBufFlowCharacterizationTest {
     }
 
     @Override
+    public void register(short accountId, short containerId) throws GeneralSecurityException {
+      // No-op for characterization tests
+    }
+
+    @Override
+    public void register(String context) throws GeneralSecurityException {
+      // No-op for characterization tests
+    }
+
+    @Override
     public SecretKey getKey(RestRequest restRequest, short accountId, short containerId)
         throws GeneralSecurityException {
       if (throwOnGetKey) {
@@ -1410,8 +1420,21 @@ public class ByteBufFlowCharacterizationTest {
     }
 
     @Override
+    public SecretKey getKey(RestRequest restRequest, String context) throws GeneralSecurityException {
+      if (throwOnGetKey) {
+        throw new GeneralSecurityException("Simulated KMS failure");
+      }
+      return new SecretKeySpec("context_key".getBytes(), "AES");
+    }
+
+    @Override
     public SecretKey getRandomKey() throws GeneralSecurityException {
       return new SecretKeySpec("random_key".getBytes(), "AES");
+    }
+
+    @Override
+    public void close() {
+      // No-op for characterization tests
     }
   }
 
