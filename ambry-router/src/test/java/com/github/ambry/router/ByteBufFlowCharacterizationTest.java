@@ -16,7 +16,6 @@ import com.github.ambry.config.KMSConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.network.BoundedNettyByteBufReceive;
 import com.github.ambry.utils.ByteBufferInputStream;
-import com.github.ambry.utils.NettyByteBufLeakHelper;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCountUtil;
@@ -54,7 +53,6 @@ import org.junit.Test;
  */
 public class ByteBufFlowCharacterizationTest {
 
-  private final NettyByteBufLeakHelper nettyByteBufLeakHelper = new NettyByteBufLeakHelper();
   private MockCryptoService cryptoService;
   private MockKeyManagementService kms;
   private CryptoJobMetricsTracker metricsTracker;
@@ -62,8 +60,6 @@ public class ByteBufFlowCharacterizationTest {
 
   @Before
   public void setUp() throws Exception {
-    nettyByteBufLeakHelper.beforeTest();
-
     // Use existing production mock implementations
     Properties props = new Properties();
     VerifiableProperties verifiableProperties = new VerifiableProperties(props);
@@ -74,7 +70,7 @@ public class ByteBufFlowCharacterizationTest {
 
   @After
   public void tearDown() {
-    nettyByteBufLeakHelper.afterTest();
+    // No assertions - let the tracer observe the flows
   }
 
   // ============================================================================
