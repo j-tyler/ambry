@@ -13,7 +13,6 @@
  */
 package com.github.ambry.messageformat;
 
-import com.github.ambry.utils.CrcInputStream;
 import com.github.ambry.utils.NettyByteBufDataInputStream;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
@@ -383,12 +382,12 @@ public class MessageFormatCorruptDataLeakTest {
       inputBuf.writeLong(crc.getValue() + 1); // Corrupt CRC (any non-zero offset corrupts it)
 
       // Create CapturingInputStream to intercept slice creation
+      // NOTE: Pass CapturingInputStream directly to deserializeBlob() which will wrap it in CrcInputStream
       CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
-      CrcInputStream crcStream = new CrcInputStream(capturingStream);
 
       // Attempt deserialization - this creates a ByteBuf slice via Utils.readNettyByteBufFromCrcInputStream
       try {
-        BlobData blobData = MessageFormatRecord.deserializeBlob(crcStream);
+        BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
         fail("Should have thrown MessageFormatException due to corrupt CRC");
       } catch (MessageFormatException e) {
         // Expected - CRC validation failed
@@ -457,11 +456,11 @@ public class MessageFormatCorruptDataLeakTest {
       inputBuf.writeLong(crc.getValue());
 
       // Create CapturingInputStream to intercept slice creation
+      // NOTE: Pass CapturingInputStream directly to deserializeBlob() which will wrap it in CrcInputStream
       CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
-      CrcInputStream crcStream = new CrcInputStream(capturingStream);
 
       // Deserialize successfully
-      BlobData blobData = MessageFormatRecord.deserializeBlob(crcStream);
+      BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
 
       // Verify deserialized content
       assertEquals("BlobData should contain 512 bytes", 512, blobData.content().readableBytes());
