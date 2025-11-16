@@ -39,15 +39,18 @@ import static org.junit.Assert.fail;
  */
 public class MessageFormatCorruptDataLeakTest {
 
-  private final NettyByteBufLeakHelper nettyByteBufLeakHelper = new NettyByteBufLeakHelper();
+  private NettyByteBufLeakHelper nettyByteBufLeakHelper;
   private String originalMaxCachedBufferCapacity;
 
   @Before
   public void before() {
-    // Disable allocator caching so NettyByteBufLeakHelper can track allocations
+    // Disable allocator caching BEFORE creating NettyByteBufLeakHelper
+    // (constructor reads this property to set cachedEnabled)
     originalMaxCachedBufferCapacity = System.getProperty("io.netty.allocator.maxCachedBufferCapacity");
     System.setProperty("io.netty.allocator.maxCachedBufferCapacity", "0");
 
+    // Now create the helper - it will see caching disabled
+    nettyByteBufLeakHelper = new NettyByteBufLeakHelper();
     nettyByteBufLeakHelper.beforeTest();
   }
 
