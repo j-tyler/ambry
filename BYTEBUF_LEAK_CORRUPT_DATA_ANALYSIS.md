@@ -82,7 +82,50 @@ return new BlobData(BlobType.DataBlob, dataSize, byteBuf);
 
 ---
 
-## 4. Production Scenarios That Trigger This Leak
+## 4. Actual Production Code Path
+
+**File**: `ambry-router/src/main/java/com/github/ambry/router/GetBlobOperation.java`
+
+### Call Stack:
+```
+GetBlobOperation.handleResponse() (line ~1180)
+  └─> try { processGetBlobResponse() } catch (line 1202-1214)
+       └─> processGetBlobResponse() (line 1279)
+            └─> handleBody() (line 1301)
+                 └─> MessageFormatRecord.deserializeBlob(payload) (line 1119)
+                      └─> Blob_Format_V1.deserializeBlobRecord() (line 1681-1696)
+                           ├─> ByteBuf allocated (line 1687)
+                           └─> CRC check fails, throw exception (line 1690-1694)
+                                └─> ByteBuf LEAKED
+```
+
+### Exact Code (GetBlobOperation.java:1202-1214):
+```java
+try {
+  processGetBlobResponse(getRequestInfo, getResponse);  // Line 1203
+} catch (IOException | MessageFormatException e) {  // Line 1204
+  // ByteBuf already leaked inside deserializeBlob!
+  logger.trace("GetBlobRequest with response correlationId {} response deserialization failed",
+      correlationId, getRequestInfo.getReplicaId().getDataNodeId());
+  routerMetrics.responseDeserializationErrorCount.inc();
+  onErrorResponse(getRequestInfo.getReplicaId(),
+      buildChunkException("Response deserialization received an unexpected error", e,
+          RouterErrorCode.UnexpectedInternalError));
+}
+```
+
+### Why GetBlobOperation Can't Prevent The Leak:
+1. GetBlobOperation calls `MessageFormatRecord.deserializeBlob(payload)`
+2. If CRC is corrupt, exception thrown from INSIDE deserializeBlob
+3. ByteBuf allocated at MessageFormatRecord.java:1687, but BlobData never created
+4. GetBlobOperation catches MessageFormatException but has NO ByteBuf reference
+5. **No way for GetBlobOperation to release the ByteBuf** - it never got a BlobData reference
+
+The bug MUST be fixed inside MessageFormatRecord.deserializeBlobRecord().
+
+---
+
+## 5. Production Scenarios That Trigger This Leak
 
 ### Real-world conditions that cause CRC mismatches:
 
@@ -105,55 +148,29 @@ return new BlobData(BlobType.DataBlob, dataSize, byteBuf);
 
 ---
 
-## 5. Test Suite: MessageFormatCorruptDataLeakTest.java
+## 6. Test Suite: MessageFormatCorruptDataLeakTest.java
 
-Created 6 comprehensive tests using NettyByteBufLeakHelper to expose the bug.
+Created 2 tests that replicate ACTUAL production code using NettyByteBufLeakHelper.
 
-### Test 1: `testCorruptBlobV1_CrcMismatch_LeaksByteBuffer`
-**Purpose**: Basic corrupt blob deserialization leak detection
-**Data**: 1KB blob with wrong CRC (+12345 offset)
-**Expected**: MessageFormatException thrown, ByteBuf leaked
-**Status**: ❌ Currently FAILS (leak detected)
-**Fix Status**: ✅ Will PASS once production code fixed
+### Test 1: `testGetBlobOperation_CorruptDataFromNetwork_LeaksByteBuffer`
+**Replicates**: GetBlobOperation.java:1119, 1202-1214
+**Production Path**: GetBlobOperation → processGetBlobResponse → handleBody → deserializeBlob
+**Scenario**: Corrupt blob data from network/storage with CRC mismatch
+**Expected**: MessageFormatException thrown at line 1204, ByteBuf leaked inside deserializeBlob
+**Status**: ❌ Currently FAILS (leak detected by NettyByteBufLeakHelper)
+**Fix Status**: ✅ Will PASS once production code fixed with try-finally
 
-### Test 2: `testMultipleCorruptBlobs_AccumulatesLeaks`
-**Purpose**: Verify leak accumulation with multiple corrupt blobs
-**Data**: 3 corrupt blobs (512B, 612B, 712B) with XOR'd CRCs
-**Expected**: 3 leaked ByteBufs
-**Status**: ❌ Currently FAILS (3 leaks detected)
-**Fix Status**: ✅ Will PASS once production code fixed
-
-### Test 3: `testLargeCorruptBlob_SignificantLeak`
-**Purpose**: Demonstrate severe memory leak with large blobs
-**Data**: 1MB corrupt blob (realistic production size)
-**Expected**: 1MB ByteBuf leaked - HIGH SEVERITY
-**Status**: ❌ Currently FAILS (1MB leak detected)
-**Fix Status**: ✅ Will PASS once production code fixed
-
-### Test 4: `testCorruptBlob_TryCatchWithoutFinally_Leaks`
-**Purpose**: Mirror exact production bug pattern (try-catch without finally)
-**Data**: 256B blob with zero CRC
-**Expected**: ByteBuf leaked in catch block
-**Status**: ❌ Currently FAILS (leak detected)
-**Fix Status**: ✅ Will PASS once production code fixed
-
-### Test 5: `testValidBlob_NoLeak` (Control Test)
-**Purpose**: Verify valid blobs do NOT leak
-**Data**: 512B blob with CORRECT CRC
-**Expected**: No leak, proper cleanup
+### Test 2: `testGetBlobOperation_ValidData_NoLeak` (Control Test)
+**Replicates**: GetBlobOperation.java:1119 with valid data
+**Production Path**: Same as Test 1 but with valid CRC
+**Scenario**: Normal successful blob retrieval
+**Expected**: BlobData created and properly released, no leak
 **Status**: ✅ Currently PASSES (no leak)
-**Fix Status**: ✅ Will still PASS (no change needed)
-
-### Test 6: `testCorruptThenValid_OnlyCorruptLeaks`
-**Purpose**: Mixed scenario - verify only corrupt blobs leak
-**Data**: 1 corrupt + 1 valid blob (128B each)
-**Expected**: 1 leak (from corrupt), valid blob released
-**Status**: ❌ Currently FAILS (1 leak detected)
-**Fix Status**: ✅ Will PASS once production code fixed
+**Fix Status**: ✅ Will still PASS after fix (no change to happy path)
 
 ---
 
-## 6. Required Production Code Fix
+## 7. Required Production Code Fix
 
 ### Current Buggy Code (lines 1681-1696):
 
@@ -212,24 +229,25 @@ public static BlobData deserializeBlobRecord(CrcInputStream crcStream)
 
 ---
 
-## 7. Verification Plan
+## 8. Verification Plan
 
 ### Before Fix:
 ```bash
 ./gradlew :ambry-messageformat:test --tests MessageFormatCorruptDataLeakTest
 ```
-**Expected**: 5 out of 6 tests FAIL due to leak detection
-**Control**: Test 5 (testValidBlob_NoLeak) PASSES
+**Expected**: 1 out of 2 tests FAILS due to leak detection
+**Failing**: testGetBlobOperation_CorruptDataFromNetwork_LeaksByteBuffer
+**Passing**: testGetBlobOperation_ValidData_NoLeak (control test)
 
 ### After Fix:
 ```bash
 ./gradlew :ambry-messageformat:test --tests MessageFormatCorruptDataLeakTest
 ```
-**Expected**: All 6 tests PASS (no leaks detected)
+**Expected**: All 2 tests PASS (no leaks detected)
 
 ---
 
-## 8. Additional Considerations
+## 9. Additional Considerations
 
 ### Same Bug in Other Blob Versions?
 
@@ -247,12 +265,12 @@ Audit all methods that allocate ByteBuf and may throw exceptions:
 
 ---
 
-## 9. Test Files Summary
+## 10. Test Files Summary
 
 ### New Test File:
 - **File**: `ambry-messageformat/src/test/java/com/github/ambry/messageformat/MessageFormatCorruptDataLeakTest.java`
-- **Tests**: 6 comprehensive tests
-- **Purpose**: Expose production bug, verify fix
+- **Tests**: 2 tests replicating actual production code (GetBlobOperation)
+- **Purpose**: Expose production bug in corrupt data handling, verify fix
 
 ### Updated Test File:
 - **File**: `ambry-server/src/test/java/com/github/ambry/server/ByteBufLeakFlowExplorationTest.java`
@@ -261,8 +279,9 @@ Audit all methods that allocate ByteBuf and may throw exceptions:
 
 ---
 
-## 10. Commits
+## 11. Commits
 
+**Commit df912cc**: Refactor tests to match ACTUAL production patterns (removed 4 hypothetical tests)
 **Commit d1dd4af**: Add tests exposing ByteBuf leak in corrupt data deserialization
 **Commit 43f30b2**: Fix CRC calculation in ByteBuf leak exploration tests
 **Branch**: claude/review-bytebuf-tracer-01XqX5RXVsegrua4awg7TPQm
