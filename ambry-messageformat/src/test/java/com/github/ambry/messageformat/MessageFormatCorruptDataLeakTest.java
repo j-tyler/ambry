@@ -47,7 +47,7 @@ import static org.junit.Assert.fail;
  * <p><b>Test Strategy:</b><br>
  * Extends {@link NettyByteBufDataInputStream} to override {@code getBuffer()}, returning a
  * minimal ByteBuf wrapper that intercepts {@code slice(int, int)} calls. This wrapper only
- * implements methods actually used by the test and production code, throwing
+ * implements methods actually used by production code, throwing
  * {@link UnsupportedOperationException} for all others to ensure explicit API contract.</p>
  *
  * <p><b>Test Coverage:</b></p>
@@ -57,21 +57,19 @@ import static org.junit.Assert.fail;
  * </ul>
  *
  * <p><b>Design Rationale:</b><br>
- * This test intentionally uses production classes ({@code MessageFormatRecord},
- * {@code Utils}, {@code NettyByteBufDataInputStream}) without mocking to ensure it detects
+ * This test intentionally uses production classes without mocking to ensure it detects
  * real-world leaks. The minimal ByteBuf wrapper approach makes the API contract explicit
  * and causes loud failures if production code changes to use unsupported methods.</p>
  */
 public class MessageFormatCorruptDataLeakTest {
 
-  // Track leaked buffers for cleanup in @After
   private final List<ByteBuf> leakedBuffersToClean = new ArrayList<>();
 
   /**
    * NettyByteBufDataInputStream that captures ByteBuf slices created during deserialization.
    *
    * <p>Overrides {@code getBuffer()} to return a {@link SliceCapturingByteBuf} wrapper that
-   * intercepts {@code slice(int, int)} calls made by {@code Utils.readNettyByteBufFromCrcInputStream}.</p>
+   * intercepts {@code slice(int, int)} calls.</p>
    */
   private static class CapturingInputStream extends NettyByteBufDataInputStream {
     private final SliceCapturingByteBuf wrapper;
@@ -94,13 +92,11 @@ public class MessageFormatCorruptDataLeakTest {
   /**
    * Minimal ByteBuf wrapper that captures slice creation and delegates only necessary methods.
    *
-   * <p><b>Implemented methods (required by test and production code):</b></p>
+   * <p><b>Implemented methods:</b></p>
    * <ul>
-   *   <li>{@code slice(int, int)} - INTERCEPTED to capture slices</li>
-   *   <li>{@code readerIndex()} - Used by Utils after creating slice</li>
-   *   <li>{@code readerIndex(int)} - Used by Utils to update position after slice</li>
-   *   <li>{@code order()} - Required by ByteBuf abstract class contract</li>
-   *   <li>{@code order(ByteOrder)} - Required by ByteBuf abstract class contract</li>
+   *   <li>{@code slice(int, int)} - Intercepted to capture slices</li>
+   *   <li>{@code readerIndex()} and {@code readerIndex(int)} - Used by Utils</li>
+   *   <li>{@code order()} and {@code order(ByteOrder)} - Required by ByteBuf abstract class</li>
    * </ul>
    *
    * <p><b>All other methods:</b> Throw {@link UnsupportedOperationException} to ensure
@@ -119,7 +115,6 @@ public class MessageFormatCorruptDataLeakTest {
       return Collections.unmodifiableList(capturedSlices);
     }
 
-    // INTERCEPTED: Capture slice creation (called by Utils.readNettyByteBufFromCrcInputStream)
     @Override
     public ByteBuf slice(int index, int length) {
       ByteBuf slice = delegate.slice(index, length);
@@ -127,7 +122,6 @@ public class MessageFormatCorruptDataLeakTest {
       return slice;
     }
 
-    // DELEGATED: Required by Utils.readNettyByteBufFromCrcInputStream
     @Override
     public int readerIndex() {
       return delegate.readerIndex();
@@ -138,7 +132,6 @@ public class MessageFormatCorruptDataLeakTest {
       return delegate.readerIndex(readerIndex);
     }
 
-    // DELEGATED: ByteOrder methods (required by ByteBuf abstract class)
     @Override
     public ByteOrder order() {
       return delegate.order();
@@ -149,7 +142,6 @@ public class MessageFormatCorruptDataLeakTest {
       return delegate.order(endianness);
     }
 
-    // All other methods throw UnsupportedOperationException
     private static final String UNSUPPORTED_MSG =
         "This method is not implemented by SliceCapturingByteBuf. " +
         "If production code requires this method, add explicit delegation.";
@@ -336,8 +328,6 @@ public class MessageFormatCorruptDataLeakTest {
 
   @After
   public void cleanup() {
-    // Clean up any leaked buffers to prevent cross-test contamination
-    // This runs after test assertions, so it doesn't mask production bugs
     for (ByteBuf leaked : leakedBuffersToClean) {
       if (leaked.refCnt() > 0) {
         leaked.release(leaked.refCnt());
@@ -365,61 +355,44 @@ public class MessageFormatCorruptDataLeakTest {
    */
   @Test
   public void testDeserializeBlobWithCorruptCrc() throws Exception {
-    // Allocate pooled ByteBuf (pooled to test production scenario)
     ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 1024 + 8);
-
-    // Track inputBuf for cleanup in @After (don't clean up in test - we're detecting production bugs)
     leakedBuffersToClean.add(inputBuf);
 
-    // Serialize blob data with CORRUPT CRC
-    // Note: Content doesn't matter since CRC will be corrupted anyway
     byte[] blobContent = new byte[1024];
-
     inputBuf.writeShort(MessageFormatRecord.Blob_Version_V1);
     inputBuf.writeLong(1024);
     inputBuf.writeBytes(blobContent);
 
-    // Calculate correct CRC but write WRONG value to trigger validation failure
+    // Corrupt the CRC to trigger validation failure
     CRC32 crc = new CRC32();
     crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
-    inputBuf.writeLong(crc.getValue() + 1); // Corrupt CRC (any non-zero offset corrupts it)
+    inputBuf.writeLong(crc.getValue() + 1);
 
-    // Create CapturingInputStream to intercept slice creation
-    // NOTE: Pass CapturingInputStream directly to deserializeBlob() which will wrap it in CrcInputStream
     CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
 
-    // Attempt deserialization - this creates a ByteBuf slice via Utils.readNettyByteBufFromCrcInputStream
     try {
-      BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
+      MessageFormatRecord.deserializeBlob(capturingStream);
       fail("Should have thrown MessageFormatException due to corrupt CRC");
     } catch (MessageFormatException e) {
-      // Expected - CRC validation failed
       assertEquals(MessageFormatErrorCodes.DataCorrupt, e.getErrorCode());
-      // BUG: ByteBuf slice created by Utils.readNettyByteBufFromCrcInputStream is never released
     }
 
-    // Verify exactly one slice was created during deserialization
     List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
-    assertEquals("Expected exactly one slice to be created by Utils.readNettyByteBufFromCrcInputStream",
-        1, capturedSlices.size());
+    assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());
 
     ByteBuf slice = capturedSlices.get(0);
-    int sliceRefCnt = slice.refCnt();
+    int refCnt = slice.refCnt();
 
-    // Track slice for cleanup in @After (don't clean up in test - we're detecting production bugs)
-    if (sliceRefCnt > 0) {
+    if (refCnt > 0) {
       leakedBuffersToClean.add(slice);
     }
 
-    // Assert slice is properly released even when exception is thrown
-    // When bug exists: refCnt = 1 (leak detected - test FAILS)
-    // When bug fixed: refCnt = 0 (properly released - test PASSES)
     assertEquals("ByteBuf slice must be released after CRC validation failure.\n" +
-            "LEAK DETECTED: slice refCnt is " + sliceRefCnt + " but should be 0.\n" +
+            "LEAK DETECTED: slice refCnt is " + refCnt + " but should be 0.\n" +
             "Fix: Add try-finally block in MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord\n" +
             "to release the ByteBuf allocated by Utils.readNettyByteBufFromCrcInputStream\n" +
             "when CRC validation fails.",
-        0, sliceRefCnt);
+        0, refCnt);
   }
 
   /**
@@ -437,61 +410,37 @@ public class MessageFormatCorruptDataLeakTest {
    */
   @Test
   public void testDeserializeBlobWithValidCrc() throws Exception {
-    // Allocate pooled ByteBuf (pooled to test production scenario)
     ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 512 + 8);
-
-    // Track inputBuf for cleanup in @After (don't clean up in test - we're detecting production bugs)
     leakedBuffersToClean.add(inputBuf);
 
-    // Serialize blob data with CORRECT CRC
     byte[] blobContent = new byte[512];
-
     inputBuf.writeShort(MessageFormatRecord.Blob_Version_V1);
     inputBuf.writeLong(512);
     inputBuf.writeBytes(blobContent);
 
-    // Calculate and write CORRECT CRC (enables successful deserialization)
     CRC32 crc = new CRC32();
     crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
     inputBuf.writeLong(crc.getValue());
 
-    // Create CapturingInputStream to intercept slice creation
-    // NOTE: Pass CapturingInputStream directly to deserializeBlob() which will wrap it in CrcInputStream
     CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
 
-    // Deserialize successfully
     BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
 
-    // Verify deserialized content
     assertEquals("BlobData should contain 512 bytes", 512, blobData.content().readableBytes());
-    byte[] readContent = new byte[512];
-    blobData.content().readBytes(readContent);
 
-    // Verify exactly one slice was created
     List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
-    assertEquals("Expected exactly one slice to be created by Utils.readNettyByteBufFromCrcInputStream",
-        1, capturedSlices.size());
+    assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());
 
     ByteBuf slice = capturedSlices.get(0);
-    int refCntBeforeRelease = slice.refCnt();
+    assertTrue("Slice should have refCnt > 0 before release", slice.refCnt() > 0);
 
-    // Sanity check: slice should be retained at this point (refCnt > 0)
-    assertTrue("Slice should have refCnt > 0 before BlobData.release(), was: " + refCntBeforeRelease,
-        refCntBeforeRelease > 0);
-
-    // Release BlobData - this should release the slice
     blobData.release();
 
-    int refCntAfterRelease = slice.refCnt();
-
-    // Track slice for cleanup in @After if it still has references
-    if (refCntAfterRelease > 0) {
+    int refCnt = slice.refCnt();
+    if (refCnt > 0) {
       leakedBuffersToClean.add(slice);
     }
 
-    // Assert no leak: slice should be released (refCnt = 0)
-    assertEquals("Expected no leak: slice refCnt should be 0 after BlobData.release(), " +
-            "but was: " + refCntAfterRelease,
-        0, refCntAfterRelease);
+    assertEquals("Expected no leak: slice refCnt should be 0 after BlobData.release()", 0, refCnt);
   }
 }
