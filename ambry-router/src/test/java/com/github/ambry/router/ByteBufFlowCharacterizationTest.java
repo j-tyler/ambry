@@ -10,10 +10,11 @@
 
 package com.github.ambry.router;
 
-import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.Callback;
+import com.github.ambry.config.CryptoServiceConfig;
+import com.github.ambry.config.KMSConfig;
+import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.network.BoundedNettyByteBufReceive;
-import com.github.ambry.rest.RestRequest;
 import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
 import io.netty.buffer.ByteBuf;
@@ -24,12 +25,11 @@ import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.security.GeneralSecurityException;
+import java.util.Properties;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import javax.crypto.SecretKey;
-import javax.crypto.spec.SecretKeySpec;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -57,14 +57,19 @@ public class ByteBufFlowCharacterizationTest {
   private final NettyByteBufLeakHelper nettyByteBufLeakHelper = new NettyByteBufLeakHelper();
   private MockCryptoService cryptoService;
   private MockKeyManagementService kms;
-  private MockCryptoJobMetricsTracker metricsTracker;
+  private CryptoJobMetricsTracker metricsTracker;
+  private static final String DEFAULT_KMS_KEY = "RandomKey1234567";
 
   @Before
-  public void setUp() {
+  public void setUp() throws Exception {
     nettyByteBufLeakHelper.beforeTest();
-    cryptoService = new MockCryptoService();
-    kms = new MockKeyManagementService();
-    metricsTracker = new MockCryptoJobMetricsTracker();
+
+    // Use existing production mock implementations
+    Properties props = new Properties();
+    VerifiableProperties verifiableProperties = new VerifiableProperties(props);
+    cryptoService = new MockCryptoService(new CryptoServiceConfig(verifiableProperties));
+    kms = new MockKeyManagementService(new KMSConfig(verifiableProperties), DEFAULT_KMS_KEY);
+    metricsTracker = new CryptoJobMetricsTracker(null);
   }
 
   @After
@@ -73,34 +78,37 @@ public class ByteBufFlowCharacterizationTest {
   }
 
   // ============================================================================
-  // SECTION 1: DecryptJob - Normal Flow Scenarios
+  // SECTION 1: DecryptJob - Normal Flow Scenarios (Production Patterns)
   // ============================================================================
 
   /**
-   * TEST: DecryptJob normal success path - input ByteBuf lifecycle
+   * TEST: DecryptJob normal success path - replicates GetBlobOperation.maybeLaunchCryptoJob()
    *
-   * FLOW:
-   * 1. Allocate encrypted ByteBuf
-   * 2. Create DecryptJob with encrypted ByteBuf (ownership transfer)
-   * 3. Call run() - should decrypt and release input in finally block
-   * 4. Callback receives DecryptJobResult with decrypted ByteBuf
+   * PRODUCTION FLOW (GetBlobOperation:1124-1126):
+   * 1. chunkBuf.retain() - increment refCount for crypto job
+   * 2. maybeLaunchCryptoJob(chunkBuf, ...)
+   * 3. Inside: new DecryptJob(..., dataBuf.duplicate(), ...)
+   * 4. DecryptJob.run() releases duplicate (decrements refCount from retain)
+   * 5. Callback receives DecryptJobResult with decrypted ByteBuf
    *
    * OBSERVES:
-   * - Encrypted ByteBuf creation
-   * - Ownership transfer to DecryptJob
-   * - Release in run() finally block (line 98)
-   * - Decrypted ByteBuf creation by cryptoService.decrypt()
+   * - chunkBuf.retain() increments refCount
+   * - duplicate() shares refCount with original
+   * - DecryptJob releases duplicate in finally block
+   * - Decrypted ByteBuf creation by cryptoService
    *
    * LEAK SCENARIOS COVERED:
-   * - SAFE-10.1: Input ByteBuf always released
+   * - SAFE-10.1: Input ByteBuf properly managed via retain/release pattern
    */
   @Test
-  public void testDecryptJob_NormalFlow_InputByteBufLifecycle() throws Exception {
-    // Allocate encrypted ByteBuf
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
+  public void testDecryptJob_ProductionFlow_RetainAndDuplicate() throws Exception {
+    // Simulate encrypted chunk from network (as in GetBlobOperation)
+    ByteBuf encryptedChunk = Unpooled.buffer(100);
+    encryptedChunk.writeBytes("encrypted chunk data".getBytes());
 
-    // Prepare callback
+    // PRODUCTION PATTERN: retain() before passing to crypto job (line 1124)
+    encryptedChunk.retain();
+
     AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
     CountDownLatch latch = new CountDownLatch(1);
     Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
@@ -108,98 +116,41 @@ public class ByteBufFlowCharacterizationTest {
       latch.countDown();
     };
 
-    // Create and run DecryptJob (ownership of encryptedBuf transferred)
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
+    // PRODUCTION PATTERN: pass buffer, DecryptJob will duplicate() it (line 1248)
+    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
+    // Job runs (simulating ExecutorService.execute)
     job.run();
     latch.await(1, TimeUnit.SECONDS);
 
-    // DecryptJob.run() released encryptedBuf in finally block (line 98)
-    // Result contains decrypted ByteBuf
+    // Clean up result
     DecryptJob.DecryptJobResult result = resultRef.get();
     if (result != null && result.getDecryptedBlobContent() != null) {
-      // Proper cleanup: release decrypted content
       result.getDecryptedBlobContent().release();
     }
+
+    // Release original chunk (still has refCount from our explicit retain)
+    encryptedChunk.release();
   }
 
   /**
-   * TEST: DecryptJob normal success path - output ByteBuf lifecycle
+   * TEST: DecryptJob with metadata-only (null content) - replicates GetBlobInfoOperation:429
    *
-   * FLOW:
-   * 1. Run DecryptJob successfully
-   * 2. Callback receives DecryptJobResult
-   * 3. Extract decryptedBlobContent from result
-   * 4. Process decrypted content (simulating GetBlobOperation)
-   * 5. Manually release via ReferenceCountUtil.safeRelease()
+   * PRODUCTION FLOW (GetBlobInfoOperation:429):
+   * new DecryptJob(blobId, encryptionKey.duplicate(), null, userMetadata, ...)
    *
    * OBSERVES:
-   * - Decrypted ByteBuf creation
-   * - DecryptJobResult construction
-   * - Ownership transfer to callback
-   * - Manual release pattern (no result.release() method exists)
-   *
-   * LEAK SCENARIOS COVERED:
-   * - LEAK-10.7: No release() method - caller must manually release
-   */
-  @Test
-  public void testDecryptJob_NormalFlow_OutputByteBufLifecycle() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
-
-    AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
-    CountDownLatch latch = new CountDownLatch(1);
-    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
-      resultRef.set(result);
-      latch.countDown();
-    };
-
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
-        cryptoService, kms, null, metricsTracker, callback);
-
-    job.run();
-    latch.await(1, TimeUnit.SECONDS);
-
-    // Extract and use decrypted content (simulating GetBlobOperation pattern)
-    DecryptJob.DecryptJobResult result = resultRef.get();
-    if (result != null) {
-      ByteBuf decryptedContent = result.getDecryptedBlobContent();
-      if (decryptedContent != null) {
-        // Simulate reading the decrypted data
-        byte[] data = new byte[decryptedContent.readableBytes()];
-        decryptedContent.readBytes(data);
-        decryptedContent.resetReaderIndex();
-
-        // Proper cleanup: Manual release via ReferenceCountUtil
-        // (DecryptJobResult does NOT have a release() method)
-        ReferenceCountUtil.safeRelease(decryptedContent);
-      }
-    }
-  }
-
-  /**
-   * TEST: DecryptJob with metadata only (null encryptedBlobContent)
-   *
-   * FLOW:
-   * 1. Create DecryptJob with null encryptedBlobContent (metadata-only path)
-   * 2. Run DecryptJob
-   * 3. Verify no ByteBuf leaks despite null content
-   *
-   * OBSERVES:
-   * - How DecryptJob handles null ByteBuf input
+   * - Null ByteBuf handling in DecryptJob
    * - Line 97 null check in finally block
    * - Metadata-only decryption path
    *
    * LEAK SCENARIOS COVERED:
-   * - Edge case: null ByteBuf handling
+   * - Edge case: null ByteBuf content, only metadata
    */
   @Test
-  public void testDecryptJob_MetadataOnly_NullByteBuf() throws Exception {
+  public void testDecryptJob_MetadataOnly_NullContent() throws Exception {
     AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
     CountDownLatch latch = new CountDownLatch(1);
     Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
@@ -207,20 +158,72 @@ public class ByteBufFlowCharacterizationTest {
       latch.countDown();
     };
 
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-    ByteBuffer encryptedMetadata = ByteBuffer.wrap("encryptedmetadata".getBytes());
+    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+    ByteBuffer encryptedMetadata = ByteBuffer.wrap("metadata".getBytes());
 
-    // Note: null encryptedBlobContent (metadata-only path)
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, null, encryptedMetadata,
+    // PRODUCTION PATTERN: null blob content (GetBlobInfoOperation line 429)
+    DecryptJob job = new DecryptJob(null, encryptedKey.duplicate(), null, encryptedMetadata,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
     latch.await(1, TimeUnit.SECONDS);
 
     // No ByteBuf to release (null content)
-    DecryptJob.DecryptJobResult result = resultRef.get();
-    // Result should have decrypted metadata but null blob content
+  }
+
+  /**
+   * TEST: DecryptJob result processing - replicates GetBlobOperation callback (lines 1250-1263)
+   *
+   * PRODUCTION FLOW (GetBlobOperation:1254-1257):
+   * if (isOperationComplete() || operationException.get() != null) {
+   *   if (exception == null && result.getDecryptedBlobContent() != null) {
+   *     ReferenceCountUtil.safeRelease(result.getDecryptedBlobContent());
+   *   }
+   *   return;
+   * }
+   *
+   * OBSERVES:
+   * - Early-exit cleanup pattern
+   * - ReferenceCountUtil.safeRelease() usage
+   * - DecryptJobResult has no release() method
+   *
+   * LEAK SCENARIOS COVERED:
+   * - LEAK-10.7: No release() method - must manually release content
+   */
+  @Test
+  public void testDecryptJob_CallbackEarlyExit_ProperCleanup() throws Exception {
+    ByteBuf encryptedChunk = Unpooled.buffer(100);
+    encryptedChunk.writeBytes("encrypted".getBytes());
+    encryptedChunk.retain();
+
+    AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
+    CountDownLatch latch = new CountDownLatch(1);
+
+    // Simulate operation already complete (early exit scenario)
+    final boolean operationComplete = true;
+
+    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
+      // PRODUCTION PATTERN: Early exit cleanup (GetBlobOperation lines 1254-1258)
+      if (operationComplete) {
+        if (exception == null && result != null && result.getDecryptedBlobContent() != null) {
+          ReferenceCountUtil.safeRelease(result.getDecryptedBlobContent());
+        }
+        latch.countDown();
+        return;
+      }
+      resultRef.set(result);
+      latch.countDown();
+    };
+
+    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
+        cryptoService, kms, null, metricsTracker, callback);
+
+    job.run();
+    latch.await(1, TimeUnit.SECONDS);
+
+    // Encrypted chunk still needs cleanup
+    encryptedChunk.release();
   }
 
   // ============================================================================
@@ -228,29 +231,37 @@ public class ByteBufFlowCharacterizationTest {
   // ============================================================================
 
   /**
-   * TEST: DecryptJob exception during decryption - decryptedBlobContent cleanup
+   * TEST: DecryptJob exception during decryption - production exception handling
    *
-   * FLOW:
-   * 1. Create DecryptJob with valid encrypted ByteBuf
-   * 2. Mock cryptoService to create decryptedBlobContent then throw exception
-   * 3. Exception handler should release decryptedBlobContent (line 92)
-   * 4. Finally block should release encryptedBlobContent (line 98)
+   * PRODUCTION FLOW (DecryptJob:85-93):
+   * try {
+   *   decryptedBlobContent = cryptoService.decrypt(...);
+   * } catch (GeneralSecurityException e) {
+   *   if (decryptedBlobContent != null) {
+   *     decryptedBlobContent.release(); // Line 92
+   *   }
+   * } finally {
+   *   if (encryptedBlobContent != null) {
+   *     encryptedBlobContent.release(); // Line 98
+   *   }
+   * }
    *
    * OBSERVES:
-   * - Partial result cleanup in exception handler
-   * - Line 92: decryptedBlobContent.release() in catch block
-   * - Line 98: encryptedBlobContent.release() in finally block
+   * - Exception during metadata decryption
+   * - Cleanup of partially created decryptedBlobContent
+   * - Cleanup of encryptedBlobContent in finally
    *
    * LEAK SCENARIOS COVERED:
-   * - SAFE-10.4: Exception handling properly releases partial results
+   * - SAFE-10.4: Exception handling releases both buffers
    */
   @Test
-  public void testDecryptJob_ExceptionDuringDecryption_CleanupBoth() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
+  public void testDecryptJob_DecryptionException_BothBuffersReleased() throws Exception {
+    ByteBuf encryptedChunk = Unpooled.buffer(100);
+    encryptedChunk.writeBytes("encrypted".getBytes());
+    encryptedChunk.retain();
 
-    // Configure crypto service to throw exception during metadata decryption
-    cryptoService.setThrowOnMetadataDecrypt(true);
+    // Configure mock to throw during decryption
+    cryptoService.exceptionOnDecryption.set(new GeneralSecurityException("Simulated failure"));
 
     AtomicReference<Exception> exceptionRef = new AtomicReference<>();
     CountDownLatch latch = new CountDownLatch(1);
@@ -259,43 +270,41 @@ public class ByteBufFlowCharacterizationTest {
       latch.countDown();
     };
 
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-    ByteBuffer encryptedMetadata = ByteBuffer.wrap("metadata".getBytes());
-
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, encryptedMetadata,
+    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+    ByteBuffer metadata = ByteBuffer.wrap("metadata".getBytes());
+    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), metadata,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
     latch.await(1, TimeUnit.SECONDS);
 
-    // Exception occurred, but both buffers were properly released
-    // encryptedBuf released in finally block
-    // decryptedBlobContent released in catch block (if it was created)
+    // Both buffers released by DecryptJob exception handling
+    encryptedChunk.release();
+
+    // Clear exception for other tests
+    cryptoService.clearStates();
   }
 
   /**
-   * TEST: DecryptJob exception before decryption - only input cleanup
+   * TEST: DecryptJob exception before decryption - KMS failure
    *
-   * FLOW:
-   * 1. Create DecryptJob with valid encrypted ByteBuf
-   * 2. Mock KMS to throw exception before decryption starts
-   * 3. Only encryptedBlobContent should be released (no decryptedBlobContent created)
+   * PRODUCTION FLOW:
+   * Exception thrown before any ByteBuf allocation
+   * Only finally block runs (no decryptedBlobContent to cleanup)
    *
    * OBSERVES:
-   * - Exception before ByteBuf allocation
-   * - Only finally block runs (not catch block for decryptedBlobContent)
-   *
-   * LEAK SCENARIOS COVERED:
-   * - Exception path variation: no decrypted content created
+   * - Exception from KMS.getKey()
+   * - Only encryptedBlobContent released
+   * - No decryptedBlobContent created
    */
   @Test
-  public void testDecryptJob_ExceptionBeforeDecryption_OnlyInputCleanup() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
+  public void testDecryptJob_KMSException_OnlyInputReleased() throws Exception {
+    ByteBuf encryptedChunk = Unpooled.buffer(100);
+    encryptedChunk.writeBytes("encrypted".getBytes());
+    encryptedChunk.retain();
 
-    // Configure KMS to throw exception
-    kms.setThrowOnGetKey(true);
+    // Configure KMS to throw
+    kms.exceptionToThrow.set(new GeneralSecurityException("KMS failure"));
 
     AtomicReference<Exception> exceptionRef = new AtomicReference<>();
     CountDownLatch latch = new CountDownLatch(1);
@@ -304,17 +313,18 @@ public class ByteBufFlowCharacterizationTest {
       latch.countDown();
     };
 
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
+    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
     latch.await(1, TimeUnit.SECONDS);
 
-    // Exception occurred before decryption, encryptedBuf released in finally block
-    // No decryptedBlobContent created
+    // Only encrypted buffer needs cleanup
+    encryptedChunk.release();
+
+    // Clear exception
+    kms.exceptionToThrow.set(null);
   }
 
   // ============================================================================
@@ -322,128 +332,109 @@ public class ByteBufFlowCharacterizationTest {
   // ============================================================================
 
   /**
-   * TEST: DecryptJob closeJob() called - demonstrates input ByteBuf leak
+   * TEST: DecryptJob closeJob() - replicates CryptoJobHandler.close() (line 68)
    *
-   * FLOW:
-   * 1. Create DecryptJob with encrypted ByteBuf
-   * 2. Call closeJob() instead of run() (simulates CryptoJobHandler shutdown)
-   * 3. closeJob() does NOT release encryptedBlobContent
+   * PRODUCTION FLOW (CryptoJobHandler:64-68):
+   * List<Runnable> pendingTasks = scheduler.shutdownNow();
+   * for (Runnable task : pendingTasks) {
+   *   if (task instanceof CryptoJob) {
+   *     ((CryptoJob) task).closeJob(CLOSED_EXCEPTION);
+   *   }
+   * }
    *
    * OBSERVES:
-   * - closeJob() method (lines 112-114)
-   * - No release of encryptedBlobContent
-   * - This test will DEMONSTRATE the leak identified in LEAK-10.2
+   * - closeJob() method (DecryptJob:112-114)
+   * - BUG: closeJob() does NOT release encryptedBlobContent
+   * - This is the actual production shutdown path
    *
    * LEAK SCENARIOS COVERED:
-   * - 🚨 LEAK-10.2: closeJob() does NOT release input ByteBuf (HIGH RISK)
+   * - 🚨 LEAK-10.2: closeJob() missing release (HIGH RISK)
    *
-   * NOTE: This test demonstrates the production bug. Tracer will show unreleased ByteBuf.
+   * NOTE: Demonstrates actual production bug during CryptoJobHandler shutdown
    */
   @Test
-  public void testDecryptJob_CloseJobPath_InputByteBufLeaked() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
+  public void testDecryptJob_CryptoJobHandlerShutdown_InputLeaked() throws Exception {
+    ByteBuf encryptedChunk = Unpooled.buffer(100);
+    encryptedChunk.writeBytes("pending job data".getBytes());
+    encryptedChunk.retain();
 
     CountDownLatch latch = new CountDownLatch(1);
     Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
       latch.countDown();
     };
 
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
+    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
-    // Call closeJob() instead of run() (simulates shutdown scenario)
-    job.closeJob(new GeneralSecurityException("Simulated shutdown"));
+    // PRODUCTION PATTERN: CryptoJobHandler.close() calls closeJob() on pending jobs
+    job.closeJob(new GeneralSecurityException("CryptoJobHandler closed"));
     latch.await(1, TimeUnit.SECONDS);
 
-    // BUG: encryptedBuf is NOT released by closeJob()
+    // BUG: encryptedChunk duplicate NOT released by closeJob()
+    // encryptedChunk.release(); // Would need this to properly cleanup, but it's leaked!
     // Tracer will show this ByteBuf is leaked
-    // In production, this would need to be fixed by adding release in closeJob()
   }
 
-  // ============================================================================
-  // SECTION 4: DecryptJobResult - Callback Processing Patterns
-  // ============================================================================
-
   /**
-   * TEST: DecryptJobResult processed by callback - deferred cleanup pattern
+   * TEST: Multiple pending jobs at shutdown - demonstrates leak multiplier
    *
-   * FLOW:
-   * 1. DecryptJob completes successfully
-   * 2. Callback stores DecryptJobResult in AtomicReference
-   * 3. Later processing extracts decryptedBlobContent
-   * 4. Store in map (simulating chunkIndexToBuf in GetBlobOperation)
-   * 5. Eventually call cleanup via maybeReleaseDecryptionResultBuffer() pattern
-   *
-   * OBSERVES:
-   * - GetBlobOperation callback pattern (lines 875-884)
-   * - Deferred cleanup via maybeReleaseDecryptionResultBuffer()
-   * - Complex ownership: result -> extracted ByteBuf -> map storage -> manual release
-   *
-   * LEAK SCENARIOS COVERED:
-   * - LEAK-10.5: Callback forgets to call cleanup method
+   * PRODUCTION SCENARIO:
+   * CryptoJobHandler shutting down with multiple queued DecryptJobs
+   * Each job has retained encrypted buffer
+   * All leaked when closeJob() is called
    */
   @Test
-  public void testDecryptJobResult_CallbackPattern_DeferredCleanup() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
+  public void testDecryptJob_MultipleJobsShutdown_MultipleLeaks() throws Exception {
+    int numJobs = 3;
+    ByteBuf[] buffers = new ByteBuf[numJobs];
+    CountDownLatch latch = new CountDownLatch(numJobs);
 
-    // Simulate GetBlobOperation callback pattern
-    AtomicReference<DecryptJob.DecryptJobResult> storedResult = new AtomicReference<>();
-    CountDownLatch latch = new CountDownLatch(1);
-    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
-      // Store result for later processing (GetBlobOperation pattern)
-      storedResult.set(result);
-      latch.countDown();
-    };
+    for (int i = 0; i < numJobs; i++) {
+      buffers[i] = Unpooled.buffer(100);
+      buffers[i].writeBytes(("job " + i).getBytes());
+      buffers[i].retain();
 
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
-        cryptoService, kms, null, metricsTracker, callback);
+      Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
+        latch.countDown();
+      };
 
-    job.run();
+      ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+      DecryptJob job = new DecryptJob(null, encryptedKey, buffers[i].duplicate(), null,
+          cryptoService, kms, null, metricsTracker, callback);
+
+      // Simulate shutdown
+      job.closeJob(new GeneralSecurityException("Shutdown"));
+    }
+
     latch.await(1, TimeUnit.SECONDS);
 
-    // Later processing (simulating GetBlobOperation.handleBody)
-    DecryptJob.DecryptJobResult result = storedResult.getAndSet(null);
-    if (result != null) {
-      ByteBuf decryptedContent = result.getDecryptedBlobContent();
-      if (decryptedContent != null) {
-        // Simulate storing in chunkIndexToBuf map
-        // ... processing ...
-
-        // Cleanup pattern (simulating maybeReleaseDecryptionResultBuffer)
-        ReferenceCountUtil.safeRelease(decryptedContent);
-      }
-    }
+    // BUG: ALL encrypted buffers leaked!
+    // Tracer will show 3 leaked ByteBufs
   }
 
+  // ============================================================================
+  // SECTION 4: DecryptJobResult - No Release Method
+  // ============================================================================
+
   /**
-   * TEST: DecryptJobResult processed then decompressed - ownership transfer
+   * TEST: DecryptJobResult forgotten cleanup - common mistake
    *
-   * FLOW:
-   * 1. DecryptJob completes successfully
-   * 2. Extract decryptedContent from result
-   * 3. Call decompressContent(decryptedContent) - may create new ByteBuf
-   * 4. Store decompressed content
-   * 5. Release both decrypted and decompressed (if different)
-   *
-   * OBSERVES:
-   * - Line 882 in GetBlobOperation: decompressedContent = decompressContent(decryptedContent)
-   * - Whether decompressContent() creates new ByteBuf or returns same
-   * - Proper cleanup of both ByteBufs
+   * SCENARIO:
+   * Developer receives DecryptJobResult
+   * Uses decryptedBlobContent
+   * Forgets to call ReferenceCountUtil.safeRelease()
    *
    * LEAK SCENARIOS COVERED:
-   * - ⚠️ LEAK-10.6: DecompressContent creates new ByteBuf, original not released
+   * - 🚨 LEAK-10.5: Forgot to release decryptedBlobContent
+   *
+   * NOTE: Easy mistake since DecryptJobResult has no release() method
    */
   @Test
-  public void testDecryptJobResult_DecompressionFlow_OwnershipChain() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
+  public void testDecryptJobResult_ForgottenCleanup_Leaked() throws Exception {
+    ByteBuf encryptedChunk = Unpooled.buffer(100);
+    encryptedChunk.writeBytes("encrypted".getBytes());
+    encryptedChunk.retain();
 
     AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
     CountDownLatch latch = new CountDownLatch(1);
@@ -452,344 +443,105 @@ public class ByteBufFlowCharacterizationTest {
       latch.countDown();
     };
 
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
+    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+    DecryptJob job = new DecryptJob(null, encryptedKey, encryptedChunk.duplicate(), null,
         cryptoService, kms, null, metricsTracker, callback);
 
     job.run();
     latch.await(1, TimeUnit.SECONDS);
 
     DecryptJob.DecryptJobResult result = resultRef.get();
-    if (result != null) {
-      ByteBuf decryptedContent = result.getDecryptedBlobContent();
-      if (decryptedContent != null) {
-        // Simulate decompression (in this test, just copy the buffer)
-        ByteBuf decompressedContent = simulateDecompression(decryptedContent);
+    if (result != null && result.getDecryptedBlobContent() != null) {
+      // Use the content
+      ByteBuf decrypted = result.getDecryptedBlobContent();
+      byte[] data = new byte[decrypted.readableBytes()];
+      decrypted.readBytes(data);
 
-        // If decompression creates new buffer, must release BOTH
-        if (decompressedContent != decryptedContent) {
-          // Original decryptedContent must be released
-          decryptedContent.release();
-          // Decompressed content must also be released
-          decompressedContent.release();
-        } else {
-          // Same buffer, release once
-          decryptedContent.release();
-        }
-      }
+      // BUG: Forgot to release!
+      // ReferenceCountUtil.safeRelease(decrypted); // MISSING!
+      // Tracer will show decryptedBlobContent is leaked
     }
-  }
 
-  /**
-   * TEST: DecryptJobResult never cleaned up - demonstrates forgotten release
-   *
-   * FLOW:
-   * 1. DecryptJob completes successfully
-   * 2. Callback receives DecryptJobResult
-   * 3. Extract and use decryptedBlobContent
-   * 4. Forget to call maybeReleaseDecryptionResultBuffer()
-   *
-   * OBSERVES:
-   * - Production scenario where cleanup is forgotten
-   * - Tracer will show decryptedBlobContent never released
-   *
-   * LEAK SCENARIOS COVERED:
-   * - 🚨 LEAK-10.5: Callback never calls cleanup method
-   *
-   * NOTE: This test demonstrates the easy-to-make mistake. Tracer will show leak.
-   */
-  @Test
-  public void testDecryptJobResult_ForgottenCleanup_DecryptedByteBufLeaked() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
-
-    AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
-    CountDownLatch latch = new CountDownLatch(1);
-    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
-      resultRef.set(result);
-      latch.countDown();
-    };
-
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
-        cryptoService, kms, null, metricsTracker, callback);
-
-    job.run();
-    latch.await(1, TimeUnit.SECONDS);
-
-    DecryptJob.DecryptJobResult result = resultRef.get();
-    if (result != null) {
-      ByteBuf decryptedContent = result.getDecryptedBlobContent();
-      if (decryptedContent != null) {
-        // Use the content
-        byte[] data = new byte[decryptedContent.readableBytes()];
-        decryptedContent.readBytes(data);
-
-        // BUG: Forgot to release!
-        // ReferenceCountUtil.safeRelease(decryptedContent); // MISSING!
-        // Tracer will show this ByteBuf is leaked
-      }
-    }
+    encryptedChunk.release();
   }
 
   // ============================================================================
-  // SECTION 5: DecryptJobResult - API Confusion Scenarios
+  // SECTION 5: BoundedNettyByteBufReceive - Normal Flow
   // ============================================================================
 
   /**
-   * TEST: DecryptJobResult API confusion - expecting release() method
+   * TEST: BoundedNettyByteBufReceive in Transmission - replicates production pattern
    *
-   * FLOW:
-   * 1. DecryptJob completes successfully
-   * 2. Callback receives DecryptJobResult
-   * 3. Developer expects result.release() to exist (like EncryptJobResult)
-   * 4. No such method exists
-   * 5. Must manually extract and release ByteBuf
+   * PRODUCTION FLOW (Transmission:79-80):
+   * networkReceive = new NetworkReceive(getConnectionId(),
+   *     new BoundedNettyByteBufReceive(config.socketRequestMaxBytes), time);
    *
-   * OBSERVES:
-   * - API inconsistency between DecryptJobResult and EncryptJobResult
-   * - DecryptJobResult has no release() method
-   * - Correct pattern: ReferenceCountUtil.safeRelease(result.getDecryptedBlobContent())
-   *
-   * LEAK SCENARIOS COVERED:
-   * - ⚠️ LEAK-10.7: No release() method - caller confusion
-   */
-  @Test
-  public void testDecryptJobResult_APIConfusion_ManualReleaseRequired() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
-
-    AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
-    CountDownLatch latch = new CountDownLatch(1);
-    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
-      resultRef.set(result);
-      latch.countDown();
-    };
-
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("encryptedkey".getBytes());
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
-        cryptoService, kms, null, metricsTracker, callback);
-
-    job.run();
-    latch.await(1, TimeUnit.SECONDS);
-
-    DecryptJob.DecryptJobResult result = resultRef.get();
-    if (result != null) {
-      // Developer might expect: result.release() - but this method doesn't exist!
-      // Correct pattern: manually extract and release
-      ByteBuf decryptedContent = result.getDecryptedBlobContent();
-      ReferenceCountUtil.safeRelease(decryptedContent);
-    }
-  }
-
-  // ============================================================================
-  // SECTION 6: BoundedNettyByteBufReceive - Normal Flow
-  // ============================================================================
-
-  /**
-   * TEST: BoundedNettyByteBufReceive normal read - dual ByteBuf lifecycle
-   *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive
-   * 2. Call readFrom() - allocates sizeBuffer (8 bytes)
-   * 3. Read size header - immediately releases sizeBuffer (line 88)
-   * 4. Allocate main buffer based on size
-   * 5. Read payload into buffer
-   * 6. Call release() on BoundedNettyByteBufReceive
+   * CLEANUP (Transmission:181-183):
+   * if (networkReceive != null) {
+   *   networkReceive.getReceivedBytes().release();
+   * }
    *
    * OBSERVES:
-   * - Line 73: sizeBuffer allocation
-   * - Line 88: sizeBuffer.release() (immediate cleanup)
-   * - Line 92: buffer allocation
-   * - AbstractByteBufHolder.release() releases buffer
+   * - Dual ByteBuf lifecycle (sizeBuffer + buffer)
+   * - sizeBuffer immediate release (line 88)
+   * - buffer release via Transmission.release()
    *
    * LEAK SCENARIOS COVERED:
-   * - ✅ SAFE-12.1: sizeBuffer properly managed
+   * - ✅ SAFE-12.1: Proper production cleanup pattern
    */
   @Test
-  public void testBoundedNettyByteBufReceive_NormalRead_DualByteBufLifecycle() throws Exception {
+  public void testBoundedNettyByteBufReceive_ProductionTransmissionPattern() throws Exception {
     int payloadSize = 1000;
     int totalSize = payloadSize + Long.BYTES;
 
-    // Create channel with size header + payload
-    ByteBuffer dataBuffer = ByteBuffer.allocate(totalSize);
-    dataBuffer.putLong(totalSize);
+    ByteBuffer networkData = ByteBuffer.allocate(totalSize);
+    networkData.putLong(totalSize);
     byte[] payload = new byte[payloadSize];
     new Random().nextBytes(payload);
-    dataBuffer.put(payload);
-    dataBuffer.flip();
+    networkData.put(payload);
+    networkData.flip();
 
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
+    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(networkData));
 
-    // Create receive and read data
+    // PRODUCTION PATTERN: Transmission creates BoundedNettyByteBufReceive
     BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
     receive.readFrom(channel);
 
-    // Use content
+    // Use content (simulating request processing)
     ByteBuf content = receive.content();
     if (content != null) {
-      // Read some data
-      content.markReaderIndex();
-      byte[] readData = new byte[Math.min(100, content.readableBytes())];
-      content.readBytes(readData);
-      content.resetReaderIndex();
+      // Process data
     }
 
-    // Proper cleanup
+    // PRODUCTION PATTERN: Transmission.release() (line 182)
     receive.release();
   }
 
   /**
-   * TEST: BoundedNettyByteBufReceive wrapped in Transmission - production pattern
+   * TEST: BoundedNettyByteBufReceive size exceeds max - production validation
    *
-   * FLOW:
-   * 1. Create Transmission (simulating production NetworkClient)
-   * 2. Transmission creates NetworkReceive with BoundedNettyByteBufReceive
-   * 3. Read data via Transmission
-   * 4. Call Transmission.release() - should release BoundedNettyByteBufReceive
-   *
-   * OBSERVES:
-   * - Line 79 in Transmission.java: initializeNetworkReceive()
-   * - Line 182 in Transmission.java: networkReceive.getReceivedBytes().release()
-   * - Production cleanup pattern
-   *
-   * LEAK SCENARIOS COVERED:
-   * - Production context where BoundedNettyByteBufReceive is properly released
-   */
-  @Test
-  public void testBoundedNettyByteBufReceive_TransmissionWrapper_ProperCleanup() throws Exception {
-    int payloadSize = 1000;
-    int totalSize = payloadSize + Long.BYTES;
-
-    ByteBuffer dataBuffer = ByteBuffer.allocate(totalSize);
-    dataBuffer.putLong(totalSize);
-    byte[] payload = new byte[payloadSize];
-    new Random().nextBytes(payload);
-    dataBuffer.put(payload);
-    dataBuffer.flip();
-
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
-
-    // Simulate production pattern (would use Transmission in real code)
-    BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
-    receive.readFrom(channel);
-
-    // Process received data
-    ByteBuf content = receive.content();
-    if (content != null) {
-      // Use content
-    }
-
-    // Production cleanup pattern
-    receive.release();
-  }
-
-  // ============================================================================
-  // SECTION 7: BoundedNettyByteBufReceive - Exception Paths
-  // ============================================================================
-
-  /**
-   * TEST: BoundedNettyByteBufReceive IOException during size read
-   *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive
-   * 2. Mock channel to throw IOException while reading size header
-   * 3. Exception handler should release sizeBuffer (line 81)
+   * PRODUCTION FLOW (BoundedNettyByteBufReceive:89-91):
+   * if (sizeToRead > maxRequestSize) {
+   *   throw new IOException(...);
+   * }
    *
    * OBSERVES:
-   * - Line 81: sizeBuffer.release() in exception handler
-   * - Proper cleanup on IOException during size read
+   * - sizeBuffer released before validation (line 88)
+   * - IOException thrown before buffer allocation
+   * - No leak since buffer not allocated
    *
    * LEAK SCENARIOS COVERED:
-   * - ✅ SAFE: Exception handling releases sizeBuffer
+   * - ✅ SAFE-12.2: Validation happens after sizeBuffer cleanup
    */
   @Test
-  public void testBoundedNettyByteBufReceive_IOExceptionDuringSizeRead_SizeBufferReleased() throws Exception {
-    // Create channel that will cause EOFException
-    ByteBuffer emptyBuffer = ByteBuffer.allocate(0);
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(emptyBuffer));
-
-    BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
-
-    try {
-      receive.readFrom(channel);
-    } catch (IOException e) {
-      // Expected exception
-      // sizeBuffer was released in exception handler (line 81)
-    }
-  }
-
-  /**
-   * TEST: BoundedNettyByteBufReceive IOException during payload read
-   *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive
-   * 2. Successfully read size header
-   * 3. Mock channel to throw IOException while reading payload
-   * 4. Exception handler should release buffer (line 103)
-   *
-   * OBSERVES:
-   * - Line 103: buffer.release() in exception handler
-   * - Proper cleanup on IOException during payload read
-   *
-   * LEAK SCENARIOS COVERED:
-   * - ✅ SAFE-12.3: Exception handling releases buffer
-   */
-  @Test
-  public void testBoundedNettyByteBufReceive_IOExceptionDuringPayloadRead_BufferReleased() throws Exception {
-    int totalSize = 1000;
-
-    // Create channel with size header but no payload (causes EOFException)
-    ByteBuffer dataBuffer = ByteBuffer.allocate(Long.BYTES);
-    dataBuffer.putLong(totalSize);
-    dataBuffer.flip();
-
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
-
-    BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
-
-    try {
-      receive.readFrom(channel);
-      // Try to read again to trigger EOFException
-      receive.readFrom(channel);
-    } catch (IOException e) {
-      // Expected exception
-      // buffer was released in exception handler (line 103)
-    }
-  }
-
-  /**
-   * TEST: BoundedNettyByteBufReceive request size exceeds max
-   *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive with maxRequestSize=1024
-   * 2. Mock channel to return size header > 1024
-   * 3. IOException thrown at line 90
-   * 4. sizeBuffer already released at line 88
-   * 5. buffer not yet allocated
-   *
-   * OBSERVES:
-   * - Line 88: sizeBuffer.release() happens before check
-   * - Line 90: IOException for size > max
-   * - No leak because buffer not allocated yet
-   *
-   * LEAK SCENARIOS COVERED:
-   * - ✅ SAFE-12.2: Exception between size read and buffer allocation
-   */
-  @Test
-  public void testBoundedNettyByteBufReceive_RequestSizeExceedsMax_NoLeak() throws Exception {
+  public void testBoundedNettyByteBufReceive_SizeExceedsMax_NoLeak() throws Exception {
     long hugeSize = 10000;
 
-    // Create channel with size header exceeding max
-    ByteBuffer dataBuffer = ByteBuffer.allocate(Long.BYTES);
-    dataBuffer.putLong(hugeSize);
-    dataBuffer.flip();
+    ByteBuffer networkData = ByteBuffer.allocate(Long.BYTES);
+    networkData.putLong(hugeSize);
+    networkData.flip();
 
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
-
+    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(networkData));
     BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(1024);
 
     try {
@@ -802,40 +554,79 @@ public class ByteBufFlowCharacterizationTest {
   }
 
   // ============================================================================
-  // SECTION 8: BoundedNettyByteBufReceive - Leak Scenarios
+  // SECTION 6: BoundedNettyByteBufReceive - Exception Paths
   // ============================================================================
 
   /**
-   * TEST: BoundedNettyByteBufReceive caller forgets to release
+   * TEST: BoundedNettyByteBufReceive IOException during payload read
    *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive
-   * 2. Successfully read data (allocates buffer)
-   * 3. Use content()
-   * 4. Forget to call release()
+   * PRODUCTION FLOW (BoundedNettyByteBufReceive:100-105):
+   * try {
+   *   ...payload read...
+   * } catch (IOException e) {
+   *   buffer.release(); // Line 103
+   *   throw e;
+   * }
    *
    * OBSERVES:
-   * - Production bug scenario
-   * - Tracer will show buffer is NOT released
+   * - Buffer allocated but payload read fails
+   * - Exception handler releases buffer
+   *
+   * LEAK SCENARIOS COVERED:
+   * - ✅ SAFE-12.3: Exception handling releases buffer
+   */
+  @Test
+  public void testBoundedNettyByteBufReceive_PayloadReadException_BufferReleased() throws Exception {
+    int totalSize = 1000;
+
+    // Size header but no payload
+    ByteBuffer networkData = ByteBuffer.allocate(Long.BYTES);
+    networkData.putLong(totalSize);
+    networkData.flip();
+
+    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(networkData));
+    BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
+
+    try {
+      receive.readFrom(channel);
+      // Try to read more (triggers EOF)
+      receive.readFrom(channel);
+    } catch (IOException e) {
+      // Expected exception
+      // buffer was released in exception handler (line 103)
+    }
+  }
+
+  // ============================================================================
+  // SECTION 7: BoundedNettyByteBufReceive - Leak Scenarios
+  // ============================================================================
+
+  /**
+   * TEST: BoundedNettyByteBufReceive forgotten release - common production bug
+   *
+   * SCENARIO:
+   * Developer reads data from receive
+   * Uses content()
+   * Forgets to call release()
    *
    * LEAK SCENARIOS COVERED:
    * - 🚨 LEAK-12.4: Caller never calls release()
    *
-   * NOTE: This test demonstrates the easy-to-make mistake. Tracer will show leak.
+   * NOTE: Common mistake when not using Transmission wrapper
    */
   @Test
-  public void testBoundedNettyByteBufReceive_ForgottenRelease_BufferLeaked() throws Exception {
+  public void testBoundedNettyByteBufReceive_ForgottenRelease_Leaked() throws Exception {
     int payloadSize = 1000;
     int totalSize = payloadSize + Long.BYTES;
 
-    ByteBuffer dataBuffer = ByteBuffer.allocate(totalSize);
-    dataBuffer.putLong(totalSize);
+    ByteBuffer networkData = ByteBuffer.allocate(totalSize);
+    networkData.putLong(totalSize);
     byte[] payload = new byte[payloadSize];
     new Random().nextBytes(payload);
-    dataBuffer.put(payload);
-    dataBuffer.flip();
+    networkData.put(payload);
+    networkData.flip();
 
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
+    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(networkData));
 
     BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
     receive.readFrom(channel);
@@ -854,241 +645,60 @@ public class ByteBufFlowCharacterizationTest {
   /**
    * TEST: BoundedNettyByteBufReceive incomplete read abandoned
    *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive
-   * 2. Call readFrom() - reads size, allocates buffer
-   * 3. Partial payload read (buffer allocated but not fully filled)
-   * 4. isReadComplete() returns false
-   * 5. Caller abandons receive without calling release()
-   *
-   * OBSERVES:
-   * - Partial read scenario
-   * - Buffer allocated but operation abandoned
-   * - Tracer will show buffer is NOT released
+   * SCENARIO:
+   * Partial payload read (buffer allocated but not full)
+   * Operation abandoned without release
    *
    * LEAK SCENARIOS COVERED:
-   * - ⚠️ LEAK-12.6: Incomplete read, buffer partially filled
-   *
-   * NOTE: This test demonstrates abandoning incomplete read. Tracer will show leak.
+   * - ⚠️ LEAK-12.6: Incomplete read, buffer partially filled, abandoned
    */
   @Test
-  public void testBoundedNettyByteBufReceive_IncompleteReadAbandoned_BufferLeaked() throws Exception {
+  public void testBoundedNettyByteBufReceive_IncompleteRead_Leaked() throws Exception {
     int payloadSize = 1000;
     int totalSize = payloadSize + Long.BYTES;
 
-    // Create channel with size header but only partial payload
-    ByteBuffer dataBuffer = ByteBuffer.allocate(Long.BYTES + 100); // Only 100 bytes of 1000
-    dataBuffer.putLong(totalSize);
+    // Partial payload
+    ByteBuffer networkData = ByteBuffer.allocate(Long.BYTES + 100);
+    networkData.putLong(totalSize);
     byte[] partialPayload = new byte[100];
     new Random().nextBytes(partialPayload);
-    dataBuffer.put(partialPayload);
-    dataBuffer.flip();
+    networkData.put(partialPayload);
+    networkData.flip();
 
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
+    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(networkData));
 
     BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
     receive.readFrom(channel);
 
-    // Check if read is complete
+    // Check incomplete
     if (!receive.isReadComplete()) {
       // BUG: Abandon without releasing!
-      // Buffer was allocated but not fully filled
       // receive.release(); // MISSING!
       // Tracer will show buffer is leaked
     }
   }
 
   /**
-   * TEST: BoundedNettyByteBufReceive replace() method - orphan buffer
+   * TEST: BoundedNettyByteBufReceive replace() orphan buffer
    *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive and read data (buffer allocated)
-   * 2. Create replacement ByteBuf
-   * 3. Call replace() to create new BoundedNettyByteBufReceive
-   * 4. Release only the new instance
-   * 5. Original buffer is leaked
+   * PRODUCTION FLOW (BoundedNettyByteBufReceive:129-131):
+   * public BoundedNettyByteBufReceive replace(ByteBuf content) {
+   *   return new BoundedNettyByteBufReceive(content);
+   * }
    *
    * OBSERVES:
-   * - Lines 129-131: replace() method
-   * - Confusing ownership semantics
-   * - Need to release BOTH original and replaced
+   * - replace() creates new instance
+   * - Original buffer ownership unclear
+   * - Need to release BOTH original and replacement
    *
    * LEAK SCENARIOS COVERED:
-   * - ⚠️ LEAK-12.5: replace() creates orphan buffer
-   *
-   * NOTE: This test demonstrates replace() confusion. Tracer will show leak if only one released.
+   * - ⚠️ LEAK-12.5: replace() orphans original buffer
    */
   @Test
-  public void testBoundedNettyByteBufReceive_ReplaceMethod_OrphanBuffer() throws Exception {
+  public void testBoundedNettyByteBufReceive_Replace_OrphanBuffer() throws Exception {
     int payloadSize = 1000;
     int totalSize = payloadSize + Long.BYTES;
 
-    ByteBuffer dataBuffer = ByteBuffer.allocate(totalSize);
-    dataBuffer.putLong(totalSize);
-    byte[] payload = new byte[payloadSize];
-    new Random().nextBytes(payload);
-    dataBuffer.put(payload);
-    dataBuffer.flip();
-
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
-
-    BoundedNettyByteBufReceive original = new BoundedNettyByteBufReceive(100000);
-    original.readFrom(channel);
-
-    // Create replacement
-    ByteBuf replacementBuf = Unpooled.buffer(100);
-    replacementBuf.writeBytes("replacement".getBytes());
-
-    BoundedNettyByteBufReceive replaced = original.replace(replacementBuf);
-
-    // BUG: Release only the new instance
-    replaced.release();
-
-    // original.release(); // MISSING!
-    // Tracer will show original buffer is leaked
-  }
-
-  /**
-   * TEST: BoundedNettyByteBufReceive replace() proper cleanup
-   *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive and read data
-   * 2. Create replacement ByteBuf
-   * 3. Call replace() to create new BoundedNettyByteBufReceive
-   * 4. Release BOTH original and replaced instances
-   *
-   * OBSERVES:
-   * - Correct usage pattern for replace()
-   * - Both buffers properly released
-   *
-   * LEAK SCENARIOS COVERED:
-   * - Demonstrates correct replace() usage (contrast with leak scenario)
-   */
-  @Test
-  public void testBoundedNettyByteBufReceive_ReplaceMethod_ProperCleanup() throws Exception {
-    int payloadSize = 1000;
-    int totalSize = payloadSize + Long.BYTES;
-
-    ByteBuffer dataBuffer = ByteBuffer.allocate(totalSize);
-    dataBuffer.putLong(totalSize);
-    byte[] payload = new byte[payloadSize];
-    new Random().nextBytes(payload);
-    dataBuffer.put(payload);
-    dataBuffer.flip();
-
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
-
-    BoundedNettyByteBufReceive original = new BoundedNettyByteBufReceive(100000);
-    original.readFrom(channel);
-
-    // Create replacement
-    ByteBuf replacementBuf = Unpooled.buffer(100);
-    replacementBuf.writeBytes("replacement".getBytes());
-
-    BoundedNettyByteBufReceive replaced = original.replace(replacementBuf);
-
-    // Proper cleanup: release BOTH
-    original.release();
-    replaced.release();
-  }
-
-  // ============================================================================
-  // SECTION 9: Cross-Class Integration Flows
-  // ============================================================================
-
-  /**
-   * TEST: Full GetBlobOperation decrypt flow - end-to-end
-   *
-   * FLOW:
-   * 1. Simulate GetBlobOperation receiving encrypted chunk
-   * 2. Create DecryptJob with encrypted ByteBuf
-   * 3. Run DecryptJob - receives DecryptJobResult
-   * 4. Extract decryptedBlobContent
-   * 5. Decompress if needed
-   * 6. Store in chunkIndexToBuf
-   * 7. Cleanup via maybeReleaseDecryptionResultBuffer()
-   *
-   * OBSERVES:
-   * - Complete production flow through GetBlobOperation
-   * - Multiple ownership transfers
-   * - Deferred cleanup pattern
-   *
-   * LEAK SCENARIOS COVERED:
-   * - Integration test covering multiple classes
-   */
-  @Test
-  public void testIntegration_GetBlobOperationDecryptFlow_EndToEnd() throws Exception {
-    // Simulate encrypted chunk received
-    ByteBuf encryptedChunk = Unpooled.buffer(500);
-    encryptedChunk.writeBytes("encrypted chunk data".getBytes());
-
-    // GetBlobOperation would use retainedSlice() before passing to DecryptJob
-    ByteBuf encryptedSlice = encryptedChunk.retainedSlice();
-
-    // Create DecryptJob
-    AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
-    CountDownLatch latch = new CountDownLatch(1);
-    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
-      resultRef.set(result);
-      latch.countDown();
-    };
-
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedSlice, null,
-        cryptoService, kms, null, metricsTracker, callback);
-
-    job.run();
-    latch.await(1, TimeUnit.SECONDS);
-
-    // Process result (simulating GetBlobOperation)
-    DecryptJob.DecryptJobResult result = resultRef.get();
-    if (result != null) {
-      ByteBuf decryptedContent = result.getDecryptedBlobContent();
-      if (decryptedContent != null) {
-        // Simulate decompression
-        ByteBuf decompressedContent = simulateDecompression(decryptedContent);
-
-        // Simulate storing in chunkIndexToBuf
-        // ... use buffer ...
-
-        // Cleanup (maybeReleaseDecryptionResultBuffer pattern)
-        if (decompressedContent != decryptedContent) {
-          decryptedContent.release();
-          decompressedContent.release();
-        } else {
-          ReferenceCountUtil.safeRelease(decryptedContent);
-        }
-      }
-    }
-
-    // Release original chunk
-    encryptedChunk.release();
-  }
-
-  /**
-   * TEST: Full network receive flow - BoundedNettyByteBufReceive in Transmission
-   *
-   * FLOW:
-   * 1. Simulate NetworkClient receiving response
-   * 2. Transmission creates BoundedNettyByteBufReceive
-   * 3. Read from channel (sizeBuffer + buffer lifecycle)
-   * 4. Process received data
-   * 5. Transmission.release() cleanup
-   *
-   * OBSERVES:
-   * - Complete production flow through NetworkClient
-   * - Proper encapsulation and cleanup
-   *
-   * LEAK SCENARIOS COVERED:
-   * - Integration test for network receive path
-   */
-  @Test
-  public void testIntegration_NetworkReceiveFlow_EndToEnd() throws Exception {
-    int payloadSize = 2000;
-    int totalSize = payloadSize + Long.BYTES;
-
-    // Simulate network data
     ByteBuffer networkData = ByteBuffer.allocate(totalSize);
     networkData.putLong(totalSize);
     byte[] payload = new byte[payloadSize];
@@ -1098,372 +708,51 @@ public class ByteBufFlowCharacterizationTest {
 
     ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(networkData));
 
-    // Simulate Transmission/NetworkClient pattern
-    BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
-    receive.readFrom(channel);
+    BoundedNettyByteBufReceive original = new BoundedNettyByteBufReceive(100000);
+    original.readFrom(channel);
 
-    // Process received data
-    ByteBuf content = receive.content();
-    if (content != null) {
-      // Parse response, extract data, etc.
-      byte[] data = new byte[Math.min(200, content.readableBytes())];
-      content.markReaderIndex();
-      content.readBytes(data);
-      content.resetReaderIndex();
-    }
+    // Create replacement
+    ByteBuf replacementBuf = Unpooled.buffer(100);
+    replacementBuf.writeBytes("replacement".getBytes());
 
-    // Proper cleanup (Transmission.release())
-    receive.release();
+    BoundedNettyByteBufReceive replaced = original.replace(replacementBuf);
+
+    // BUG: Only release replacement
+    replaced.release();
+
+    // original.release(); // MISSING!
+    // Tracer will show original buffer is leaked
   }
 
   /**
-   * TEST: DecryptJob shutdown scenario - CryptoJobHandler calls closeJob()
+   * TEST: BoundedNettyByteBufReceive replace() proper cleanup - correct pattern
    *
-   * FLOW:
-   * 1. Create CryptoJobHandler (or simulate)
-   * 2. Submit DecryptJob with encrypted ByteBuf
-   * 3. Before job runs, trigger shutdown
-   * 4. CryptoJobHandler calls closeJob() on pending jobs
-   * 5. Encrypted ByteBuf is leaked
-   *
-   * OBSERVES:
-   * - Shutdown scenario in production
-   * - closeJob() does not release encryptedBlobContent
-   * - Critical leak scenario
-   *
-   * LEAK SCENARIOS COVERED:
-   * - 🚨 LEAK-10.2: closeJob() missing release (production shutdown scenario)
+   * DEMONSTRATES: Correct usage of replace() - release both instances
    */
   @Test
-  public void testIntegration_CryptoJobHandlerShutdown_CloseJobLeak() throws Exception {
-    // Simulate pending job at shutdown
-    ByteBuf encryptedBuf1 = Unpooled.buffer(100);
-    encryptedBuf1.writeBytes("pending job 1".getBytes());
+  public void testBoundedNettyByteBufReceive_Replace_ProperCleanup() throws Exception {
+    int payloadSize = 1000;
+    int totalSize = payloadSize + Long.BYTES;
 
-    ByteBuf encryptedBuf2 = Unpooled.buffer(100);
-    encryptedBuf2.writeBytes("pending job 2".getBytes());
+    ByteBuffer networkData = ByteBuffer.allocate(totalSize);
+    networkData.putLong(totalSize);
+    byte[] payload = new byte[payloadSize];
+    new Random().nextBytes(payload);
+    networkData.put(payload);
+    networkData.flip();
 
-    CountDownLatch latch = new CountDownLatch(2);
-    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
-      latch.countDown();
-    };
+    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(networkData));
 
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
+    BoundedNettyByteBufReceive original = new BoundedNettyByteBufReceive(100000);
+    original.readFrom(channel);
 
-    // Create pending jobs
-    DecryptJob job1 = new DecryptJob(blobId, encryptedKey, encryptedBuf1, null,
-        cryptoService, kms, null, metricsTracker, callback);
+    ByteBuf replacementBuf = Unpooled.buffer(100);
+    replacementBuf.writeBytes("replacement".getBytes());
 
-    DecryptJob job2 = new DecryptJob(blobId, encryptedKey, encryptedBuf2, null,
-        cryptoService, kms, null, metricsTracker, callback);
+    BoundedNettyByteBufReceive replaced = original.replace(replacementBuf);
 
-    // Simulate shutdown - CryptoJobHandler calls closeJob() on pending jobs
-    GeneralSecurityException shutdownException = new GeneralSecurityException("Shutdown");
-    job1.closeJob(shutdownException);
-    job2.closeJob(shutdownException);
-
-    latch.await(1, TimeUnit.SECONDS);
-
-    // BUG: Both encryptedBuf1 and encryptedBuf2 are leaked!
-    // closeJob() does not release them
-    // Tracer will show both ByteBufs leaked
-  }
-
-  // ============================================================================
-  // SECTION 10: Edge Cases and Boundary Conditions
-  // ============================================================================
-
-  /**
-   * TEST: DecryptJob with retainedSlice() ownership
-   *
-   * FLOW:
-   * 1. Allocate encrypted ByteBuf
-   * 2. Create retainedSlice() (increments refCount)
-   * 3. Pass slice to DecryptJob
-   * 4. DecryptJob.run() releases slice
-   * 5. Original buffer still has refCount > 0
-   *
-   * OBSERVES:
-   * - Line 1250 in GetBlobOperation: encryptedBuf.retainedSlice()
-   * - Reference counting with slices
-   * - Proper cleanup of both original and slice
-   *
-   * LEAK SCENARIOS COVERED:
-   * - Production pattern using retainedSlice()
-   */
-  @Test
-  public void testDecryptJob_RetainedSliceOwnership_RefCounting() throws Exception {
-    // Allocate original buffer
-    ByteBuf originalBuf = Unpooled.buffer(200);
-    originalBuf.writeBytes("original encrypted data".getBytes());
-
-    // Create retained slice (increments refCount)
-    ByteBuf slice = originalBuf.retainedSlice();
-
-    AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
-    CountDownLatch latch = new CountDownLatch(1);
-    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
-      resultRef.set(result);
-      latch.countDown();
-    };
-
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-
-    // Pass slice to DecryptJob
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, slice, null,
-        cryptoService, kms, null, metricsTracker, callback);
-
-    job.run();
-    latch.await(1, TimeUnit.SECONDS);
-
-    // Cleanup result
-    DecryptJob.DecryptJobResult result = resultRef.get();
-    if (result != null && result.getDecryptedBlobContent() != null) {
-      result.getDecryptedBlobContent().release();
-    }
-
-    // Release original buffer
-    originalBuf.release();
-
-    // Both slice and original properly released
-  }
-
-  /**
-   * TEST: BoundedNettyByteBufReceive with minimal size (edge case)
-   *
-   * FLOW:
-   * 1. Create BoundedNettyByteBufReceive
-   * 2. Mock channel with minimal size (8 bytes = header only)
-   * 3. Read size header
-   * 4. Buffer allocated with 0 bytes (sizeToRead - Long.BYTES)
-   * 5. Release properly
-   *
-   * OBSERVES:
-   * - Edge case: minimal payload size
-   * - Line 92: buffer allocation with 0 bytes
-   * - Proper cleanup even with empty buffer
-   */
-  @Test
-  public void testBoundedNettyByteBufReceive_MinimalSize_EmptyBuffer() throws Exception {
-    // Minimal size: just the header (8 bytes)
-    int totalSize = Long.BYTES;
-
-    ByteBuffer dataBuffer = ByteBuffer.allocate(totalSize);
-    dataBuffer.putLong(totalSize);
-    dataBuffer.flip();
-
-    ReadableByteChannel channel = Channels.newChannel(new ByteBufferInputStream(dataBuffer));
-
-    BoundedNettyByteBufReceive receive = new BoundedNettyByteBufReceive(100000);
-    receive.readFrom(channel);
-
-    // Buffer allocated with 0 bytes
-    ByteBuf content = receive.content();
-
-    // Proper cleanup
-    receive.release();
-  }
-
-  /**
-   * TEST: DecryptJob double-release protection (if any)
-   *
-   * FLOW:
-   * 1. Create DecryptJob with encrypted ByteBuf
-   * 2. Run DecryptJob - releases encrypted ByteBuf in finally
-   * 3. Manually call release() on DecryptJob (if method exists)
-   * 4. Observe double-release handling
-   *
-   * OBSERVES:
-   * - Whether DecryptJob has double-release protection
-   * - RefCount behavior on double-release
-   *
-   * LEAK SCENARIOS COVERED:
-   * - Edge case: double-release attempts
-   */
-  @Test
-  public void testDecryptJob_DoubleRelease_Protection() throws Exception {
-    ByteBuf encryptedBuf = Unpooled.buffer(100);
-    encryptedBuf.writeBytes("encrypted data".getBytes());
-
-    AtomicReference<DecryptJob.DecryptJobResult> resultRef = new AtomicReference<>();
-    CountDownLatch latch = new CountDownLatch(1);
-    Callback<DecryptJob.DecryptJobResult> callback = (result, exception) -> {
-      resultRef.set(result);
-      latch.countDown();
-    };
-
-    BlobId blobId = createMockBlobId();
-    ByteBuffer encryptedKey = ByteBuffer.wrap("key".getBytes());
-    DecryptJob job = new DecryptJob(blobId, encryptedKey, encryptedBuf, null,
-        cryptoService, kms, null, metricsTracker, callback);
-
-    job.run();
-    latch.await(1, TimeUnit.SECONDS);
-
-    // DecryptJob already released encryptedBuf in finally block
-    // Attempting to release again would cause issues
-    // (In production, don't do this - this is just to observe behavior)
-
-    // Cleanup result
-    DecryptJob.DecryptJobResult result = resultRef.get();
-    if (result != null && result.getDecryptedBlobContent() != null) {
-      result.getDecryptedBlobContent().release();
-    }
-  }
-
-  // ============================================================================
-  // Helper Methods and Mock Classes
-  // ============================================================================
-
-  private BlobId createMockBlobId() {
-    // Create a simple mock BlobId for testing
-    // In real tests, this would use proper BlobId construction
-    return null; // Tests will work with null BlobId for flow characterization
-  }
-
-  private ByteBuf simulateDecompression(ByteBuf input) {
-    // For characterization, just return the same buffer
-    // In production, this might allocate a new buffer
-    return input;
-  }
-
-  /**
-   * Mock CryptoService for testing
-   */
-  private static class MockCryptoService implements CryptoService<SecretKey> {
-    private boolean throwOnMetadataDecrypt = false;
-
-    public void setThrowOnMetadataDecrypt(boolean throwOnMetadataDecrypt) {
-      this.throwOnMetadataDecrypt = throwOnMetadataDecrypt;
-    }
-
-    @Override
-    public ByteBuffer encrypt(ByteBuffer toEncrypt, SecretKey key) throws GeneralSecurityException {
-      byte[] data = new byte[toEncrypt.remaining()];
-      toEncrypt.get(data);
-      return ByteBuffer.wrap(("encrypted_" + new String(data)).getBytes());
-    }
-
-    @Override
-    public ByteBuf encrypt(ByteBuf toEncrypt, SecretKey key) throws GeneralSecurityException {
-      ByteBuf result = Unpooled.buffer(toEncrypt.readableBytes() + 20);
-      result.writeBytes("encrypted_".getBytes());
-      result.writeBytes(toEncrypt);
-      toEncrypt.resetReaderIndex();
-      return result;
-    }
-
-    @Override
-    public ByteBuffer decrypt(ByteBuffer toDecrypt, SecretKey key) throws GeneralSecurityException {
-      if (throwOnMetadataDecrypt) {
-        throw new GeneralSecurityException("Simulated decryption failure");
-      }
-      byte[] data = new byte[toDecrypt.remaining()];
-      toDecrypt.get(data);
-      String decrypted = new String(data).replace("encrypted_", "decrypted_");
-      return ByteBuffer.wrap(decrypted.getBytes());
-    }
-
-    @Override
-    public ByteBuf decrypt(ByteBuf toDecrypt, SecretKey key) throws GeneralSecurityException {
-      if (throwOnMetadataDecrypt) {
-        throw new GeneralSecurityException("Simulated decryption failure");
-      }
-      ByteBuf result = Unpooled.buffer(toDecrypt.readableBytes() + 20);
-      result.writeBytes("decrypted_".getBytes());
-      byte[] data = new byte[toDecrypt.readableBytes()];
-      toDecrypt.readBytes(data);
-      result.writeBytes(data);
-      return result;
-    }
-
-    @Override
-    public ByteBuffer encryptKey(SecretKey toEncrypt, SecretKey key) throws GeneralSecurityException {
-      return ByteBuffer.wrap("encrypted_key".getBytes());
-    }
-
-    @Override
-    public SecretKey decryptKey(ByteBuffer toDecrypt, SecretKey key) throws GeneralSecurityException {
-      return new SecretKeySpec("decrypted_key".getBytes(), "AES");
-    }
-  }
-
-  /**
-   * Mock KeyManagementService for testing
-   */
-  private static class MockKeyManagementService implements KeyManagementService<SecretKey> {
-    private boolean throwOnGetKey = false;
-
-    public void setThrowOnGetKey(boolean throwOnGetKey) {
-      this.throwOnGetKey = throwOnGetKey;
-    }
-
-    @Override
-    public void register(short accountId, short containerId) throws GeneralSecurityException {
-      // No-op for characterization tests
-    }
-
-    @Override
-    public void register(String context) throws GeneralSecurityException {
-      // No-op for characterization tests
-    }
-
-    @Override
-    public SecretKey getKey(RestRequest restRequest, short accountId, short containerId)
-        throws GeneralSecurityException {
-      if (throwOnGetKey) {
-        throw new GeneralSecurityException("Simulated KMS failure");
-      }
-      return new SecretKeySpec("container_key".getBytes(), "AES");
-    }
-
-    @Override
-    public SecretKey getKey(RestRequest restRequest, String context) throws GeneralSecurityException {
-      if (throwOnGetKey) {
-        throw new GeneralSecurityException("Simulated KMS failure");
-      }
-      return new SecretKeySpec("context_key".getBytes(), "AES");
-    }
-
-    @Override
-    public SecretKey getRandomKey() throws GeneralSecurityException {
-      return new SecretKeySpec("random_key".getBytes(), "AES");
-    }
-
-    @Override
-    public void close() {
-      // No-op for characterization tests
-    }
-  }
-
-  /**
-   * Mock CryptoJobMetricsTracker for testing
-   */
-  private static class MockCryptoJobMetricsTracker extends CryptoJobMetricsTracker {
-    MockCryptoJobMetricsTracker() {
-      super(null); // Pass null metrics for characterization tests
-    }
-
-    @Override
-    void onJobProcessingStart() {
-      // No-op for characterization tests
-    }
-
-    @Override
-    void onJobProcessingComplete() {
-      // No-op for characterization tests
-    }
-
-    @Override
-    void onJobResultProcessingStart() {
-      // No-op for characterization tests
-    }
-
-    @Override
-    void onJobResultProcessingComplete() {
-      // No-op for characterization tests
-    }
+    // CORRECT: Release both
+    original.release();
+    replaced.release();
   }
 }
