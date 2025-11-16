@@ -241,7 +241,7 @@ public class ByteBufSliceCapture extends ByteBuf {
   @Override public ByteBuf writeInt(int value) { return delegate.writeInt(value); }
   @Override public ByteBuf writeIntLE(int value) { return delegate.writeIntLE(value); }
   @Override public ByteBuf writeLong(long value) { return delegate.writeLong(value); }
-  @Override public ByteBuf writeLongLE(int value) { return delegate.writeLongLE(value); }
+  @Override public ByteBuf writeLongLE(long value) { return delegate.writeLongLE(value); }
   @Override public ByteBuf writeChar(int value) { return delegate.writeChar(value); }
   @Override public ByteBuf writeFloat(float value) { return delegate.writeFloat(value); }
   @Override public ByteBuf writeDouble(double value) { return delegate.writeDouble(value); }
