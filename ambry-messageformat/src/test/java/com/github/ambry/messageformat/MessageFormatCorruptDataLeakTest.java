@@ -40,15 +40,27 @@ import static org.junit.Assert.fail;
 public class MessageFormatCorruptDataLeakTest {
 
   private final NettyByteBufLeakHelper nettyByteBufLeakHelper = new NettyByteBufLeakHelper();
+  private String originalMaxCachedBufferCapacity;
 
   @Before
   public void before() {
+    // Disable allocator caching so NettyByteBufLeakHelper can track allocations
+    originalMaxCachedBufferCapacity = System.getProperty("io.netty.allocator.maxCachedBufferCapacity");
+    System.setProperty("io.netty.allocator.maxCachedBufferCapacity", "0");
+
     nettyByteBufLeakHelper.beforeTest();
   }
 
   @After
   public void after() {
     nettyByteBufLeakHelper.afterTest();
+
+    // Restore original property
+    if (originalMaxCachedBufferCapacity != null) {
+      System.setProperty("io.netty.allocator.maxCachedBufferCapacity", originalMaxCachedBufferCapacity);
+    } else {
+      System.clearProperty("io.netty.allocator.maxCachedBufferCapacity");
+    }
   }
 
   /**
