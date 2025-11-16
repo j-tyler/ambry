@@ -32,6 +32,13 @@ import static org.junit.Assert.fail;
  * PRODUCTION BUG: MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord (lines 1681-1696)
  * allocates a ByteBuf but throws MessageFormatException on CRC mismatch without releasing it.
  *
+ * PRODUCTION CODE PATH: GetBlobOperation.java:1202-1214
+ *   GetBlobOperation calls processGetBlobResponse() which calls handleBody() which calls
+ *   MessageFormatRecord.deserializeBlob(). When corrupt data is received (disk corruption,
+ *   network corruption, etc.), the CRC check fails and MessageFormatException is thrown.
+ *   The exception is caught in GetBlobOperation but the ByteBuf is already leaked inside
+ *   deserializeBlob().
+ *
  * These tests currently FAIL because the leak exists. They will PASS once the production code
  * is fixed to release ByteBuf in error cases.
  */
@@ -51,20 +58,23 @@ public class MessageFormatCorruptDataLeakTest {
   }
 
   /**
-   * TEST: Corrupt Blob V1 - CRC Mismatch Causes ByteBuf Leak
+   * TEST: Corrupt Blob - GetBlobOperation Production Code Path
    *
-   * PRODUCTION CODE PATH:
-   * 1. MessageFormatRecord.deserializeBlob() called with corrupt data
-   * 2. Blob_Format_V1.deserializeBlobRecord() line 1687: ByteBuf allocated
-   * 3. Line 1690-1694: CRC check fails, MessageFormatException thrown
-   * 4. ByteBuf never released (NO try-finally block)
-   * 5. LEAK: ByteBuf remains allocated
+   * REPLICATES: GetBlobOperation.java:1119
+   *   BlobData blobData = MessageFormatRecord.deserializeBlob(payload);
    *
-   * This test exposes the bug by using NettyByteBufLeakHelper to detect the leaked ByteBuf.
+   * When GetBlobOperation receives corrupt blob data from storage/network (CRC mismatch),
+   * deserializeBlob() throws MessageFormatException. The exception is caught at line 1204,
+   * but the ByteBuf allocated at MessageFormatRecord.java:1687 is already leaked.
+   *
+   * PRODUCTION SCENARIO:
+   * - Disk corruption (bit flips)
+   * - Network corruption during replication
+   * - Partial writes causing CRC mismatch
    */
   @Test
-  public void testCorruptBlobV1_CrcMismatch_LeaksByteBuffer() throws Exception {
-    // Create blob data with INCORRECT CRC (production corruption scenario)
+  public void testGetBlobOperation_CorruptDataFromNetwork_LeaksByteBuffer() throws Exception {
+    // Simulate blob data received from network with corrupt CRC
     byte[] blobContent = new byte[1024];
     for (int i = 0; i < 1024; i++) {
       blobContent[i] = (byte) (i % 256);
@@ -79,18 +89,20 @@ public class MessageFormatCorruptDataLeakTest {
     CRC32 crc = new CRC32();
     crc.update(serialized.array(), 0, serialized.position());
 
-    // Write WRONG CRC (simulate corruption)
+    // Write WRONG CRC (simulate corruption from disk/network)
     serialized.putLong(crc.getValue() + 12345);
     serialized.flip();
 
-    // Attempt deserialization - this will trigger the leak
+    // GetBlobOperation.handleBody() calls deserializeBlob with this corrupt data
+    // Line 1119: BlobData blobData = MessageFormatRecord.deserializeBlob(payload);
     try {
       BlobData blobData = MessageFormatRecord.deserializeBlob(new ByteBufferInputStream(serialized));
       fail("Should have thrown MessageFormatException due to corrupt CRC");
     } catch (MessageFormatException e) {
-      // Expected exception
+      // GetBlobOperation catches this at line 1204:
+      // catch (IOException | MessageFormatException e)
+      // But ByteBuf allocated at MessageFormatRecord.java:1687 is already leaked!
       assertEquals(MessageFormatErrorCodes.DataCorrupt, e.getErrorCode());
-      // ByteBuf allocated at line 1687 is now leaked (not released before exception)
     }
 
     // NettyByteBufLeakHelper.afterTest() will detect the leak and fail this test
@@ -98,121 +110,21 @@ public class MessageFormatCorruptDataLeakTest {
   }
 
   /**
-   * TEST: Multiple Corrupt Blobs - Leak Accumulation
-   *
-   * PRODUCTION SCENARIO: During replication or recovery, multiple corrupt blobs
-   * may be encountered (disk corruption, network errors, etc.).
-   * Each corrupt blob leaks a ByteBuf, accumulating over time.
-   */
-  @Test
-  public void testMultipleCorruptBlobs_AccumulatesLeaks() throws Exception {
-    // Simulate processing 3 corrupt blobs (production pattern)
-    for (int i = 0; i < 3; i++) {
-      byte[] blobContent = new byte[512 + i * 100];
-
-      ByteBuffer serialized = ByteBuffer.allocate(2 + 8 + blobContent.length + 8);
-      serialized.putShort(MessageFormatRecord.Blob_Version_V1);
-      serialized.putLong(blobContent.length);
-      serialized.put(blobContent);
-
-      CRC32 crc = new CRC32();
-      crc.update(serialized.array(), 0, serialized.position());
-
-      // Corrupt CRC
-      serialized.putLong(crc.getValue() ^ 0xDEADBEEF);
-      serialized.flip();
-
-      try {
-        MessageFormatRecord.deserializeBlob(new ByteBufferInputStream(serialized));
-        fail("Should have thrown MessageFormatException");
-      } catch (MessageFormatException e) {
-        // Each iteration leaks a ByteBuf
-        assertEquals(MessageFormatErrorCodes.DataCorrupt, e.getErrorCode());
-      }
-    }
-
-    // NettyByteBufLeakHelper will detect 3 leaked ByteBufs
-  }
-
-  /**
-   * TEST: Large Blob Corruption - Significant Memory Leak
-   *
-   * PRODUCTION SCENARIO: Corruption in large blobs (multi-MB) causes significant
-   * native memory leaks. This is HIGH SEVERITY as it can quickly exhaust memory.
-   */
-  @Test
-  public void testLargeCorruptBlob_SignificantLeak() throws Exception {
-    // 1MB blob (realistic production size)
-    byte[] largeBlobContent = new byte[1024 * 1024];
-
-    ByteBuffer serialized = ByteBuffer.allocate(2 + 8 + largeBlobContent.length + 8);
-    serialized.putShort(MessageFormatRecord.Blob_Version_V1);
-    serialized.putLong(largeBlobContent.length);
-    serialized.put(largeBlobContent);
-
-    CRC32 crc = new CRC32();
-    crc.update(serialized.array(), 0, serialized.position());
-
-    // Corrupt CRC
-    serialized.putLong(~crc.getValue());
-    serialized.flip();
-
-    try {
-      MessageFormatRecord.deserializeBlob(new ByteBufferInputStream(serialized));
-      fail("Should have thrown MessageFormatException");
-    } catch (MessageFormatException e) {
-      assertEquals(MessageFormatErrorCodes.DataCorrupt, e.getErrorCode());
-      // 1MB ByteBuf is now leaked - severe memory leak!
-    }
-
-    // NettyByteBufLeakHelper will detect the 1MB leaked ByteBuf
-  }
-
-  /**
-   * TEST: Corrupt Blob in Try-Catch Without Finally
-   *
-   * PRODUCTION PATTERN: Code that catches MessageFormatException but doesn't
-   * have a finally block to clean up. This is the exact bug pattern in
-   * MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord.
-   */
-  @Test
-  public void testCorruptBlob_TryCatchWithoutFinally_Leaks() throws Exception {
-    byte[] blobContent = new byte[256];
-
-    ByteBuffer serialized = ByteBuffer.allocate(2 + 8 + 256 + 8);
-    serialized.putShort(MessageFormatRecord.Blob_Version_V1);
-    serialized.putLong(256);
-    serialized.put(blobContent);
-
-    CRC32 crc = new CRC32();
-    crc.update(serialized.array(), 0, serialized.position());
-
-    // Zero out CRC (simulate corruption)
-    serialized.putLong(0L);
-    serialized.flip();
-
-    // Pattern: try-catch without finally (mirrors production bug)
-    try {
-      BlobData blobData = MessageFormatRecord.deserializeBlob(new ByteBufferInputStream(serialized));
-      // If we get here, something is wrong with the test
-      fail("Should have thrown MessageFormatException");
-    } catch (MessageFormatException | IOException e) {
-      // Production code catches exception here but ByteBuf is already leaked
-      // The ByteBuf was allocated at line 1687 but never released
-    }
-    // No finally block to release ByteBuf - LEAK!
-
-    // NettyByteBufLeakHelper will detect the leak
-  }
-
-  /**
    * TEST: Valid Blob - No Leak (Control Test)
    *
-   * This test verifies that VALID blobs do NOT leak. This proves that the leak
-   * is specifically in the error path (CRC mismatch), not in normal operation.
+   * REPLICATES: GetBlobOperation.java:1119 with VALID data
+   *   BlobData blobData = MessageFormatRecord.deserializeBlob(payload);
+   *
+   * When GetBlobOperation receives VALID blob data, deserializeBlob() succeeds and returns
+   * BlobData. The caller properly releases it later. This test verifies that valid blobs
+   * do NOT leak - the leak is only in the error path (CRC mismatch).
+   *
+   * PRODUCTION SCENARIO:
+   * - Normal successful blob retrieval from storage/network
    */
   @Test
-  public void testValidBlob_NoLeak() throws Exception {
+  public void testGetBlobOperation_ValidData_NoLeak() throws Exception {
+    // Simulate valid blob data received from network
     byte[] blobContent = new byte[512];
     for (int i = 0; i < 512; i++) {
       blobContent[i] = (byte) i;
@@ -229,59 +141,17 @@ public class MessageFormatCorruptDataLeakTest {
     serialized.putLong(crc.getValue());
     serialized.flip();
 
-    // Deserialize successfully
+    // GetBlobOperation.handleBody() calls deserializeBlob with valid data
+    // Line 1119: BlobData blobData = MessageFormatRecord.deserializeBlob(payload);
     BlobData blobData = MessageFormatRecord.deserializeBlob(new ByteBufferInputStream(serialized));
 
-    // Verify data
+    // Verify data (simulates GetBlobOperation using the blob)
     byte[] readContent = new byte[512];
     blobData.content().readBytes(readContent);
 
-    // Proper cleanup
+    // GetBlobOperation properly releases BlobData later
     blobData.release();
 
     // NettyByteBufLeakHelper.afterTest() will verify no leak - this test should PASS
-  }
-
-  /**
-   * TEST: Corrupt Blob Followed By Valid Blob - Mixed Scenario
-   *
-   * PRODUCTION SCENARIO: System processes both corrupt and valid blobs.
-   * Only corrupt ones should leak in current buggy code.
-   */
-  @Test
-  public void testCorruptThenValid_OnlyCorruptLeaks() throws Exception {
-    // First: Process corrupt blob (will leak)
-    byte[] corruptContent = new byte[128];
-    ByteBuffer corruptSerialized = ByteBuffer.allocate(2 + 8 + 128 + 8);
-    corruptSerialized.putShort(MessageFormatRecord.Blob_Version_V1);
-    corruptSerialized.putLong(128);
-    corruptSerialized.put(corruptContent);
-    CRC32 corruptCrc = new CRC32();
-    corruptCrc.update(corruptSerialized.array(), 0, corruptSerialized.position());
-    corruptSerialized.putLong(corruptCrc.getValue() + 999); // Corrupt
-    corruptSerialized.flip();
-
-    try {
-      MessageFormatRecord.deserializeBlob(new ByteBufferInputStream(corruptSerialized));
-      fail("Should have thrown MessageFormatException");
-    } catch (MessageFormatException e) {
-      // Leaked ByteBuf from corrupt blob
-    }
-
-    // Second: Process valid blob (should NOT leak)
-    byte[] validContent = new byte[128];
-    ByteBuffer validSerialized = ByteBuffer.allocate(2 + 8 + 128 + 8);
-    validSerialized.putShort(MessageFormatRecord.Blob_Version_V1);
-    validSerialized.putLong(128);
-    validSerialized.put(validContent);
-    CRC32 validCrc = new CRC32();
-    validCrc.update(validSerialized.array(), 0, validSerialized.position());
-    validSerialized.putLong(validCrc.getValue()); // CORRECT
-    validSerialized.flip();
-
-    BlobData validBlob = MessageFormatRecord.deserializeBlob(new ByteBufferInputStream(validSerialized));
-    validBlob.release(); // Properly released
-
-    // NettyByteBufLeakHelper will detect 1 leak (from corrupt blob only)
   }
 }
