@@ -21,6 +21,7 @@ import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.util.ByteProcessor;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
@@ -99,6 +100,8 @@ public class MessageFormatCorruptDataLeakTest {
    *   <li>{@code slice(int, int)} - INTERCEPTED to capture slices</li>
    *   <li>{@code readerIndex()} - Used by Utils after creating slice</li>
    *   <li>{@code readerIndex(int)} - Used by Utils to update position after slice</li>
+   *   <li>{@code order()} - Required by ByteBuf abstract class contract</li>
+   *   <li>{@code order(ByteOrder)} - Required by ByteBuf abstract class contract</li>
    * </ul>
    *
    * <p><b>All other methods:</b> Throw {@link UnsupportedOperationException} to ensure
@@ -134,6 +137,17 @@ public class MessageFormatCorruptDataLeakTest {
     @Override
     public ByteBuf readerIndex(int readerIndex) {
       return delegate.readerIndex(readerIndex);
+    }
+
+    // DELEGATED: ByteOrder methods (required by ByteBuf abstract class)
+    @Override
+    public ByteOrder order() {
+      return delegate.order();
+    }
+
+    @Override
+    public ByteBuf order(ByteOrder endianness) {
+      return delegate.order(endianness);
     }
 
     // All other methods throw UnsupportedOperationException
