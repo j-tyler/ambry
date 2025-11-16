@@ -16,8 +16,15 @@ package com.github.ambry.messageformat;
 import com.github.ambry.utils.CrcInputStream;
 import com.github.ambry.utils.NettyByteBufDataInputStream;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocator;
-import io.netty.buffer.WrappedByteBuf;
+import io.netty.util.ByteProcessor;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.GatheringByteChannel;
+import java.nio.channels.ScatteringByteChannel;
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -26,6 +33,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
@@ -37,9 +45,10 @@ import static org.junit.Assert.fail;
  * validation fails, causing a memory leak in the error path.</p>
  *
  * <p><b>Test Strategy:</b><br>
- * Uses {@link ByteBufSliceCapture}, a {@link WrappedByteBuf} subclass that intercepts
- * {@code slice(int, int)} calls to capture created slices. After deserialization (successful
- * or failed), verifies slice reference counts to detect leaks.</p>
+ * Extends {@link NettyByteBufDataInputStream} to override {@code getBuffer()}, returning a
+ * minimal ByteBuf wrapper that intercepts {@code slice(int, int)} calls. This wrapper only
+ * implements methods actually used by the test and production code, throwing
+ * {@link UnsupportedOperationException} for all others to ensure explicit API contract.</p>
  *
  * <p><b>Test Coverage:</b></p>
  * <ul>
@@ -50,8 +59,8 @@ import static org.junit.Assert.fail;
  * <p><b>Design Rationale:</b><br>
  * This test intentionally uses production classes ({@code MessageFormatRecord},
  * {@code Utils}, {@code NettyByteBufDataInputStream}) without mocking to ensure it detects
- * real-world leaks. ByteBufSliceCapture provides minimal interception while delegating
- * all other behavior to Netty's {@link WrappedByteBuf}.</p>
+ * real-world leaks. The minimal ByteBuf wrapper approach makes the API contract explicit
+ * and causes loud failures if production code changes to use unsupported methods.</p>
  */
 public class MessageFormatCorruptDataLeakTest {
 
@@ -59,80 +68,257 @@ public class MessageFormatCorruptDataLeakTest {
   private final List<ByteBuf> leakedBuffersToClean = new ArrayList<>();
 
   /**
-   * Wrapper that captures ByteBuf slices created during operations.
+   * NettyByteBufDataInputStream that captures ByteBuf slices created during deserialization.
    *
-   * Extends {@link WrappedByteBuf} to automatically delegate all ByteBuf methods to the underlying buffer.
-   * Only overrides slice creation methods to intercept and track created slices.
-   *
-   * <p><b>Methods used by this test:</b></p>
-   * <ul>
-   *   <li>{@code writeShort(int)} - Write blob version</li>
-   *   <li>{@code writeLong(long)} - Write blob size and CRC</li>
-   *   <li>{@code writeBytes(byte[])} - Write blob content</li>
-   *   <li>{@code nioBuffer(int, int)} - Get NIO buffer for CRC calculation</li>
-   *   <li>{@code writerIndex()} - Get current write position for CRC calculation</li>
-   * </ul>
-   *
-   * <p><b>Methods used by production code (Utils.readNettyByteBufFromCrcInputStream):</b></p>
-   * <ul>
-   *   <li>{@code slice(int, int)} - Create slice (INTERCEPTED - this is what we're testing)</li>
-   *   <li>{@code readerIndex(int)} - Update read position after slice</li>
-   * </ul>
-   *
-   * <p>All other WrappedByteBuf methods are inherited but not used by this test.</p>
+   * <p>Overrides {@code getBuffer()} to return a {@link SliceCapturingByteBuf} wrapper that
+   * intercepts {@code slice(int, int)} calls made by {@code Utils.readNettyByteBufFromCrcInputStream}.</p>
    */
-  private static class ByteBufSliceCapture extends WrappedByteBuf {
+  private static class CapturingInputStream extends NettyByteBufDataInputStream {
+    private final SliceCapturingByteBuf wrapper;
+
+    public CapturingInputStream(ByteBuf buffer) {
+      super(buffer);
+      this.wrapper = new SliceCapturingByteBuf(buffer);
+    }
+
+    @Override
+    public ByteBuf getBuffer() {
+      return wrapper;
+    }
+
+    public List<ByteBuf> getCapturedSlices() {
+      return wrapper.getCapturedSlices();
+    }
+  }
+
+  /**
+   * Minimal ByteBuf wrapper that captures slice creation and delegates only necessary methods.
+   *
+   * <p><b>Implemented methods (required by test and production code):</b></p>
+   * <ul>
+   *   <li>{@code slice(int, int)} - INTERCEPTED to capture slices</li>
+   *   <li>{@code readerIndex()} - Used by Utils after creating slice</li>
+   *   <li>{@code readerIndex(int)} - Used by Utils to update position after slice</li>
+   * </ul>
+   *
+   * <p><b>All other methods:</b> Throw {@link UnsupportedOperationException} to ensure
+   * explicit API contract. If production code calls an unsupported method, the test fails
+   * loudly rather than silently delegating unexpected behavior.</p>
+   */
+  private static class SliceCapturingByteBuf extends ByteBuf {
+    private final ByteBuf delegate;
     private final List<ByteBuf> capturedSlices = new ArrayList<>();
 
-    public ByteBufSliceCapture(ByteBuf delegate) {
-      super(delegate);
+    public SliceCapturingByteBuf(ByteBuf delegate) {
+      this.delegate = delegate;
     }
 
     public List<ByteBuf> getCapturedSlices() {
       return Collections.unmodifiableList(capturedSlices);
     }
 
+    // INTERCEPTED: Capture slice creation (called by Utils.readNettyByteBufFromCrcInputStream)
     @Override
     public ByteBuf slice(int index, int length) {
-      ByteBuf slice = super.slice(index, length);
+      ByteBuf slice = delegate.slice(index, length);
       capturedSlices.add(slice);
       return slice;
     }
 
+    // DELEGATED: Required by Utils.readNettyByteBufFromCrcInputStream
     @Override
-    public ByteBuf slice() {
-      ByteBuf slice = super.slice();
-      capturedSlices.add(slice);
-      return slice;
+    public int readerIndex() {
+      return delegate.readerIndex();
     }
 
     @Override
-    public ByteBuf retainedSlice() {
-      ByteBuf slice = super.retainedSlice();
-      capturedSlices.add(slice);
-      return slice;
+    public ByteBuf readerIndex(int readerIndex) {
+      return delegate.readerIndex(readerIndex);
     }
 
-    @Override
-    public ByteBuf retainedSlice(int index, int length) {
-      ByteBuf slice = super.retainedSlice(index, length);
-      capturedSlices.add(slice);
-      return slice;
-    }
+    // All other methods throw UnsupportedOperationException
+    private static final String UNSUPPORTED_MSG =
+        "This method is not implemented by SliceCapturingByteBuf. " +
+        "If production code requires this method, add explicit delegation.";
 
-    @Override
-    public ByteBuf readSlice(int length) {
-      ByteBuf slice = super.readSlice(length);
-      capturedSlices.add(slice);
-      return slice;
-    }
-
-    @Override
-    public ByteBuf readRetainedSlice(int length) {
-      ByteBuf slice = super.readRetainedSlice(length);
-      capturedSlices.add(slice);
-      return slice;
-    }
+    @Override public int capacity() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf capacity(int newCapacity) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int maxCapacity() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBufAllocator alloc() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf unwrap() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean isDirect() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean isReadOnly() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf asReadOnly() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int writerIndex() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writerIndex(int writerIndex) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setIndex(int readerIndex, int writerIndex) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readableBytes() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int writableBytes() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int maxWritableBytes() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean isReadable() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean isReadable(int size) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean isWritable() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean isWritable(int size) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf clear() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf markReaderIndex() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf resetReaderIndex() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf markWriterIndex() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf resetWriterIndex() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf discardReadBytes() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf discardSomeReadBytes() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf ensureWritable(int minWritableBytes) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int ensureWritable(int minWritableBytes, boolean force) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean getBoolean(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public byte getByte(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public short getUnsignedByte(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public short getShort(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public short getShortLE(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getUnsignedShort(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getUnsignedShortLE(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getMedium(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getMediumLE(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getUnsignedMedium(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getUnsignedMediumLE(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getInt(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getIntLE(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long getUnsignedInt(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long getUnsignedIntLE(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long getLong(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long getLongLE(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public char getChar(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public float getFloat(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public double getDouble(int index) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf getBytes(int index, ByteBuf dst) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf getBytes(int index, ByteBuf dst, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf getBytes(int index, ByteBuf dst, int dstIndex, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf getBytes(int index, byte[] dst) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf getBytes(int index, byte[] dst, int dstIndex, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf getBytes(int index, ByteBuffer dst) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf getBytes(int index, java.io.OutputStream out, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getBytes(int index, GatheringByteChannel out, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int getBytes(int index, FileChannel out, long position, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public CharSequence getCharSequence(int index, int length, Charset charset) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setBoolean(int index, boolean value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setByte(int index, int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setShort(int index, int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setShortLE(int index, int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setMedium(int index, int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setMediumLE(int index, int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setInt(int index, int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setIntLE(int index, int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setLong(int index, long value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setLongLE(int index, long value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setChar(int index, int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setFloat(int index, float value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setDouble(int index, double value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setBytes(int index, ByteBuf src) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setBytes(int index, ByteBuf src, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setBytes(int index, ByteBuf src, int srcIndex, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setBytes(int index, byte[] src) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setBytes(int index, byte[] src, int srcIndex, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setBytes(int index, ByteBuffer src) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int setBytes(int index, java.io.InputStream in, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int setBytes(int index, ScatteringByteChannel in, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int setBytes(int index, FileChannel in, long position, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf setZero(int index, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int setCharSequence(int index, CharSequence sequence, Charset charset) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean readBoolean() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public byte readByte() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public short readUnsignedByte() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public short readShort() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public short readShortLE() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readUnsignedShort() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readUnsignedShortLE() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readMedium() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readMediumLE() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readUnsignedMedium() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readUnsignedMediumLE() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readInt() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readIntLE() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long readUnsignedInt() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long readUnsignedIntLE() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long readLong() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long readLongLE() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public char readChar() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public float readFloat() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public double readDouble() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readBytes(int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readSlice(int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readRetainedSlice(int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readBytes(ByteBuf dst) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readBytes(ByteBuf dst, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readBytes(ByteBuf dst, int dstIndex, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readBytes(byte[] dst) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readBytes(byte[] dst, int dstIndex, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readBytes(ByteBuffer dst) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf readBytes(java.io.OutputStream out, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readBytes(GatheringByteChannel out, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public CharSequence readCharSequence(int length, Charset charset) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int readBytes(FileChannel out, long position, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf skipBytes(int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeBoolean(boolean value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeByte(int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeShort(int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeShortLE(int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeMedium(int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeMediumLE(int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeInt(int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeIntLE(int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeLong(long value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeLongLE(long value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeChar(int value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeFloat(float value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeDouble(double value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeBytes(ByteBuf src) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeBytes(ByteBuf src, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeBytes(ByteBuf src, int srcIndex, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeBytes(byte[] src) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeBytes(byte[] src, int srcIndex, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeBytes(ByteBuffer src) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int writeBytes(java.io.InputStream in, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int writeBytes(ScatteringByteChannel in, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int writeBytes(FileChannel in, long position, int length) throws IOException { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf writeZero(int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int writeCharSequence(CharSequence sequence, Charset charset) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int indexOf(int fromIndex, int toIndex, byte value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int bytesBefore(byte value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int bytesBefore(int length, byte value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int bytesBefore(int index, int length, byte value) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int forEachByte(ByteProcessor processor) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int forEachByte(int index, int length, ByteProcessor processor) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int forEachByteDesc(ByteProcessor processor) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int forEachByteDesc(int index, int length, ByteProcessor processor) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf copy() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf copy(int index, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf slice() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf retainedSlice() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf retainedSlice(int index, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf duplicate() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf retainedDuplicate() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int nioBufferCount() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuffer nioBuffer() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuffer nioBuffer(int index, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuffer internalNioBuffer(int index, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuffer[] nioBuffers() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuffer[] nioBuffers(int index, int length) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean hasArray() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public byte[] array() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int arrayOffset() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean hasMemoryAddress() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public long memoryAddress() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public String toString(Charset charset) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public String toString(int index, int length, Charset charset) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int hashCode() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean equals(Object obj) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int compareTo(ByteBuf buffer) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public String toString() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf retain(int increment) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf retain() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf touch() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public ByteBuf touch(Object hint) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public int refCnt() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean release() { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
+    @Override public boolean release(int decrement) { throw new UnsupportedOperationException(UNSUPPORTED_MSG); }
   }
 
   @After
@@ -153,7 +339,7 @@ public class MessageFormatCorruptDataLeakTest {
    * allocates a ByteBuf slice via {@code Utils.readNettyByteBufFromCrcInputStream} but doesn't release
    * it when CRC validation fails, causing a memory leak.</p>
    *
-   * <p><b>Test mechanism:</b> Uses {@link ByteBufSliceCapture} to intercept {@code slice(int, int)}
+   * <p><b>Test mechanism:</b> Uses {@link CapturingInputStream} to intercept {@code slice(int, int)}
    * calls during deserialization. After the exception is thrown, verifies the captured slice has
    * {@code refCnt() == 0}, proving it was properly released.</p>
    *
@@ -168,26 +354,23 @@ public class MessageFormatCorruptDataLeakTest {
     // Allocate pooled ByteBuf (pooled to test production scenario)
     ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 1024 + 8);
 
-    // Wrap in slice capture to intercept slice creation
-    ByteBufSliceCapture capture = new ByteBufSliceCapture(inputBuf);
-
     try {
       // Serialize blob data with CORRUPT CRC
       // Note: Content doesn't matter since CRC will be corrupted anyway
       byte[] blobContent = new byte[1024];
 
-      capture.writeShort(MessageFormatRecord.Blob_Version_V1);
-      capture.writeLong(1024);
-      capture.writeBytes(blobContent);
+      inputBuf.writeShort(MessageFormatRecord.Blob_Version_V1);
+      inputBuf.writeLong(1024);
+      inputBuf.writeBytes(blobContent);
 
       // Calculate correct CRC but write WRONG value to trigger validation failure
       CRC32 crc = new CRC32();
-      crc.update(capture.nioBuffer(0, capture.writerIndex()));
-      capture.writeLong(crc.getValue() + 1); // Corrupt CRC (any non-zero offset corrupts it)
+      crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
+      inputBuf.writeLong(crc.getValue() + 1); // Corrupt CRC (any non-zero offset corrupts it)
 
-      // Create NettyByteBufDataInputStream with our capture wrapper
-      NettyByteBufDataInputStream inputStream = new NettyByteBufDataInputStream(capture);
-      CrcInputStream crcStream = new CrcInputStream(inputStream);
+      // Create CapturingInputStream to intercept slice creation
+      CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
+      CrcInputStream crcStream = new CrcInputStream(capturingStream);
 
       // Attempt deserialization - this creates a ByteBuf slice via Utils.readNettyByteBufFromCrcInputStream
       try {
@@ -200,7 +383,7 @@ public class MessageFormatCorruptDataLeakTest {
       }
 
       // Verify exactly one slice was created during deserialization
-      List<ByteBuf> capturedSlices = capture.getCapturedSlices();
+      List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
       assertEquals("Expected exactly one slice to be created by Utils.readNettyByteBufFromCrcInputStream",
           1, capturedSlices.size());
 
@@ -243,25 +426,25 @@ public class MessageFormatCorruptDataLeakTest {
    */
   @Test
   public void testDeserializeBlobWithValidCrc() throws Exception {
+    // Allocate pooled ByteBuf (pooled to test production scenario)
     ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 8 + 512 + 8);
-
-    ByteBufSliceCapture capture = new ByteBufSliceCapture(inputBuf);
 
     try {
       // Serialize blob data with CORRECT CRC
       byte[] blobContent = new byte[512];
 
-      capture.writeShort(MessageFormatRecord.Blob_Version_V1);
-      capture.writeLong(512);
-      capture.writeBytes(blobContent);
+      inputBuf.writeShort(MessageFormatRecord.Blob_Version_V1);
+      inputBuf.writeLong(512);
+      inputBuf.writeBytes(blobContent);
 
       // Calculate and write CORRECT CRC (enables successful deserialization)
       CRC32 crc = new CRC32();
-      crc.update(capture.nioBuffer(0, capture.writerIndex()));
-      capture.writeLong(crc.getValue());
+      crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
+      inputBuf.writeLong(crc.getValue());
 
-      NettyByteBufDataInputStream inputStream = new NettyByteBufDataInputStream(capture);
-      CrcInputStream crcStream = new CrcInputStream(inputStream);
+      // Create CapturingInputStream to intercept slice creation
+      CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
+      CrcInputStream crcStream = new CrcInputStream(capturingStream);
 
       // Deserialize successfully
       BlobData blobData = MessageFormatRecord.deserializeBlob(crcStream);
@@ -272,7 +455,7 @@ public class MessageFormatCorruptDataLeakTest {
       blobData.content().readBytes(readContent);
 
       // Verify exactly one slice was created
-      List<ByteBuf> capturedSlices = capture.getCapturedSlices();
+      List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
       assertEquals("Expected exactly one slice to be created by Utils.readNettyByteBufFromCrcInputStream",
           1, capturedSlices.size());
 
