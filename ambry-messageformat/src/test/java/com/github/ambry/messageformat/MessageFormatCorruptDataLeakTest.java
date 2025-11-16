@@ -13,18 +13,17 @@
  */
 package com.github.ambry.messageformat;
 
-import com.github.ambry.utils.ByteBufSliceCapture;
 import com.github.ambry.utils.CrcInputStream;
 import com.github.ambry.utils.NettyByteBufDataInputStream;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.buffer.WrappedByteBuf;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.zip.CRC32;
 import org.junit.After;
 import org.junit.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
@@ -41,17 +40,73 @@ import static org.junit.Assert.fail;
  * deserialization, allowing verification of proper cleanup.
  */
 public class MessageFormatCorruptDataLeakTest {
-  private static final Logger logger = LoggerFactory.getLogger(MessageFormatCorruptDataLeakTest.class);
 
   // Track leaked buffers for cleanup in @After
   private final List<ByteBuf> leakedBuffersToClean = new ArrayList<>();
+
+  /**
+   * Wrapper that captures ByteBuf slices created during operations.
+   * Extends WrappedByteBuf for automatic delegation of all ByteBuf methods.
+   */
+  private static class ByteBufSliceCapture extends WrappedByteBuf {
+    private final List<ByteBuf> capturedSlices = new ArrayList<>();
+
+    public ByteBufSliceCapture(ByteBuf delegate) {
+      super(delegate);
+    }
+
+    public List<ByteBuf> getCapturedSlices() {
+      return Collections.unmodifiableList(capturedSlices);
+    }
+
+    @Override
+    public ByteBuf slice(int index, int length) {
+      ByteBuf slice = super.slice(index, length);
+      capturedSlices.add(slice);
+      return slice;
+    }
+
+    @Override
+    public ByteBuf slice() {
+      ByteBuf slice = super.slice();
+      capturedSlices.add(slice);
+      return slice;
+    }
+
+    @Override
+    public ByteBuf retainedSlice() {
+      ByteBuf slice = super.retainedSlice();
+      capturedSlices.add(slice);
+      return slice;
+    }
+
+    @Override
+    public ByteBuf retainedSlice(int index, int length) {
+      ByteBuf slice = super.retainedSlice(index, length);
+      capturedSlices.add(slice);
+      return slice;
+    }
+
+    @Override
+    public ByteBuf readSlice(int length) {
+      ByteBuf slice = super.readSlice(length);
+      capturedSlices.add(slice);
+      return slice;
+    }
+
+    @Override
+    public ByteBuf readRetainedSlice(int length) {
+      ByteBuf slice = super.readRetainedSlice(length);
+      capturedSlices.add(slice);
+      return slice;
+    }
+  }
 
   @After
   public void cleanup() {
     // Clean up any leaked buffers to prevent cross-test contamination
     for (ByteBuf leaked : leakedBuffersToClean) {
       if (leaked.refCnt() > 0) {
-        logger.warn("Cleaning up leaked buffer with refCnt={}", leaked.refCnt());
         leaked.release(leaked.refCnt());
       }
     }
@@ -117,8 +172,6 @@ public class MessageFormatCorruptDataLeakTest {
       ByteBuf slice = capturedSlices.get(0);
       int sliceRefCnt = slice.refCnt();
 
-      logger.info("Slice refCnt after exception: {}", sliceRefCnt);
-
       // Track for cleanup if leaked
       if (sliceRefCnt > 0) {
         leakedBuffersToClean.add(slice);
@@ -183,14 +236,11 @@ public class MessageFormatCorruptDataLeakTest {
       assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());
 
       ByteBuf slice = capturedSlices.get(0);
-      int refCntBeforeRelease = slice.refCnt();
-      logger.info("Slice refCnt before BlobData.release(): {}", refCntBeforeRelease);
 
       // Proper cleanup - this should release the slice
       blobData.release();
 
       int refCntAfterRelease = slice.refCnt();
-      logger.info("Slice refCnt after BlobData.release(): {}", refCntAfterRelease);
 
       // Assert no leak: slice should be released (refCnt = 0)
       assertEquals("Expected no leak: slice refCnt should be 0 after BlobData.release()",
