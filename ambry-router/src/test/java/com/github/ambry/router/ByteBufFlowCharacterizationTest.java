@@ -64,6 +64,7 @@ public class ByteBufFlowCharacterizationTest {
   private MockKeyManagementService kms;
   private CryptoJobMetricsTracker metricsTracker;
   private ClusterMap clusterMap;
+  private NonBlockingRouterMetrics routerMetrics;
   private static final int DEFAULT_KEY_SIZE = 64;
 
   @Before
@@ -75,8 +76,9 @@ public class ByteBufFlowCharacterizationTest {
     // Generate valid hex-encoded key (same pattern as CryptoJobHandlerTest)
     String defaultKey = TestUtils.getRandomKey(DEFAULT_KEY_SIZE);
     kms = new MockKeyManagementService(new KMSConfig(verifiableProperties), defaultKey);
-    metricsTracker = new CryptoJobMetricsTracker(null);
     clusterMap = new MockClusterMap();
+    routerMetrics = new NonBlockingRouterMetrics(clusterMap, null);
+    metricsTracker = new CryptoJobMetricsTracker(routerMetrics.decryptJobMetrics);
   }
 
   @After
