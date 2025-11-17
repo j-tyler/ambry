@@ -73,9 +73,10 @@ public class NettyResponseChannelByteBufLeakTest {
     nettyConfig = new NettyConfig(verifiableProperties);
     performanceConfig = new PerformanceConfig(verifiableProperties);
 
-    // Create channel with handler in constructor to ensure it's registered and active
+    // Create channel with ChunkedWriteHandler like production
+    channel = new EmbeddedChannel();
     ChunkedWriteHandler chunkedWriteHandler = new ChunkedWriteHandler();
-    channel = new EmbeddedChannel(chunkedWriteHandler);
+    channel.pipeline().addLast(chunkedWriteHandler);
   }
 
   @After
@@ -121,6 +122,9 @@ public class NettyResponseChannelByteBufLeakTest {
     byteBuffer.put(new byte[100]);
     byteBuffer.flip();
 
+    // Verify channel is active before writing
+    assertTrue("Channel should be active before write", channel.isActive());
+
     CountDownLatch latch = new CountDownLatch(1);
     responseChannel.write(byteBuffer, new Callback<Long>() {
       @Override
@@ -130,7 +134,8 @@ public class NettyResponseChannelByteBufLeakTest {
       }
     });
 
-    // Get the wrapper ByteBuf from the channel before processing
+    // Get the wrapper ByteBuf from the channel BEFORE processing
+    // We need the reference now so we can check its refCnt after resolveChunk()
     ByteBuf wrapper = getWrapperFromChannel(responseChannel);
     assertNotNull("Wrapper ByteBuf should exist in chunksToWrite queue after write() call", wrapper);
 
