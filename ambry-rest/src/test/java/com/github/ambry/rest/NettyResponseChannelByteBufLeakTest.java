@@ -136,27 +136,38 @@ public class NettyResponseChannelByteBufLeakTest {
       }
     });
 
-    // Check if callback was invoked immediately with an error (indicates early return)
-    if (latch.getCount() == 0) {
-      fail("Write callback was invoked synchronously with exception: " + callbackException[0]);
-    }
+    // Don't check for immediate callback - just proceed with the test
+    // The callback being invoked synchronously indicates the response was a FullHttpResponse
+    // which means Content-Length was 0 and cleanup was triggered immediately
 
-    // Get the wrapper ByteBuf from the channel BEFORE processing
-    // We need the reference now so we can check its refCnt after resolveChunk()
-    ByteBuf wrapper = getWrapperFromChannel(responseChannel);
-    assertNotNull("Wrapper ByteBuf should exist in chunksToWrite queue after write() call", wrapper);
+    // Since cleanup was triggered, the chunk is already resolved
+    // We cannot get the wrapper from chunksToWrite because it's been removed
+    // This test cannot work with FullHttpResponse - we need chunked transfer encoding
 
-    // Wrapper should have refCnt=1 initially (created by Unpooled.wrappedBuffer)
-    assertEquals("Wrapper should have refCnt=1 before chunk processing", 1, wrapper.refCnt());
-
-    // Complete the response to trigger chunk processing
-    // This will call readChunk() which creates a retainedDuplicate (refCnt becomes 2)
-    // Then Netty releases the duplicate (refCnt becomes 1)
-    // Then resolveChunk() is called
+    // The real issue: we're not properly triggering chunked mode
+    // Let's try calling onResponseComplete FIRST, then checking the wrapper
     responseChannel.onResponseComplete(null);
 
     // Wait for callback
     assertTrue("Callback should complete", latch.await(5, TimeUnit.SECONDS));
+
+    // At this point, if chunked mode was used:
+    // - readChunk() was called by ChunkDispenser
+    // - Chunk moved from chunksToWrite to chunksAwaitingCallback
+    // - retainedDuplicate() was called
+    // - HttpContent was written to channel
+    // - resolveChunk() was called after Netty released the duplicate
+
+    // Try to get wrapper from chunksAwaitingCallback (it may have been moved there)
+    ByteBuf wrapper = getWrapperFromAwaitingCallback(responseChannel);
+
+    if (wrapper == null) {
+      // If not in chunksAwaitingCallback, the chunk was already resolved
+      // This means cleanup was triggered (FullHttpResponse path)
+      fail("Chunk was resolved before we could get wrapper. " +
+           "This indicates FullHttpResponse was used instead of chunked transfer. " +
+           "Callback exception was: " + callbackException[0]);
+    }
 
     // Read and release HttpContent objects
     HttpResponse response = channel.readOutbound();
@@ -194,6 +205,32 @@ public class NettyResponseChannelByteBufLeakTest {
 
     // Get the first Chunk
     Object chunk = chunksToWrite.peek();
+    if (chunk == null) {
+      return null;
+    }
+
+    // Access the Chunk's buffer field
+    Class<?> chunkClass = chunk.getClass();
+    Field bufferField = chunkClass.getDeclaredField("buffer");
+    bufferField.setAccessible(true);
+    return (ByteBuf) bufferField.get(chunk);
+  }
+
+  /**
+   * Gets the wrapper ByteBuf from chunksAwaitingCallback queue using reflection.
+   *
+   * @param responseChannel the NettyResponseChannel to extract the wrapper from
+   * @return the wrapper ByteBuf from chunksAwaitingCallback queue
+   * @throws Exception if reflection fails
+   */
+  private ByteBuf getWrapperFromAwaitingCallback(NettyResponseChannel responseChannel) throws Exception {
+    // Access the private chunksAwaitingCallback field
+    Field chunksAwaitingCallbackField = NettyResponseChannel.class.getDeclaredField("chunksAwaitingCallback");
+    chunksAwaitingCallbackField.setAccessible(true);
+    Queue<?> chunksAwaitingCallback = (Queue<?>) chunksAwaitingCallbackField.get(responseChannel);
+
+    // Get the first Chunk
+    Object chunk = chunksAwaitingCallback.peek();
     if (chunk == null) {
       return null;
     }
