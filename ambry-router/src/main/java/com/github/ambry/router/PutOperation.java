@@ -540,15 +540,36 @@ class PutOperation {
   }
 
   /**
-   * release all the chunk {@link ByteBuf} resource when the operation is done.
+   * Release all chunk {@link ByteBuf} resources when the operation completes or is aborted.
+   *
+   * This method must handle chunks in ALL states (Building, Ready, Complete) except Free and Encrypting because:
+   * 1. When an operation completes/fails, PutManager immediately removes it from putOperations
+   * 2. After removal, the ChunkFiller thread will never call fillChunks() again
+   * 3. Therefore, this is the ONLY chance to release Building chunks with retained ByteBuf slices
+   *
+   * The ChunkFiller cleanup at line 748-753 only runs if the operation is still in putOperations when
+   * ChunkFiller gets CPU time, which is not guaranteed in a race condition.
+   *
+   * IMPORTANT: Uses releaseBlobContent() instead of clear() to avoid setting state to Free, which would
+   * allow ChunkFiller to reuse the chunk and create new leaks.
+   *
+   * Also closes chunkFillerChannel to release any ByteBufs that were written to the channel but not yet
+   * processed by ChunkFiller (critical for operations that fail before ChunkFiller processes them).
    */
-  private synchronized void clearReadyChunks() {
+  private synchronized void releaseChunksOnCompletion() {
+    // Close the channel first - this releases ByteBufs waiting in the channel queue via resolveAllRemainingChunks()
+    // This is critical for operations that fail before ChunkFiller retrieves their data
+    if (chunkFillerChannel != null) {
+      chunkFillerChannel.close();
+    }
+
+    // Release ByteBufs in chunks that were already created and filled
     for (PutChunk chunk : putChunks) {
       logger.debug("{}: Chunk {} state: {}", loggingContext, chunk.getChunkIndex(), chunk.getState());
-      // Only release the chunk in ready or complete mode. Filler thread will release the chunk in building mode
-      // and the encryption thread will release the chunk in encrypting mode.
-      if (chunk.isReady() || chunk.isComplete()) {
-        chunk.clear();
+      // Release all chunks except Free (no content) and Encrypting (encryption thread manages lifecycle)
+      // Use releaseBlobContent() not clear() - clear() sets state to Free, allowing ChunkFiller to reuse it
+      if (!(chunk.isFree() || chunk.isEncrypting())) {
+        chunk.releaseBlobContent();
       }
     }
   }
@@ -569,7 +590,7 @@ class PutOperation {
 
   void setOperationCompleted() {
     operationCompleted = true;
-    clearReadyChunks();
+    releaseChunksOnCompletion();
   }
 
   /**

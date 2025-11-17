@@ -22,6 +22,7 @@ import com.github.ambry.clustermap.MockDataNodeId;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
+import com.github.ambry.commons.ByteBufReadableStreamChannel;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.Callback;
 import com.github.ambry.commons.LoggingNotificationSystem;
@@ -87,6 +88,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -97,6 +100,8 @@ import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import javax.sql.DataSource;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import org.json.JSONObject;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -4548,6 +4553,99 @@ public class NonBlockingRouterTest extends NonBlockingRouterTestBase {
       // cannot verify the operationTime
       assertEquals(expectedRecord.getLifeVersion(), record.getLifeVersion());
       assertEquals(expectedRecord.getExpirationTimeMs(), record.getExpirationTimeMs());
+    }
+  }
+
+  /**
+   * Test for ByteBuf memory leak in PutOperation when operations are aborted with chunks in Building state.
+   *
+   * The leak occurs when PutOperation is aborted while the ChunkFiller background thread has not yet processed
+   * ByteBufs from the channel or has chunks in Building state. The buggy clearReadyChunks() method only releases
+   * Ready and Complete chunks, leaving Building chunks and queued ByteBufs unreleased.
+   *
+   * This test uses high concurrency to reliably trigger the race condition where operations fail before
+   * ChunkFiller processes them, exposing the leak that occurs in production.
+   */
+  @Test
+  public void testPutOperationByteBufLeakOnAbort() throws Exception {
+    // Temporarily disable the base class leak helper for this test since we're checking leaks manually
+    nettyByteBufLeakHelper.setDisabled(true);
+
+    // Create a separate leak helper to check before router.close()
+    NettyByteBufLeakHelper testLeakHelper = new NettyByteBufLeakHelper();
+    testLeakHelper.beforeTest();
+
+    try {
+      Properties props = getNonBlockingRouterProperties(localDcName);
+      int chunkSize = 512;
+      props.setProperty("router.max.put.chunk.size.bytes", Integer.toString(chunkSize));
+      setRouter(props, mockServerLayout, new LoggingNotificationSystem());
+
+      // Configure servers to succeed for first few chunks, then fail
+      // This mimics production: upload starts, then partition fails during operation
+      List<ServerErrorCode> serverErrorList = new ArrayList<>();
+      serverErrorList.add(ServerErrorCode.NoError);
+      serverErrorList.add(ServerErrorCode.NoError);
+      serverErrorList.add(ServerErrorCode.NoError);
+      for (int i = 0; i < 20000; i++) {
+        serverErrorList.add(ServerErrorCode.PartitionReadOnly);
+      }
+      mockServerLayout.getMockServers().forEach(server -> server.setServerErrors(serverErrorList));
+
+      int numTasks = 100;
+      int threadPoolSize = 100;
+      int blobSize = 10 * chunkSize;
+      CountDownLatch startLatch = new CountDownLatch(1);
+      ExecutorService executor = Executors.newFixedThreadPool(threadPoolSize);
+
+      // Submit concurrent put operations
+      for (int i = 0; i < numTasks; i++) {
+        executor.submit(() -> {
+          try {
+            startLatch.await();
+
+            // Use pooled ByteBuf to make them trackable by NettyByteBufLeakHelper
+            byte[] blobData = new byte[blobSize];
+            ThreadLocalRandom.current().nextBytes(blobData);
+            ByteBuf pooledBuf = PooledByteBufAllocator.DEFAULT.buffer(blobSize);
+            pooledBuf.writeBytes(blobData);
+            ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(pooledBuf);
+
+            BlobProperties blobProperties = new BlobProperties(blobSize, "serviceId", "ownerId", "contentType",
+                false, Utils.Infinite_Time, Utils.getRandomShort(ThreadLocalRandom.current()),
+                Utils.getRandomShort(ThreadLocalRandom.current()), false, null, null, null);
+
+            try {
+              router.putBlob(blobProperties, new byte[10], channel, PutBlobOptions.DEFAULT).get();
+            } catch (ExecutionException e) {
+              // Expected for operations that hit error responses
+            }
+          } catch (Exception e) {
+            fail("Unexpected exception: " + e.getMessage());
+          }
+        });
+      }
+
+      startLatch.countDown();
+      executor.shutdown();
+      assertTrue("Operations should complete within reasonable time",
+          executor.awaitTermination(1, TimeUnit.SECONDS));
+
+      // CRITICAL: Check for leaks BEFORE router.close()
+      // router.close() calls cleanupChunks() which properly releases all chunks,
+      // masking the leak we're testing for in setOperationCompleted() -> releaseChunksOnCompletion()
+      testLeakHelper.afterTest();
+
+      // Now close router
+      router.close();
+      router = null; // Prevent base class from trying to close again
+    } finally {
+      if (router != null) {
+        router.close();
+        router = null;
+      }
+      // Re-enable the base class leak helper
+      nettyByteBufLeakHelper.setDisabled(false);
     }
   }
 }
