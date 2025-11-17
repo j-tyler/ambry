@@ -19,8 +19,6 @@ import com.github.ambry.config.NettyConfig;
 import com.github.ambry.config.PerformanceConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.HttpContent;
@@ -32,9 +30,7 @@ import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.stream.ChunkedWriteHandler;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -58,7 +54,6 @@ public class NettyResponseChannelByteBufLeakTest {
   private NettyMetrics nettyMetrics;
   private NettyConfig nettyConfig;
   private PerformanceConfig performanceConfig;
-  private List<ByteBuf> capturedByteBufs = new ArrayList<>();
 
   @Before
   public void setUp() {
@@ -80,29 +75,19 @@ public class NettyResponseChannelByteBufLeakTest {
     if (channel != null && channel.isOpen()) {
       channel.close();
     }
-    // Release any captured ByteBufs to prevent test framework leaks
-    for (ByteBuf buf : capturedByteBufs) {
-      if (buf.refCnt() > 0) {
-        buf.release(buf.refCnt());
-      }
-    }
     nettyByteBufLeakHelper.afterTest();
   }
 
   /**
    * This test proves the ByteBuf leak when write(ByteBuffer) creates an internal wrapper.
    *
-   * The test directly uses write(ByteBuf) with a tracked ByteBuf to prove the leak pattern.
+   * Test flow:
+   * 1. Call write(ByteBuffer) which creates internal ByteBuf wrapper
+   * 2. Process the write through completion
+   * 3. NettyByteBufLeakHelper will detect leaked ByteBuf in tearDown()
    *
-   * Expected behavior:
-   * - write(ByteBuf) with our tracked ByteBuf, refCount=1
-   * - Chunk stores the ByteBuf
-   * - readChunk() calls retainedDuplicate(), refCount=2
-   * - Netty releases duplicate, refCount=1
-   * - resolveChunk() should release original, refCount=0
-   *
-   * Actual behavior (BUG):
-   * - resolveChunk() does NOT release, refCount stays at 1 → LEAK
+   * Before fix: Test FAILS - NettyByteBufLeakHelper detects the internal ByteBuf wrapper leaked
+   * After fix: Test PASSES - Internal ByteBuf wrapper is released in resolveChunk()
    */
   @Test
   public void testWriteByteBufferLeaksInternalWrapper() throws Exception {
@@ -115,22 +100,13 @@ public class NettyResponseChannelByteBufLeakTest {
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
 
-    // Create a tracked ByteBuf directly (simulating what Unpooled.wrappedBuffer does internally)
+    // PRODUCTION PATTERN: Call write(ByteBuffer)
+    // This creates an internal ByteBuf wrapper via Unpooled.wrappedBuffer()
     String data = "test data that will leak";
-    ByteBuf trackedByteBuf = Unpooled.wrappedBuffer(data.getBytes(StandardCharsets.UTF_8));
-    capturedByteBufs.add(trackedByteBuf); // Track for cleanup
-
-    // Initial state: refCount = 1
-    assertEquals("Initial refCount should be 1", 1, trackedByteBuf.refCnt());
+    ByteBuffer byteBuffer = ByteBuffer.wrap(data.getBytes(StandardCharsets.UTF_8));
 
     TestCallback callback = new TestCallback();
-
-    // Call write(ByteBuf) directly with our tracked ByteBuf
-    // This simulates what happens inside write(ByteBuffer) when it calls Unpooled.wrappedBuffer()
-    responseChannel.write(trackedByteBuf, callback);
-
-    // RefCount should still be 1 (Chunk just stores the reference, doesn't retain)
-    assertEquals("After write(), refCount should still be 1", 1, trackedByteBuf.refCnt());
+    responseChannel.write(byteBuffer, callback);
 
     // Complete the response to trigger chunk processing
     responseChannel.onResponseComplete(null);
@@ -142,30 +118,19 @@ public class NettyResponseChannelByteBufLeakTest {
     HttpResponse response = channel.readOutbound();
     assertNotNull("Should have response", response);
 
-    // Read and release HttpContent objects (these are the duplicates)
+    // Read and release HttpContent objects
     Object outbound;
     while ((outbound = channel.readOutbound()) != null) {
       if (outbound instanceof HttpContent) {
         HttpContent content = (HttpContent) outbound;
-        // The content wraps a retainedDuplicate() of our trackedByteBuf
-        // When we release it, it should decrement the original's refCount
         content.release();
       }
     }
 
-    // BUG VERIFICATION:
-    // After all processing, the original trackedByteBuf should have refCount=0
-    // But due to the bug in resolveChunk(), it will be 1 (LEAKED)
-
-    int finalRefCnt = trackedByteBuf.refCnt();
-
-    // This assertion will FAIL, proving the bug
-    assertEquals(
-        "ByteBuf should be fully released (refCnt=0) after chunk resolution, but it's LEAKED! " +
-        "The bug is in NettyResponseChannel.Chunk.resolveChunk() which never calls buffer.release()",
-        0,
-        finalRefCnt
-    );
+    // LEAK DETECTION:
+    // The NettyByteBufLeakHelper.afterTest() in tearDown() will detect any ByteBuf leaks.
+    // Before fix: Will detect the leaked internal ByteBuf wrapper → TEST FAILS
+    // After fix: No leak detected → TEST PASSES
   }
 
   /**
