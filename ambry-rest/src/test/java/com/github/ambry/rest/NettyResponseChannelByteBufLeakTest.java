@@ -107,6 +107,7 @@ public class NettyResponseChannelByteBufLeakTest {
   @Test
   public void testWriteByteBufferReleasesWrapper() throws Exception {
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/test");
+    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
 
     NettyResponseChannel responseChannel = new NettyResponseChannel(
         new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
