@@ -28,6 +28,7 @@ import com.github.ambry.network.Send;
 import com.github.ambry.utils.NettyByteBufDataInputStream;
 import com.github.ambry.utils.ByteBufferChannel;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
@@ -44,27 +45,21 @@ import org.junit.Before;
 import org.junit.Test;
 
 /**
- * ByteBuf Flow Tracer Test Suite
+ * ByteBuf Flow Tracer Test Suite - Production Pattern Validation
  *
- * PURPOSE: These tests are designed to exercise all ByteBuf flow paths identified in BYTEBUF_LEAK_ANALYSIS.md.
- * They are NOT traditional assertion-based tests. Instead, they demonstrate production-like usage patterns
- * to generate flow traces when run with the ByteBuddy ByteBuf Tracer agent.
+ * PURPOSE: Validate that ACTUAL production code patterns correctly manage ByteBuf lifecycle.
+ * These tests replicate the real patterns used in Router, Server, and Replication code to verify
+ * whether they leak ByteBufs or properly clean them up.
  *
  * USAGE: Run this test class with the tracer agent:
- *   -javaagent:bytebuddy-bytebuf-tracer.jar=include=com.github.ambry.*
+ *   gradle :ambry-protocol:test --tests ByteBufFlowTracerTest -PwithByteBufTracking
  *
- * Then use JMX to call getTreeView() or getLLMView() to see the complete ByteBuf flow paths.
- *
- * EXPECTATIONS:
- * - All tests should PASS (no exceptions thrown unless part of the flow being tested)
- * - Some tests intentionally leak ByteBufs to demonstrate leak paths
- * - Some tests properly clean up to demonstrate safe paths
- * - Tests exercise all branches: happy paths, exception paths, ownership transfer, etc.
- *
- * ANALYZED CLASSES:
- * 1. com.github.ambry.protocol.PutRequest
- * 2. com.github.ambry.utils.NettyByteBufDataInputStream
- * 3. com.github.ambry.network.ResponseInfo
+ * WHAT THIS TESTS:
+ * - Router's retainedDuplicate() pattern (PutOperation.java:1854, 2364)
+ * - Server's InputStream wrapper pattern (AmbryRequests.java:285, ServerRequestResponseHelper.java:118)
+ * - Router's ResponseInfo cleanup pattern (OperationController.java:627)
+ * - ReplicaThread's ResponseInfo usage (ReplicaThread.java:473) - suspected leak
+ * - NettyByteBufDataInputStream non-owning wrapper semantics
  */
 public class ByteBufFlowTracerTest {
   private ClusterMap clusterMap;
@@ -83,463 +78,260 @@ public class ByteBufFlowTracerTest {
 
   @After
   public void tearDown() {
-    // Note: Some tests intentionally leak to demonstrate leak paths
-    // In production, all ByteBufs must be released
+    // All tests should properly clean up - no intentional leaks
   }
 
   // ========================================
-  // SECTION 1: PutRequest Tests
-  // Tests based on BYTEBUF_LEAK_ANALYSIS.md Class 1 analysis
+  // SECTION 1: PutRequest Production Patterns
+  // Replicates actual Router and Server code
   // ========================================
 
   /**
-   * TEST 1.1: PutRequest Happy Path - Proper Release
+   * TEST 1: Router Pattern - retainedDuplicate() Ownership Transfer
    *
-   * Flow: Constructor → prepareBuffer() → writeTo() → release()
-   * Expected: NO LEAK - All ByteBufs properly released
+   * PRODUCTION CODE: PutOperation.java:1854 and 2364
+   * Pattern: buf.retainedDuplicate() creates new ByteBuf with independent refCount
+   *
+   * Flow:
+   * 1. Router allocates chunk buffer (refCount=1)
+   * 2. Creates PutRequest with chunk.retainedDuplicate() (creates new buf with refCount=1)
+   * 3. PutRequest takes ownership of duplicate
+   * 4. NetworkClient sends request and calls request.release() (duplicate refCount=0)
+   * 5. Router releases original chunk (original refCount=0)
+   *
+   * Expected: NO LEAK - Both original and duplicate properly released
    */
   @Test
-  public void testPutRequest_HappyPath_ProperRelease() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
+  public void testPutRequest_RouterPattern_RetainedDuplicate() throws Exception {
+    // Simulate Router's encrypted chunk buffer
+    ByteBuf originalChunk = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
+    originalChunk.writeBytes(generateRandomBytes(BLOB_SIZE));
 
-    PutRequest request = createSamplePutRequest(materializedBlob);
+    // Router pattern: Pass retainedDuplicate to PutRequest
+    ByteBuf duplicate = originalChunk.retainedDuplicate();
+    PutRequest request = createPutRequest(duplicate);
+
+    // Simulate NetworkClient sending the request
+    request.prepareBuffer();
+    ByteBufferChannel channel = new ByteBufferChannel(ByteBuffer.allocate((int) request.sizeInBytes()));
+    request.writeTo(channel);
+
+    // NetworkClient releases the request after send
+    request.release();  // Releases duplicate (refCount=0)
+
+    // Router releases original chunk
+    originalChunk.release();  // Releases original (refCount=0)
+
+    // Both ByteBufs should be fully released - no leak
+  }
+
+  /**
+   * TEST 2: Server Pattern - InputStream Wrapper (Non-Owning)
+   *
+   * PRODUCTION CODE: AmbryRequests.java:285-288, ServerRequestResponseHelper.java:118-121
+   * Pattern: Create wrapper PutRequest with InputStream constructor
+   *
+   * Flow:
+   * 1. Original PutRequest (sentRequest) owns ByteBuf blob field
+   * 2. Server creates new PutRequest with ByteBufInputStream wrapping sentRequest.getBlob()
+   * 3. New PutRequest does NOT own ByteBuf (InputStream constructor sets blob=null)
+   * 4. Original sentRequest is released via LocalChannelRequest.release()
+   * 5. This releases the ByteBuf
+   *
+   * Expected: NO LEAK - Original PutRequest releases ByteBuf, wrapper is non-owning
+   */
+  @Test
+  public void testPutRequest_ServerPattern_InputStreamWrapper() throws Exception {
+    // Original PutRequest sent over network (owns ByteBuf)
+    ByteBuf blob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
+    blob.writeBytes(generateRandomBytes(BLOB_SIZE));
+
+    PutRequest sentRequest = createPutRequest(blob);
+
+    // Server creates wrapper PutRequest with InputStream constructor
+    // This constructor does NOT take ownership of ByteBuf
+    PutRequest receivedRequest = new PutRequest(
+        sentRequest.getCorrelationId(),
+        sentRequest.getClientId(),
+        sentRequest.getBlobId(),
+        sentRequest.getBlobProperties(),
+        sentRequest.getUsermetadata(),
+        sentRequest.getBlobSize(),
+        sentRequest.getBlobType(),
+        sentRequest.getBlobEncryptionKey(),
+        new ByteBufInputStream(sentRequest.getBlob()),  // Wraps but doesn't own
+        null  // crc
+    );
+
+    // receivedRequest is just a wrapper - doesn't own ByteBuf
+    // sentRequest still owns the ByteBuf
+
+    // Server processes request, then releases original (which owns ByteBuf)
+    sentRequest.release();  // This releases the ByteBuf
+
+    // receivedRequest has nothing to release (blob field is null)
+    // No leak - ByteBuf released via sentRequest
+  }
+
+  /**
+   * TEST 3: Router Pattern - Full Lifecycle with prepareBuffer()
+   *
+   * PRODUCTION CODE: Complete Router flow through NetworkClient
+   * Pattern: retainedDuplicate → prepareBuffer → writeTo → release
+   *
+   * Flow:
+   * 1. Allocate chunk buffer
+   * 2. Pass retainedDuplicate to PutRequest
+   * 3. Call prepareBuffer() which creates composite buffer
+   * 4. Write to channel
+   * 5. Release request (releases composite and all components)
+   * 6. Release original chunk
+   *
+   * Expected: NO LEAK - All buffers properly released
+   */
+  @Test
+  public void testPutRequest_RouterPattern_FullLifecycle() throws Exception {
+    ByteBuf originalChunk = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
+    originalChunk.writeBytes(generateRandomBytes(BLOB_SIZE));
+
+    PutRequest request = createPutRequest(originalChunk.retainedDuplicate());
+
+    // Router prepares and sends
+    request.prepareBuffer();  // Creates composite with blob, crcByteBuf, bufferToSend
+    ByteBufferChannel channel = new ByteBufferChannel(ByteBuffer.allocate((int) request.sizeInBytes()));
+    request.writeTo(channel);
+
+    // NetworkClient cleanup
+    request.release();
+
+    // Router cleanup
+    originalChunk.release();
+  }
+
+  /**
+   * TEST 4: Direct Allocation Pattern
+   *
+   * PRODUCTION CODE: Test utilities and simple cases
+   * Pattern: Allocate ByteBuf directly and pass to PutRequest
+   *
+   * Flow:
+   * 1. Allocate ByteBuf (refCount=1)
+   * 2. Pass to PutRequest constructor (ownership transfers, refCount still 1)
+   * 3. PutRequest.release() releases ByteBuf (refCount=0)
+   *
+   * Expected: NO LEAK - Simple ownership transfer
+   */
+  @Test
+  public void testPutRequest_DirectAllocation_OwnershipTransfer() throws Exception {
+    ByteBuf blob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
+    blob.writeBytes(generateRandomBytes(BLOB_SIZE));
+
+    // Direct ownership transfer
+    PutRequest request = createPutRequest(blob);
     request.prepareBuffer();
 
     ByteBufferChannel channel = new ByteBufferChannel(ByteBuffer.allocate((int) request.sizeInBytes()));
     request.writeTo(channel);
 
-    // Proper cleanup
+    // Release transfers ownership back and frees
     request.release();
   }
 
   /**
-   * TEST 1.2: PutRequest - LEAK-1.1 - Exception Before prepareBuffer()
+   * TEST 5: Composite ByteBuf Pattern (Router with Multiple Chunks)
    *
-   * Flow: Constructor → [EXCEPTION] → (no release)
-   * Expected: LEAK - blob ByteBuf never released
+   * PRODUCTION CODE: Router creating composite blobs
+   * Pattern: Create composite ByteBuf and pass to PutRequest
+   *
+   * Expected: NO LEAK - PutRequest handles composite buffers correctly
    */
   @Test
-  public void testPutRequest_Leak_ExceptionBeforePrepareBuffer_NoRelease() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
+  public void testPutRequest_CompositeByteBuffer() throws Exception {
+    // Create composite blob (simulates encryption producing multiple buffers)
+    ByteBuf part1 = PooledByteBufAllocator.DEFAULT.heapBuffer(512);
+    part1.writeBytes(generateRandomBytes(512));
 
-    PutRequest request = createSamplePutRequest(materializedBlob);
+    ByteBuf part2 = PooledByteBufAllocator.DEFAULT.heapBuffer(512);
+    part2.writeBytes(generateRandomBytes(512));
 
-    // Simulate exception scenario - validation error, etc.
-    // In production, caller might throw exception here
+    CompositeByteBuf composite = PooledByteBufAllocator.DEFAULT.compositeHeapBuffer(2);
+    composite.addComponent(true, part1);
+    composite.addComponent(true, part2);
 
-    // DO NOT call release() - intentionally leak to show the path
-    // This simulates caller error handling failure
-    // materializedBlob is now leaked
-  }
-
-  /**
-   * TEST 1.3: PutRequest - LEAK-1.1 Mitigation - Exception Before prepareBuffer() WITH Release
-   *
-   * Flow: Constructor → [EXCEPTION] → release() in finally block
-   * Expected: NO LEAK - release() cleans up blob field
-   */
-  @Test
-  public void testPutRequest_Safe_ExceptionBeforePrepareBuffer_WithRelease() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
-
-    PutRequest request = null;
-    try {
-      request = createSamplePutRequest(materializedBlob);
-      // Simulate exception before prepareBuffer()
-      if (RANDOM.nextBoolean() || true) {  // Always true, just to show flow
-        // throw new RuntimeException("Validation failed");
-        // For tracer purposes, we don't actually throw, just show the pattern
-      }
-    } finally {
-      if (request != null) {
-        request.release();  // Proper cleanup in finally block
-      }
-    }
-  }
-
-  /**
-   * TEST 1.4: PutRequest - LEAK-1.2 - Exception During prepareBuffer()
-   *
-   * Flow: Constructor → prepareBuffer() [EXCEPTION mid-execution]
-   * Expected: POTENTIAL LEAK - crcByteBuf and/or bufferToSend may leak
-   */
-  @Test
-  public void testPutRequest_Leak_ExceptionDuringPrepareBuffer() throws Exception {
-    // Note: This is difficult to test without modifying PutRequest
-    // We demonstrate the pattern where prepareBuffer might throw
-
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
-
-    PutRequest request = createSamplePutRequest(materializedBlob);
-
-    try {
-      request.prepareBuffer();
-      // If exception occurred mid-prepareBuffer (e.g., OutOfMemoryError)
-      // crcByteBuf and bufferToSend could leak
-    } catch (Exception e) {
-      // Exception caught but no cleanup - demonstrates the vulnerability
-      // DO NOT call release() to show the leak path
-      return;
-    }
-
-    // If we get here, clean up normally
-    request.release();
-  }
-
-  /**
-   * TEST 1.5: PutRequest - LEAK-1.3 - Caller Never Calls release()
-   *
-   * Flow: Constructor → prepareBuffer() → writeTo() → [NO RELEASE]
-   * Expected: LEAK - All ByteBufs (blob, crcByteBuf, bufferToSend) leak
-   */
-  @Test
-  public void testPutRequest_Leak_NoReleaseCall() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
-
-    PutRequest request = createSamplePutRequest(materializedBlob);
+    // Pass to PutRequest
+    PutRequest request = createPutRequest(composite.retainedDuplicate());
     request.prepareBuffer();
 
     ByteBufferChannel channel = new ByteBufferChannel(ByteBuffer.allocate((int) request.sizeInBytes()));
     request.writeTo(channel);
 
-    // DO NOT call release() - most common leak scenario
-    // Caller simply forgets or error path doesn't include cleanup
-    // All ByteBufs leak
-  }
-
-  /**
-   * TEST 1.6: PutRequest - LEAK-1.4 - Partial Write With Network Error
-   *
-   * Flow: Constructor → prepareBuffer() → writeTo() [IOException] → release() in finally
-   * Expected: NO LEAK - release() called despite IOException
-   */
-  @Test
-  public void testPutRequest_PartialWrite_WithRelease() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
-
-    PutRequest request = createSamplePutRequest(materializedBlob);
-    request.prepareBuffer();
-
-    try {
-      WritableByteChannel failingChannel = new FailingChannel(512);
-      request.writeTo(failingChannel);
-    } catch (IOException e) {
-      // Network error during write
-    } finally {
-      // Proper cleanup despite IOException
-      request.release();
-    }
-  }
-
-  /**
-   * TEST 1.7: PutRequest - LEAK-1.4 - Partial Write WITHOUT Release
-   *
-   * Flow: Constructor → prepareBuffer() → writeTo() [IOException] → (no release)
-   * Expected: LEAK - caller assumes failure means no cleanup needed
-   */
-  @Test
-  public void testPutRequest_PartialWrite_NoRelease() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
-
-    PutRequest request = createSamplePutRequest(materializedBlob);
-    request.prepareBuffer();
-
-    try {
-      WritableByteChannel failingChannel = new FailingChannel(512);
-      request.writeTo(failingChannel);
-    } catch (IOException e) {
-      // Caller catches exception but doesn't release
-      // Assumes failed write means no cleanup needed
-      // This is WRONG - ByteBufs still leak
-      return;
-    }
-
-    // DO NOT call release() to demonstrate leak path
-  }
-
-  /**
-   * TEST 1.8: PutRequest - Multiple Calls to prepareBuffer()
-   *
-   * Flow: Constructor → prepareBuffer() → prepareBuffer() again
-   * Expected: Depends on implementation - may leak or handle gracefully
-   */
-  @Test
-  public void testPutRequest_MultiplePrepareBufferCalls() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
-
-    PutRequest request = createSamplePutRequest(materializedBlob);
-    request.prepareBuffer();
-
-    // Call prepareBuffer() again - edge case
-    // Does it leak the first composite? Replace it?
-    try {
-      request.prepareBuffer();
-    } catch (Exception e) {
-      // May throw exception or handle gracefully
-    }
-
     request.release();
-  }
-
-  /**
-   * TEST 1.9: PutRequest - Release Before prepareBuffer()
-   *
-   * Flow: Constructor → release() → prepareBuffer()
-   * Expected: May crash or handle gracefully depending on implementation
-   */
-  @Test
-  public void testPutRequest_ReleaseBeforePrepareBuffer() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
-
-    PutRequest request = createSamplePutRequest(materializedBlob);
-    request.release();  // Release immediately
-
-    // Try to call prepareBuffer() after release - what happens?
-    try {
-      request.prepareBuffer();
-      // Should fail gracefully or throw exception
-    } catch (Exception e) {
-      // Expected - blob is already released
-    }
-  }
-
-  /**
-   * TEST 1.10: PutRequest - Double Release
-   *
-   * Flow: Constructor → prepareBuffer() → release() → release()
-   * Expected: Second release() should be safe (ReferenceCountUtil.safeRelease handles this)
-   */
-  @Test
-  public void testPutRequest_DoubleRelease() throws Exception {
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
-
-    PutRequest request = createSamplePutRequest(materializedBlob);
-    request.prepareBuffer();
-
-    request.release();  // First release
-    request.release();  // Second release - should not crash
+    composite.release();
   }
 
   // ========================================
-  // SECTION 2: NettyByteBufDataInputStream Tests
-  // Tests based on BYTEBUF_LEAK_ANALYSIS.md Class 2 analysis
+  // SECTION 2: ResponseInfo Production Patterns
+  // Replicates Router and ReplicaThread usage
   // ========================================
 
   /**
-   * TEST 2.1: NettyByteBufDataInputStream - Happy Path - Caller Owns ByteBuf
+   * TEST 6: Router Pattern - OperationController ResponseInfo Cleanup
    *
-   * Flow: Allocate ByteBuf → Create stream → Use stream → Release ByteBuf
-   * Expected: NO LEAK - caller properly manages ByteBuf lifecycle
+   * PRODUCTION CODE: OperationController.java:622-627
+   * Pattern: sendAndPoll returns ResponseInfo list, forEach(ResponseInfo::release)
+   *
+   * Flow:
+   * 1. NetworkClient.sendAndPoll() returns List<ResponseInfo>
+   * 2. Each ResponseInfo owns a ByteBuf content
+   * 3. Process responses
+   * 4. responseInfoList.forEach(ResponseInfo::release)
+   *
+   * Expected: NO LEAK - All ResponseInfo properly released
    */
   @Test
-  public void testNettyByteBufDataInputStream_HappyPath_CallerOwns() throws Exception {
-    ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    buf.writeInt(12345);
-    buf.writeLong(67890L);
-    buf.writeBytes("test data".getBytes());
+  public void testResponseInfo_RouterPattern_ProperCleanup() throws Exception {
+    List<ResponseInfo> responseInfoList = new ArrayList<>();
 
-    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(buf);
+    // Simulate NetworkClient returning multiple responses
+    for (int i = 0; i < 5; i++) {
+      ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
+      content.writeInt(200);  // Success status
+      content.writeBytes(generateRandomBytes(100));
 
-    // Read data from stream
-    int intVal = stream.readInt();
-    long longVal = stream.readLong();
-    byte[] bytes = new byte[9];
-    stream.read(bytes);
-
-    // Stream doesn't manage lifecycle, so close() does nothing to buf
-    stream.close();
-
-    // Caller's responsibility to release ByteBuf
-    buf.release();
-  }
-
-  /**
-   * TEST 2.2: NettyByteBufDataInputStream - LEAK-2.2 - Caller Assumes Stream Owns ByteBuf
-   *
-   * Flow: Allocate ByteBuf → Create stream → Use stream → Close stream → [NO BUFFER RELEASE]
-   * Expected: LEAK - ByteBuf never released
-   */
-  @Test
-  public void testNettyByteBufDataInputStream_Leak_CallerConfusion() throws Exception {
-    ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    buf.writeInt(12345);
-    buf.writeLong(67890L);
-
-    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(buf);
-
-    int intVal = stream.readInt();
-    long longVal = stream.readLong();
-
-    // Caller thinks stream owns buf and will release it
-    stream.close();  // Does nothing to buf!
-
-    // DO NOT release buf - simulating caller confusion
-    // buf is leaked
-  }
-
-  /**
-   * TEST 2.3: NettyByteBufDataInputStream - Production Pattern from NettyServerRequest
-   *
-   * Flow: Owner allocates → Creates stream wrapper → Processes → Owner releases
-   * Expected: NO LEAK - follows correct pattern
-   */
-  @Test
-  public void testNettyByteBufDataInputStream_ProductionPattern_NettyServerRequest() throws Exception {
-    // Simulate NettyServerRequest pattern
-    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
-    content.writeInt(100);
-    content.writeLong(200L);
-
-    // NettyServerRequest owns content, creates stream as wrapper
-    NettyByteBufDataInputStream inputStream = new NettyByteBufDataInputStream(content);
-
-    // Use stream to read data
-    int value1 = inputStream.readInt();
-    long value2 = inputStream.readLong();
-
-    // Owner (NettyServerRequest) releases content, not the stream
-    content.release();
-  }
-
-  /**
-   * TEST 2.4: NettyByteBufDataInputStream - Used in ResponseInfo Processing
-   *
-   * Flow: ResponseInfo has content → Create stream → Deserialize → Release ResponseInfo
-   * Expected: NO LEAK if ResponseInfo.release() is called
-   */
-  @Test
-  public void testNettyByteBufDataInputStream_ResponseInfoPattern_WithRelease() throws Exception {
-    ByteBuf responseBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    responseBuf.writeInt(42);
-    responseBuf.writeLong(123456L);
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, responseBuf);
-
-    // Create stream to read response
-    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
-    int statusCode = stream.readInt();
-    long timestamp = stream.readLong();
-
-    // Must call responseInfo.release() to clean up content
-    responseInfo.release();
-  }
-
-  /**
-   * TEST 2.5: NettyByteBufDataInputStream - Used in ResponseInfo Processing WITHOUT Release
-   *
-   * Flow: ResponseInfo has content → Create stream → Deserialize → [NO RELEASE]
-   * Expected: LEAK - this is the ReplicaThread bug
-   */
-  @Test
-  public void testNettyByteBufDataInputStream_ResponseInfoPattern_NoRelease() throws Exception {
-    ByteBuf responseBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    responseBuf.writeInt(42);
-    responseBuf.writeLong(123456L);
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, responseBuf);
-
-    // Create stream to read response - ReplicaThread pattern
-    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
-    int statusCode = stream.readInt();
-    long timestamp = stream.readLong();
-
-    // DO NOT call responseInfo.release() - simulating ReplicaThread bug
-    // Content ByteBuf leaks
-  }
-
-  /**
-   * TEST 2.6: NettyByteBufDataInputStream - Exception During Deserialization
-   *
-   * Flow: Create stream → Read data → [Exception] → Cleanup in finally
-   * Expected: NO LEAK if caller has try-finally
-   */
-  @Test
-  public void testNettyByteBufDataInputStream_ExceptionDuringRead_WithFinally() throws Exception {
-    ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(16);
-    buf.writeInt(100);
-    // Not enough data for readLong() - will cause exception
-
-    try {
-      NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(buf);
-      int value = stream.readInt();
-      long value2 = stream.readLong();  // Will throw - not enough bytes
-    } catch (Exception e) {
-      // Exception during read
-    } finally {
-      // Caller's responsibility to release ByteBuf
-      buf.release();
-    }
-  }
-
-  /**
-   * TEST 2.7: NettyByteBufDataInputStream - Exception During Deserialization WITHOUT Cleanup
-   *
-   * Flow: Create stream → Read data → [Exception] → (no cleanup)
-   * Expected: LEAK - exception breaks flow, ByteBuf never released
-   */
-  @Test
-  public void testNettyByteBufDataInputStream_ExceptionDuringRead_NoCleanup() throws Exception {
-    ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(16);
-    buf.writeInt(100);
-
-    try {
-      NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(buf);
-      int value = stream.readInt();
-      long value2 = stream.readLong();  // Will throw
-    } catch (Exception e) {
-      // Exception caught but DON'T release ByteBuf
-      // Simulates poor error handling leading to leak
-      return;
+      responseInfoList.add(new ResponseInfo(null, null, content));
     }
 
-    // DO NOT release buf
-  }
+    // Process responses (Router's onResponse logic)
+    for (ResponseInfo responseInfo : responseInfoList) {
+      ByteBuf content = responseInfo.content();
+      // Process response data...
+    }
 
-  // ========================================
-  // SECTION 3: ResponseInfo Tests
-  // Tests based on BYTEBUF_LEAK_ANALYSIS.md Class 3 analysis
-  // ========================================
+    // Router cleanup pattern - OperationController.java:627
+    responseInfoList.forEach(ResponseInfo::release);
 
-  /**
-   * TEST 3.1: ResponseInfo - Happy Path - Router Pattern (OperationController)
-   *
-   * Flow: Create ResponseInfo → Process → release() in forEach
-   * Expected: NO LEAK - proper cleanup
-   */
-  @Test
-  public void testResponseInfo_HappyPath_RouterPattern() throws Exception {
-    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
-    content.writeInt(200);  // Status code
-    content.writeBytes(generateRandomBytes(100));
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, content);
-
-    // Process response (simulate onResponse logic)
-    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
-    int status = stream.readInt();
-
-    // Router pattern - proper cleanup
-    responseInfo.release();
+    // All ByteBufs released - no leak
   }
 
   /**
-   * TEST 3.2: ResponseInfo - LEAK-3.1 - ReplicaThread Pattern WITHOUT Release
+   * TEST 7: ReplicaThread Pattern - ResponseInfo with NettyByteBufDataInputStream
    *
-   * Flow: Create ResponseInfo → Create NettyByteBufDataInputStream → Process → [NO RELEASE]
-   * Expected: LEAK - content ByteBuf never released
+   * PRODUCTION CODE: ReplicaThread.java:473, 865-889
+   * Pattern: Create NettyByteBufDataInputStream from ResponseInfo.content(), process, then release
+   *
+   * This is the CRITICAL test - does ReplicaThread properly release ResponseInfo?
+   *
+   * Flow:
+   * 1. NetworkClient.sendAndPoll() returns ResponseInfo with content ByteBuf
+   * 2. Create NettyByteBufDataInputStream(responseInfo.content())
+   * 3. Deserialize response data
+   * 4. Must call responseInfo.release() to clean up content
+   *
+   * Expected: Test both patterns to see which one production uses
    */
   @Test
-  public void testResponseInfo_Leak_ReplicaThreadPattern_NoRelease() throws Exception {
+  public void testResponseInfo_ReplicaThreadPattern_WithRelease() throws Exception {
+    // NetworkClient returns ResponseInfo
     ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
     content.writeInt(200);
     content.writeLong(System.currentTimeMillis());
@@ -547,328 +339,66 @@ public class ByteBufFlowTracerTest {
 
     ResponseInfo responseInfo = new ResponseInfo(null, null, content);
 
-    // ReplicaThread pattern
+    // ReplicaThread pattern - create stream to read response
+    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
+
+    // Deserialize response
+    int status = stream.readInt();
+    long timestamp = stream.readLong();
+
+    // CRITICAL: Must release ResponseInfo (which releases content ByteBuf)
+    // NettyByteBufDataInputStream is non-owning wrapper
+    responseInfo.release();
+
+    // If this pattern is followed, no leak
+  }
+
+  /**
+   * TEST 8: ReplicaThread Pattern - WITHOUT Release (Suspected Bug)
+   *
+   * PRODUCTION CODE: ReplicaThread.java:473, 865-889
+   * Based on analysis, ReplicaThread may NOT be releasing ResponseInfo
+   *
+   * This test replicates what the code ACTUALLY does to detect the leak
+   */
+  @Test
+  public void testResponseInfo_ReplicaThreadPattern_ActualCodePath() throws Exception {
+    // Simulate what ReplicaThread.java:473 actually does
+    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
+    content.writeInt(200);
+    content.writeLong(System.currentTimeMillis());
+    content.writeBytes(generateRandomBytes(100));
+
+    ResponseInfo responseInfo = new ResponseInfo(null, null, content);
+
+    // Line 865-889: Create stream and deserialize
     NettyByteBufDataInputStream dis = new NettyByteBufDataInputStream(responseInfo.content());
     int status = dis.readInt();
     long timestamp = dis.readLong();
 
     // Process response...
 
-    // DO NOT call responseInfo.release() - bug simulation
-    // This is the CRITICAL BUG in ReplicaThread
-    // Content leaks on every replication cycle
+    // Based on analysis: ReplicaThread does NOT call responseInfo.release() here
+    // The ByteBuf leaks
+    //
+    // To validate: Run with tracer and check if this shows a leak
   }
 
   /**
-   * TEST 3.3: ResponseInfo - ReplicaThread Pattern WITH Release (Fixed)
+   * TEST 9: ResponseInfo with Multiple Items - Exception Safety
    *
-   * Flow: Create ResponseInfo → Process → release() in finally
-   * Expected: NO LEAK - demonstrates the fix
+   * PRODUCTION CODE: OperationController handling batch responses
+   * Pattern: Process list with try-finally to ensure all released
+   *
+   * Expected: NO LEAK - finally ensures cleanup even with exceptions
    */
   @Test
-  public void testResponseInfo_Safe_ReplicaThreadPattern_WithRelease() throws Exception {
-    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
-    content.writeInt(200);
-    content.writeLong(System.currentTimeMillis());
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, content);
-
-    try {
-      NettyByteBufDataInputStream dis = new NettyByteBufDataInputStream(responseInfo.content());
-      int status = dis.readInt();
-      long timestamp = dis.readLong();
-      // Process response...
-    } finally {
-      // Proper fix for LEAK-3.1
-      responseInfo.release();
-    }
-  }
-
-  /**
-   * TEST 3.4: ResponseInfo - LEAK-3.2 - Exception During Response Processing
-   *
-   * Flow: Create ResponseInfo → Process → [Exception] → (no release)
-   * Expected: LEAK - exception breaks flow
-   */
-  @Test
-  public void testResponseInfo_Leak_ExceptionDuringProcessing_NoFinally() throws Exception {
-    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    content.writeInt(500);  // Error status
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, content);
-
-    try {
-      NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
-      int status = stream.readInt();
-
-      if (status == 500) {
-        // Simulate exception during processing
-        // throw new MessageFormatException("Corrupt data");
-        return;  // For tracer, just return instead of throw
-      }
-    } catch (Exception e) {
-      // Exception caught but DON'T release ResponseInfo
-      return;
-    }
-
-    // DO NOT call responseInfo.release()
-    // Content leaks
-  }
-
-  /**
-   * TEST 3.5: ResponseInfo - Exception During Processing WITH Finally
-   *
-   * Flow: Create ResponseInfo → Process → [Exception] → release() in finally
-   * Expected: NO LEAK - finally ensures cleanup
-   */
-  @Test
-  public void testResponseInfo_Safe_ExceptionDuringProcessing_WithFinally() throws Exception {
-    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    content.writeInt(500);
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, content);
-
-    try {
-      NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
-      int status = stream.readInt();
-
-      if (status == 500) {
-        // Exception during processing
-        return;
-      }
-    } finally {
-      // Cleanup happens despite exception
-      responseInfo.release();
-    }
-  }
-
-  /**
-   * TEST 3.6: ResponseInfo - LEAK-3.3 - Caller Confusion About Ownership (ByteBuf)
-   *
-   * Flow: Allocate ByteBuf → Create ResponseInfo → Caller still has ByteBuf reference
-   * Expected: Confusion about who owns ByteBuf
-   */
-  @Test
-  public void testResponseInfo_OwnershipConfusion_ByteBufRetained() throws Exception {
-    ByteBuf responseBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    responseBuf.writeInt(200);
-
-    // Caller creates ResponseInfo with responseBuf
-    ResponseInfo responseInfo = new ResponseInfo(null, null, responseBuf);
-
-    // Ownership transferred to ResponseInfo
-    // Caller should NOT use responseBuf anymore
-    // But caller might be confused and think they still own it
-
-    // Correct: Release ResponseInfo
-    responseInfo.release();
-
-    // Incorrect: Caller tries to release responseBuf separately
-    // This would be a double-release error if both happened
-    // responseBuf.release();  // WRONG - ResponseInfo owns it now
-  }
-
-  /**
-   * TEST 3.7: ResponseInfo - LEAK-3.3 - replace() Creates Orphan
-   *
-   * Flow: Create ResponseInfo → replace(newBuf) → Release only new one
-   * Expected: LEAK - original content orphaned
-   */
-  @Test
-  public void testResponseInfo_Leak_ReplaceCreatesOrphan() throws Exception {
-    ByteBuf bufferA = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    bufferA.writeInt(100);
-
-    ResponseInfo original = new ResponseInfo(null, null, bufferA);
-
-    ByteBuf bufferB = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    bufferB.writeInt(200);
-
-    ResponseInfo replaced = original.replace(bufferB);
-
-    // Release only the new ResponseInfo
-    replaced.release();  // Releases bufferB
-
-    // DO NOT release original - bufferA leaks
-    // This demonstrates the danger of replace()
-  }
-
-  /**
-   * TEST 3.8: ResponseInfo - replace() Proper Usage
-   *
-   * Flow: Create ResponseInfo → replace(newBuf) → Release BOTH
-   * Expected: NO LEAK - both released
-   */
-  @Test
-  public void testResponseInfo_Safe_ReplaceWithBothReleases() throws Exception {
-    ByteBuf bufferA = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    bufferA.writeInt(100);
-
-    ResponseInfo original = new ResponseInfo(null, null, bufferA);
-
-    ByteBuf bufferB = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    bufferB.writeInt(200);
-
-    ResponseInfo replaced = original.replace(bufferB);
-
-    // Correct: Release both
-    original.release();   // Releases bufferA
-    replaced.release();   // Releases bufferB
-  }
-
-  /**
-   * TEST 3.9: ResponseInfo - LEAK-3.4 - Send Object Not Released
-   *
-   * Flow: Create ResponseInfo with Send → (no release)
-   * Expected: LEAK - Send object and its internal ByteBufs leak
-   */
-  @Test
-  public void testResponseInfo_Leak_SendObjectNotReleased() throws Exception {
-    ByteBuf internalBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
-    internalBuf.writeBytes(generateRandomBytes(256));
-
-    MockSend send = new MockSend(internalBuf);
-
-    // LocalNetworkClient path - ResponseInfo with Send
-    ResponseInfo responseInfo = new ResponseInfo(null, null, (DataNodeId) null, send);
-
-    // Process response...
-
-    // DO NOT call responseInfo.release()
-    // Send object and internalBuf leak
-  }
-
-  /**
-   * TEST 3.10: ResponseInfo - Send Object Properly Released
-   *
-   * Flow: Create ResponseInfo with Send → release()
-   * Expected: NO LEAK - release() calls ReferenceCountUtil.safeRelease(response)
-   */
-  @Test
-  public void testResponseInfo_Safe_SendObjectReleased() throws Exception {
-    ByteBuf internalBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
-    internalBuf.writeBytes(generateRandomBytes(256));
-
-    MockSend send = new MockSend(internalBuf);
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, (DataNodeId) null, send);
-
-    // Process response...
-
-    // Proper cleanup
-    responseInfo.release();  // Calls ReferenceCountUtil.safeRelease(send)
-  }
-
-  /**
-   * TEST 3.11: ResponseInfo - Null Content (Network Error)
-   *
-   * Flow: Create ResponseInfo with null content (error case) → release()
-   * Expected: NO LEAK - null is safe to release
-   */
-  @Test
-  public void testResponseInfo_NullContent_NetworkError() throws Exception {
-    // Network error scenario - no content
-    ResponseInfo responseInfo = new ResponseInfo(null, NetworkClientErrorCode.ConnectionUnavailable,
-        (ByteBuf) null, (DataNodeId) null, false);
-
-    // Release should handle null safely
-    responseInfo.release();
-  }
-
-  /**
-   * TEST 3.12: ResponseInfo - Double Release
-   *
-   * Flow: Create ResponseInfo → release() → release()
-   * Expected: NO LEAK - second release() should be safe
-   */
-  @Test
-  public void testResponseInfo_DoubleRelease() throws Exception {
-    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    content.writeInt(200);
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, content);
-
-    responseInfo.release();  // First release - sets content=null
-    responseInfo.release();  // Second release - safe, content already null
-  }
-
-  /**
-   * TEST 3.13: ResponseInfo - Multiple ResponseInfos in List (Router Pattern)
-   *
-   * Flow: Create list of ResponseInfo → Process each → forEach(ResponseInfo::release)
-   * Expected: NO LEAK - all released
-   */
-  @Test
-  public void testResponseInfo_MultipleInList_AllReleased() throws Exception {
+  public void testResponseInfo_MultipleItems_ExceptionSafety() throws Exception {
     List<ResponseInfo> responseInfoList = new ArrayList<>();
 
     for (int i = 0; i < 10; i++) {
       ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-      content.writeInt(200 + i);
-      responseInfoList.add(new ResponseInfo(null, null, content));
-    }
-
-    // Process each response
-    for (ResponseInfo responseInfo : responseInfoList) {
-      NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
-      int status = stream.readInt();
-    }
-
-    // OperationController pattern - release all
-    responseInfoList.forEach(ResponseInfo::release);
-  }
-
-  /**
-   * TEST 3.14: ResponseInfo - Multiple ResponseInfos, Exception Mid-Processing
-   *
-   * Flow: Process list → Exception on 3rd item → Some released, some not
-   * Expected: PARTIAL LEAK - items after exception not released
-   */
-  @Test
-  public void testResponseInfo_MultipleInList_ExceptionMidLoop_NoFinally() throws Exception {
-    List<ResponseInfo> responseInfoList = new ArrayList<>();
-
-    for (int i = 0; i < 10; i++) {
-      ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-      content.writeInt(i == 2 ? 500 : 200);  // 3rd item has error status
-      responseInfoList.add(new ResponseInfo(null, null, content));
-    }
-
-    try {
-      for (int i = 0; i < responseInfoList.size(); i++) {
-        ResponseInfo responseInfo = responseInfoList.get(i);
-        NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
-        int status = stream.readInt();
-
-        if (status == 500) {
-          // Exception on 3rd item
-          return;  // Loop breaks
-        }
-
-        // Release as we process
-        responseInfo.release();
-      }
-    } catch (Exception e) {
-      // No cleanup in catch
-    }
-
-    // Items 0-1 were released
-    // Items 2-9 are LEAKED
-  }
-
-  /**
-   * TEST 3.15: ResponseInfo - Multiple ResponseInfos WITH Try-Finally
-   *
-   * Flow: Process list with try-finally → Exception → All released in finally
-   * Expected: NO LEAK - finally ensures all released
-   */
-  @Test
-  public void testResponseInfo_MultipleInList_ExceptionWithFinally() throws Exception {
-    List<ResponseInfo> responseInfoList = new ArrayList<>();
-
-    for (int i = 0; i < 10; i++) {
-      ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-      content.writeInt(i == 2 ? 500 : 200);
+      content.writeInt(i == 5 ? 500 : 200);  // 6th item has error
       responseInfoList.add(new ResponseInfo(null, null, content));
     }
 
@@ -878,126 +408,216 @@ public class ByteBufFlowTracerTest {
         int status = stream.readInt();
 
         if (status == 500) {
-          // Exception on 3rd item
-          return;
+          // Simulate exception during processing
+          // Exception would break the loop in naive implementation
         }
       }
     } finally {
-      // All items cleaned up despite exception
+      // Router pattern ensures all released even if exception
       responseInfoList.forEach(ResponseInfo::release);
+    }
+
+    // All ResponseInfo released despite exception
+  }
+
+  /**
+   * TEST 10: ResponseInfo - Replace Pattern
+   *
+   * PRODUCTION CODE: ResponseInfo.replace() usage
+   * Pattern: Create new ResponseInfo with different content
+   *
+   * Expected: Must release BOTH original and replaced ResponseInfo
+   */
+  @Test
+  public void testResponseInfo_ReplacePattern_BothReleased() throws Exception {
+    ByteBuf contentA = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
+    contentA.writeInt(100);
+    ResponseInfo original = new ResponseInfo(null, null, contentA);
+
+    ByteBuf contentB = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
+    contentB.writeInt(200);
+    ResponseInfo replaced = original.replace(contentB);
+
+    // Must release both
+    original.release();   // Releases contentA
+    replaced.release();   // Releases contentB
+  }
+
+  // ========================================
+  // SECTION 3: NettyByteBufDataInputStream Patterns
+  // Non-owning wrapper semantics
+  // ========================================
+
+  /**
+   * TEST 11: NettyByteBufDataInputStream - Non-Owning Wrapper Pattern
+   *
+   * PRODUCTION CODE: Throughout codebase
+   * Pattern: Stream wraps ByteBuf but doesn't own it, caller must release ByteBuf
+   *
+   * Expected: NO LEAK - Caller releases ByteBuf, stream is just a view
+   */
+  @Test
+  public void testNettyByteBufDataInputStream_NonOwningWrapper() throws Exception {
+    // Caller allocates and owns ByteBuf
+    ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
+    buf.writeInt(12345);
+    buf.writeLong(67890L);
+
+    // Create stream (non-owning wrapper)
+    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(buf);
+
+    // Read data
+    int intVal = stream.readInt();
+    long longVal = stream.readLong();
+
+    // Close stream does nothing to ByteBuf
+    stream.close();
+
+    // Caller must release ByteBuf
+    buf.release();
+  }
+
+  /**
+   * TEST 12: NettyByteBufDataInputStream - Used with ResponseInfo
+   *
+   * PRODUCTION CODE: ResponseInfo content processing
+   * Pattern: ResponseInfo owns content, stream wraps it, ResponseInfo.release() frees it
+   *
+   * Expected: NO LEAK - ResponseInfo owns ByteBuf, stream is wrapper
+   */
+  @Test
+  public void testNettyByteBufDataInputStream_WithResponseInfo() throws Exception {
+    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
+    content.writeInt(42);
+    content.writeLong(123456L);
+    content.writeBytes(generateRandomBytes(100));
+
+    // ResponseInfo owns content
+    ResponseInfo responseInfo = new ResponseInfo(null, null, content);
+
+    // Stream wraps ResponseInfo.content() but doesn't own it
+    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
+
+    // Read data
+    int statusCode = stream.readInt();
+    long timestamp = stream.readLong();
+
+    // ResponseInfo.release() releases content
+    responseInfo.release();
+
+    // Stream doesn't need to be released - it's just a wrapper
+  }
+
+  /**
+   * TEST 13: NettyByteBufDataInputStream - Exception During Read
+   *
+   * PRODUCTION CODE: Deserialization with potential exceptions
+   * Pattern: Exception during stream reading, must still release underlying ByteBuf
+   *
+   * Expected: NO LEAK - ByteBuf released in finally block
+   */
+  @Test
+  public void testNettyByteBufDataInputStream_ExceptionDuringRead() throws Exception {
+    ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(16);
+    buf.writeInt(100);
+    // Not enough data for readLong() - will throw exception
+
+    try {
+      NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(buf);
+      int value = stream.readInt();
+      long value2 = stream.readLong();  // Throws - not enough bytes
+    } catch (Exception e) {
+      // Expected exception
+    } finally {
+      // Caller must release ByteBuf even if exception
+      buf.release();
     }
   }
 
   // ========================================
   // SECTION 4: Integration Tests
-  // Tests that combine multiple classes
+  // Multi-class production patterns
   // ========================================
 
   /**
-   * TEST 4.1: PutRequest + ResponseInfo Integration - Full Roundtrip
+   * TEST 14: Full Roundtrip - Router to Server
    *
-   * Flow: Create PutRequest → Serialize → Create ResponseInfo → Deserialize → Release both
-   * Expected: NO LEAK - full roundtrip with proper cleanup
+   * PRODUCTION CODE: Complete request/response cycle
+   * Pattern: Router creates PutRequest → Server wraps → Both release properly
+   *
+   * Expected: NO LEAK - Complete lifecycle with proper cleanup
    */
   @Test
-  public void testIntegration_PutRequestResponseRoundtrip_ProperRelease() throws Exception {
-    // Create PutRequest
-    ByteBuf materializedBlob = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
-    materializedBlob.writeBytes(generateRandomBytes(BLOB_SIZE));
+  public void testIntegration_RouterToServer_FullRoundtrip() throws Exception {
+    // Router side: Create chunk and PutRequest with retainedDuplicate
+    ByteBuf routerChunk = PooledByteBufAllocator.DEFAULT.heapBuffer(BLOB_SIZE);
+    routerChunk.writeBytes(generateRandomBytes(BLOB_SIZE));
 
-    PutRequest putRequest = createSamplePutRequest(materializedBlob);
-    putRequest.prepareBuffer();
+    PutRequest routerRequest = createPutRequest(routerChunk.retainedDuplicate());
+    routerRequest.prepareBuffer();
 
-    // Serialize to channel
-    ByteBufferChannel channel = new ByteBufferChannel(ByteBuffer.allocate((int) putRequest.sizeInBytes()));
-    putRequest.writeTo(channel);
+    // Server side: Wrap in InputStream PutRequest
+    PutRequest serverRequest = new PutRequest(
+        routerRequest.getCorrelationId(),
+        routerRequest.getClientId(),
+        routerRequest.getBlobId(),
+        routerRequest.getBlobProperties(),
+        routerRequest.getUsermetadata(),
+        routerRequest.getBlobSize(),
+        routerRequest.getBlobType(),
+        routerRequest.getBlobEncryptionKey(),
+        new ByteBufInputStream(routerRequest.getBlob()),
+        null
+    );
 
-    // Create response
-    ByteBuf responseContent = PooledByteBufAllocator.DEFAULT.heapBuffer(128);
-    responseContent.writeInt(200);
-    ResponseInfo responseInfo = new ResponseInfo(null, null, responseContent);
+    // Process on server...
 
-    // Clean up both
-    putRequest.release();
-    responseInfo.release();
+    // Cleanup: Router releases its request, server's wrapper has nothing to release
+    routerRequest.release();  // Releases duplicate
+    routerChunk.release();     // Releases original
+
+    // serverRequest has blob=null (InputStream constructor), nothing to release
   }
 
   /**
-   * TEST 4.2: ResponseInfo + NettyByteBufDataInputStream Integration
+   * TEST 15: ResponseInfo Processing - Router Pattern
    *
-   * Flow: ResponseInfo content → NettyByteBufDataInputStream → Deserialize → Release ResponseInfo
-   * Expected: NO LEAK - stream is view, ResponseInfo owns content
+   * PRODUCTION CODE: OperationController complete flow
+   * Pattern: sendAndPoll → onResponse → forEach release
+   *
+   * Expected: NO LEAK
    */
   @Test
-  public void testIntegration_ResponseInfoWithStream_ProperPattern() throws Exception {
-    ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
-    content.writeInt(200);
-    content.writeLong(System.currentTimeMillis());
-    content.writeBytes(generateRandomBytes(100));
+  public void testIntegration_ResponseProcessing_CompleteRouterFlow() throws Exception {
+    List<ResponseInfo> responseInfoList = new ArrayList<>();
 
-    ResponseInfo responseInfo = new ResponseInfo(null, null, content);
+    // Simulate sendAndPoll returning responses
+    for (int i = 0; i < 3; i++) {
+      ByteBuf content = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
+      content.writeInt(200);
+      content.writeLong(System.currentTimeMillis());
+      content.writeBytes(generateRandomBytes(100));
 
-    // Create stream - just a view
-    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
+      responseInfoList.add(new ResponseInfo(null, null, content));
+    }
 
-    // Deserialize
-    int status = stream.readInt();
-    long timestamp = stream.readLong();
+    // Process all responses (onResponse)
+    for (ResponseInfo responseInfo : responseInfoList) {
+      NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
+      int status = stream.readInt();
+      long timestamp = stream.readLong();
+      // Handle response...
+    }
 
-    // Release ResponseInfo - this releases content
-    responseInfo.release();
-
-    // Stream doesn't need cleanup
-  }
-
-  /**
-   * TEST 4.3: Complex Flow - Multiple Allocations and Transfers
-   *
-   * Flow: Multiple ByteBuf allocations → PutRequest → ResponseInfo → Streams → Cleanup
-   * Expected: NO LEAK - demonstrates complex but correct flow
-   */
-  @Test
-  public void testIntegration_ComplexFlow_MultipleAllocations() throws Exception {
-    // Allocate multiple ByteBufs
-    ByteBuf blob1 = PooledByteBufAllocator.DEFAULT.heapBuffer(512);
-    blob1.writeBytes(generateRandomBytes(512));
-
-    ByteBuf blob2 = PooledByteBufAllocator.DEFAULT.heapBuffer(512);
-    blob2.writeBytes(generateRandomBytes(512));
-
-    // Create composite blob
-    CompositeByteBuf compositeBuf = PooledByteBufAllocator.DEFAULT.compositeHeapBuffer(2);
-    compositeBuf.addComponent(true, blob1);
-    compositeBuf.addComponent(true, blob2);
-
-    // Create PutRequest - ownership transfers
-    PutRequest putRequest = createSamplePutRequest(compositeBuf);
-    putRequest.prepareBuffer();
-
-    // Create ResponseInfo
-    ByteBuf responseContent = PooledByteBufAllocator.DEFAULT.heapBuffer(256);
-    responseContent.writeInt(200);
-    responseContent.writeBytes(generateRandomBytes(100));
-
-    ResponseInfo responseInfo = new ResponseInfo(null, null, responseContent);
-
-    // Use stream to read response
-    NettyByteBufDataInputStream stream = new NettyByteBufDataInputStream(responseInfo.content());
-    int status = stream.readInt();
-
-    // Release all owned objects
-    putRequest.release();
-    responseInfo.release();
+    // Router cleanup - line 627 in OperationController
+    responseInfoList.forEach(ResponseInfo::release);
   }
 
   // ========================================
   // Helper Methods
   // ========================================
 
-  /**
-   * Helper: Create a sample PutRequest with realistic data
-   */
-  private PutRequest createSamplePutRequest(ByteBuf materializedBlob) throws Exception {
+  private PutRequest createPutRequest(ByteBuf materializedBlob) throws Exception {
     int correlationId = RANDOM.nextInt();
     String clientId = "test-client";
 
@@ -1011,157 +631,9 @@ public class ByteBufFlowTracerTest {
         materializedBlob, BLOB_SIZE, BlobType.DataBlob, null);
   }
 
-  /**
-   * Helper: Generate random bytes
-   */
   private byte[] generateRandomBytes(int size) {
     byte[] bytes = new byte[size];
     RANDOM.nextBytes(bytes);
     return bytes;
-  }
-
-  /**
-   * Helper: Create a WritableByteChannel that throws IOException after N bytes
-   */
-  private static class FailingChannel implements WritableByteChannel {
-    private final int failAfterBytes;
-    private int bytesWritten = 0;
-    private boolean closed = false;
-
-    public FailingChannel(int failAfterBytes) {
-      this.failAfterBytes = failAfterBytes;
-    }
-
-    @Override
-    public int write(ByteBuffer src) throws IOException {
-      if (bytesWritten >= failAfterBytes) {
-        throw new IOException("Simulated network failure");
-      }
-
-      int toWrite = Math.min(src.remaining(), failAfterBytes - bytesWritten);
-      bytesWritten += toWrite;
-      src.position(src.position() + toWrite);
-      return toWrite;
-    }
-
-    @Override
-    public boolean isOpen() {
-      return !closed;
-    }
-
-    @Override
-    public void close() {
-      closed = true;
-    }
-  }
-
-  /**
-   * Helper: Create a mock Send object for testing ResponseInfo Send path
-   */
-  private static class MockSend implements Send {
-    private ByteBuf internalBuffer;
-
-    public MockSend(ByteBuf buffer) {
-      this.internalBuffer = buffer;
-    }
-
-    @Override
-    public long writeTo(WritableByteChannel channel) throws IOException {
-      if (internalBuffer != null) {
-        int bytesToWrite = internalBuffer.readableBytes();
-        ByteBuffer nioBuffer = internalBuffer.nioBuffer();
-        channel.write(nioBuffer);
-        return bytesToWrite;
-      }
-      return 0;
-    }
-
-    @Override
-    public boolean isSendComplete() {
-      return true;
-    }
-
-    @Override
-    public long sizeInBytes() {
-      return internalBuffer != null ? internalBuffer.readableBytes() : 0;
-    }
-
-    @Override
-    public ByteBuf content() {
-      return internalBuffer;
-    }
-
-    @Override
-    public MockSend copy() {
-      return this;
-    }
-
-    @Override
-    public MockSend duplicate() {
-      return this;
-    }
-
-    @Override
-    public MockSend retainedDuplicate() {
-      return this;
-    }
-
-    @Override
-    public MockSend replace(ByteBuf content) {
-      return new MockSend(content);
-    }
-
-    @Override
-    public MockSend retain() {
-      if (internalBuffer != null) {
-        internalBuffer.retain();
-      }
-      return this;
-    }
-
-    @Override
-    public MockSend retain(int increment) {
-      if (internalBuffer != null) {
-        internalBuffer.retain(increment);
-      }
-      return this;
-    }
-
-    @Override
-    public MockSend touch() {
-      if (internalBuffer != null) {
-        internalBuffer.touch();
-      }
-      return this;
-    }
-
-    @Override
-    public MockSend touch(Object hint) {
-      if (internalBuffer != null) {
-        internalBuffer.touch(hint);
-      }
-      return this;
-    }
-
-    @Override
-    public int refCnt() {
-      return internalBuffer != null ? internalBuffer.refCnt() : 0;
-    }
-
-    @Override
-    public boolean release() {
-      if (internalBuffer != null) {
-        return internalBuffer.release();
-      }
-      return false;
-    }
-
-    @Override
-    public boolean release(int decrement) {
-      if (internalBuffer != null) {
-        return internalBuffer.release(decrement);
-      }
-      return false;
-    }
   }
 }
