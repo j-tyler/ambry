@@ -73,10 +73,9 @@ public class NettyResponseChannelByteBufLeakTest {
     nettyConfig = new NettyConfig(verifiableProperties);
     performanceConfig = new PerformanceConfig(verifiableProperties);
 
-    // Create channel with ChunkedWriteHandler like production
-    channel = new EmbeddedChannel();
+    // Create channel with ChunkedWriteHandler in constructor to get proper context
     ChunkedWriteHandler chunkedWriteHandler = new ChunkedWriteHandler();
-    channel.pipeline().addLast(chunkedWriteHandler);
+    channel = new EmbeddedChannel(chunkedWriteHandler);
   }
 
   @After
@@ -107,11 +106,13 @@ public class NettyResponseChannelByteBufLeakTest {
    */
   @Test
   public void testWriteByteBufferReleasesWrapper() throws Exception {
-    // COPY EXACT SETUP FROM ByteBufLeakAnalysisFlowTest
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/test");
     NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
+
+    // Use the ChunkedWriteHandler's context directly instead of MockChannelHandlerContext
+    ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
+        channel.pipeline().context(handler), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
