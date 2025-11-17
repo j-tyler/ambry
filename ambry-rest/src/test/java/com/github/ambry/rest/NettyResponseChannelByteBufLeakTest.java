@@ -125,14 +125,21 @@ public class NettyResponseChannelByteBufLeakTest {
     // Verify channel is active before writing
     assertTrue("Channel should be active before write", channel.isActive());
 
+    // Track callback invocation
+    final Exception[] callbackException = new Exception[1];
     CountDownLatch latch = new CountDownLatch(1);
     responseChannel.write(byteBuffer, new Callback<Long>() {
       @Override
       public void onCompletion(Long result, Exception exception) {
-        assertNull("Should have no exception", exception);
+        callbackException[0] = exception;
         latch.countDown();
       }
     });
+
+    // Check if callback was invoked immediately with an error (indicates early return)
+    if (latch.getCount() == 0) {
+      fail("Write callback was invoked synchronously with exception: " + callbackException[0]);
+    }
 
     // Get the wrapper ByteBuf from the channel BEFORE processing
     // We need the reference now so we can check its refCnt after resolveChunk()
