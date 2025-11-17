@@ -107,77 +107,41 @@ public class NettyResponseChannelByteBufLeakTest {
    */
   @Test
   public void testWriteByteBufferReleasesWrapper() throws Exception {
+    // COPY EXACT SETUP FROM ByteBufLeakAnalysisFlowTest
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/test");
     NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
-
     NettyResponseChannel responseChannel = new NettyResponseChannel(
         new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
 
-    // PRODUCTION PATTERN: Call write(ByteBuffer)
-    // This creates an internal ByteBuf wrapper via Unpooled.wrappedBuffer()
-    ByteBuffer byteBuffer = ByteBuffer.allocate(100);
-    byteBuffer.put(new byte[100]);
-    byteBuffer.flip();
+    // PRODUCTION PATTERN: Use ByteBuffer, not ByteBuf
+    String data = "test data";
+    ByteBuffer byteBuffer = ByteBuffer.wrap(data.getBytes(StandardCharsets.UTF_8));
 
-    // Verify channel is active before writing
-    assertTrue("Channel should be active before write", channel.isActive());
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);  // Wraps as ByteBuf internally
 
-    // Track callback invocation
-    final Exception[] callbackException = new Exception[1];
-    CountDownLatch latch = new CountDownLatch(1);
-    responseChannel.write(byteBuffer, new Callback<Long>() {
-      @Override
-      public void onCompletion(Long result, Exception exception) {
-        callbackException[0] = exception;
-        latch.countDown();
-      }
-    });
+    // Get wrapper reference BEFORE onResponseComplete
+    ByteBuf wrapper = getWrapperFromChannel(responseChannel);
+    assertNotNull("Wrapper should exist in chunksToWrite", wrapper);
+    assertEquals("Wrapper should have refCnt=1 initially", 1, wrapper.refCnt());
 
-    // Don't check for immediate callback - just proceed with the test
-    // The callback being invoked synchronously indicates the response was a FullHttpResponse
-    // which means Content-Length was 0 and cleanup was triggered immediately
-
-    // Since cleanup was triggered, the chunk is already resolved
-    // We cannot get the wrapper from chunksToWrite because it's been removed
-    // This test cannot work with FullHttpResponse - we need chunked transfer encoding
-
-    // The real issue: we're not properly triggering chunked mode
-    // Let's try calling onResponseComplete FIRST, then checking the wrapper
     responseChannel.onResponseComplete(null);
 
-    // Wait for callback
-    assertTrue("Callback should complete", latch.await(5, TimeUnit.SECONDS));
+    // Verify callback completed
+    assertTrue("Callback should complete", callback.awaitCompletion(1000));
 
-    // At this point, if chunked mode was used:
-    // - readChunk() was called by ChunkDispenser
-    // - Chunk moved from chunksToWrite to chunksAwaitingCallback
-    // - retainedDuplicate() was called
-    // - HttpContent was written to channel
-    // - resolveChunk() was called after Netty released the duplicate
-
-    // Try to get wrapper from chunksAwaitingCallback (it may have been moved there)
-    ByteBuf wrapper = getWrapperFromAwaitingCallback(responseChannel);
-
-    if (wrapper == null) {
-      // If not in chunksAwaitingCallback, the chunk was already resolved
-      // This means cleanup was triggered (FullHttpResponse path)
-      fail("Chunk was resolved before we could get wrapper. " +
-           "This indicates FullHttpResponse was used instead of chunked transfer. " +
-           "Callback exception was: " + callbackException[0]);
-    }
-
-    // Read and release HttpContent objects
+    // Read outbound response
     HttpResponse response = channel.readOutbound();
     assertNotNull("Should have response", response);
 
+    // Read and release content
     Object outbound;
     while ((outbound = channel.readOutbound()) != null) {
       if (outbound instanceof HttpContent) {
-        HttpContent content = (HttpContent) outbound;
-        content.release();
+        ((HttpContent) outbound).release();
       }
     }
 
@@ -185,6 +149,28 @@ public class NettyResponseChannelByteBufLeakTest {
     // Before fix: refCnt=1 (LEAKED - resolveChunk doesn't call release)
     // After fix: refCnt=0 (RELEASED - resolveChunk calls buffer.release())
     assertEquals("Wrapper ByteBuf should be released after resolveChunk()", 0, wrapper.refCnt());
+  }
+
+  // Helper classes
+
+  /**
+   * Test callback implementation
+   */
+  private static class TestCallback implements Callback<Long> {
+    volatile Long result = null;
+    volatile Exception exception = null;
+    private final CountDownLatch latch = new CountDownLatch(1);
+
+    @Override
+    public void onCompletion(Long result, Exception exception) {
+      this.result = result;
+      this.exception = exception;
+      latch.countDown();
+    }
+
+    boolean awaitCompletion(long timeoutMs) throws InterruptedException {
+      return latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+    }
   }
 
   // Helper methods
