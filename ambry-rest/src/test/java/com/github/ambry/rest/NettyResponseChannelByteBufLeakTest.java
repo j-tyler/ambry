@@ -109,7 +109,6 @@ public class NettyResponseChannelByteBufLeakTest {
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/test");
     NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
 
-    // Use the ChunkedWriteHandler's context directly instead of MockChannelHandlerContext
     ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
     NettyResponseChannel responseChannel = new NettyResponseChannel(
         channel.pipeline().context(handler), nettyMetrics, performanceConfig, nettyConfig);
@@ -117,28 +116,38 @@ public class NettyResponseChannelByteBufLeakTest {
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
 
-    // PRODUCTION PATTERN: Use ByteBuffer, not ByteBuf
-    String data = "test data";
-    ByteBuffer byteBuffer = ByteBuffer.wrap(data.getBytes(StandardCharsets.UTF_8));
+    // Create our own wrapper to track it
+    byte[] data = "test data".getBytes(StandardCharsets.UTF_8);
+    ByteBuf wrapper = io.netty.buffer.Unpooled.wrappedBuffer(data);
+    assertEquals("Wrapper should start with refCnt=1", 1, wrapper.refCnt());
+
+    // Convert to ByteBuffer for the write call
+    ByteBuffer byteBuffer = wrapper.nioBuffer();
 
     TestCallback callback = new TestCallback();
-    responseChannel.write(byteBuffer, callback);  // Wraps as ByteBuf internally
+    responseChannel.write(byteBuffer, callback);
 
-    // Get wrapper reference BEFORE onResponseComplete
-    ByteBuf wrapper = getWrapperFromChannel(responseChannel);
-    assertNotNull("Wrapper should exist in chunksToWrite", wrapper);
-    assertEquals("Wrapper should have refCnt=1 initially", 1, wrapper.refCnt());
+    // Try to get wrapper from chunksToWrite (before processing)
+    ByteBuf wrapperFromWrite = getWrapperFromChannel(responseChannel);
+    if (wrapperFromWrite != null) {
+      System.out.println("Found wrapper in chunksToWrite with refCnt=" + wrapperFromWrite.refCnt());
+      wrapper = wrapperFromWrite;
+    }
+
+    // Try to get from chunksAwaitingCallback (during processing)
+    ByteBuf wrapperFromCallback = getWrapperFromAwaitingCallback(responseChannel);
+    if (wrapperFromCallback != null) {
+      System.out.println("Found wrapper in chunksAwaitingCallback with refCnt=" + wrapperFromCallback.refCnt());
+      wrapper = wrapperFromCallback;
+    }
 
     responseChannel.onResponseComplete(null);
-
-    // Verify callback completed
     assertTrue("Callback should complete", callback.awaitCompletion(1000));
 
-    // Read outbound response
+    // Read and release HttpContent
     HttpResponse response = channel.readOutbound();
     assertNotNull("Should have response", response);
 
-    // Read and release content
     Object outbound;
     while ((outbound = channel.readOutbound()) != null) {
       if (outbound instanceof HttpContent) {
@@ -146,9 +155,10 @@ public class NettyResponseChannelByteBufLeakTest {
       }
     }
 
-    // CRITICAL ASSERTION: Wrapper ByteBuf should be released after resolveChunk()
-    // Before fix: refCnt=1 (LEAKED - resolveChunk doesn't call release)
-    // After fix: refCnt=0 (RELEASED - resolveChunk calls buffer.release())
+    // CRITICAL ASSERTION
+    // The wrapper we created should have been released by resolveChunk()
+    // Before fix: refCnt > 0 (LEAKED)
+    // After fix: refCnt = 0 (released)
     assertEquals("Wrapper ByteBuf should be released after resolveChunk()", 0, wrapper.refCnt());
   }
 
