@@ -1685,14 +1685,23 @@ public class MessageFormatRecord {
         throw new IOException("We only support data of max size == MAX_INT. Error while reading blob from store");
       }
       ByteBuf byteBuf = Utils.readNettyByteBufFromCrcInputStream(crcStream, (int) dataSize);
-      long crc = crcStream.getValue();
-      long streamCrc = dataStream.readLong();
-      if (crc != streamCrc) {
-        logger.error("corrupt data while parsing blob content expectedcrc {} actualcrc {}", crc, streamCrc);
-        throw new MessageFormatException("corrupt data while parsing blob content",
-            MessageFormatErrorCodes.DataCorrupt);
+      // Track success to ensure byteBuf is released only on error path (not when ownership transfers to BlobData)
+      boolean success = false;
+      try {
+        long crc = crcStream.getValue();
+        long streamCrc = dataStream.readLong();
+        if (crc != streamCrc) {
+          logger.error("corrupt data while parsing blob content expectedcrc {} actualcrc {}", crc, streamCrc);
+          throw new MessageFormatException("corrupt data while parsing blob content",
+              MessageFormatErrorCodes.DataCorrupt);
+        }
+        success = true;
+        return new BlobData(BlobType.DataBlob, dataSize, byteBuf);
+      } finally {
+        if (!success) {
+          byteBuf.release();
+        }
       }
-      return new BlobData(BlobType.DataBlob, dataSize, byteBuf);
     }
   }
 
