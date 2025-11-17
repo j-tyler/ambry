@@ -132,7 +132,7 @@ public class NettyResponseChannelByteBufLeakTest {
 
     // Get the wrapper ByteBuf from the channel before processing
     ByteBuf wrapper = getWrapperFromChannel(responseChannel);
-    assertNotNull("Wrapper should exist", wrapper);
+    assertNotNull("Wrapper ByteBuf should exist in chunksToWrite queue after write() call", wrapper);
 
     // Wrapper should have refCnt=1 initially (created by Unpooled.wrappedBuffer)
     assertEquals("Wrapper should have refCnt=1 before chunk processing", 1, wrapper.refCnt());
@@ -193,23 +193,4 @@ public class NettyResponseChannelByteBufLeakTest {
     return (ByteBuf) bufferField.get(chunk);
   }
 
-  /**
-   * Helper callback implementation
-   */
-  private static class TestCallback implements Callback<Long> {
-    volatile Long result = null;
-    volatile Exception exception = null;
-    private final CountDownLatch latch = new CountDownLatch(1);
-
-    @Override
-    public void onCompletion(Long result, Exception exception) {
-      this.result = result;
-      this.exception = exception;
-      latch.countDown();
-    }
-
-    boolean awaitCompletion(long timeoutMs) throws InterruptedException {
-      return latch.await(timeoutMs, TimeUnit.MILLISECONDS);
-    }
-  }
 }
