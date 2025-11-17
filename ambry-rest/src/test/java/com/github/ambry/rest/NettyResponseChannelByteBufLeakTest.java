@@ -19,6 +19,7 @@ import com.github.ambry.config.NettyConfig;
 import com.github.ambry.config.PerformanceConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.HttpContent;
@@ -28,10 +29,12 @@ import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.stream.ChunkedWriteHandler;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.Properties;
+import java.util.Queue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.After;
@@ -41,12 +44,17 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 /**
- * Test to prove ByteBuf leak in NettyResponseChannel when write(ByteBuffer) creates internal wrappers.
+ * Tests for ByteBuf memory leak in NettyResponseChannel.
  *
- * The bug: When write(ByteBuffer) is called, NettyResponseChannel creates a ByteBuf wrapper using
- * Unpooled.wrappedBuffer(). This ByteBuf is stored in a Chunk, and when readChunk() is called,
- * it creates a retainedDuplicate() which increments the refCount. Netty releases the duplicate,
- * but the original ByteBuf in the Chunk is never released in resolveChunk().
+ * NettyResponseChannel.write(ByteBuffer) creates a memory leak by wrapping the input ByteBuffer
+ * in a Netty ByteBuf wrapper without releasing it. The callback has no reference to it.
+ * According to Netty's reference counting contract, whoever creates or retains a ByteBuf is
+ * responsible for releasing it. Since NettyResponseChannel creates the wrapper internally,
+ * it must release it. The original code never calls wrapper.release() in resolveChunk(),
+ * causing every call to write(ByteBuffer) to leak native memory.
+ *
+ * This test uses reflection to extract the internal wrapper ByteBuf and verify its refCount
+ * lifecycle to prove the bug exists before the fix and is resolved after the fix.
  */
 public class NettyResponseChannelByteBufLeakTest {
   private NettyByteBufLeakHelper nettyByteBufLeakHelper = new NettyByteBufLeakHelper();
@@ -79,20 +87,26 @@ public class NettyResponseChannelByteBufLeakTest {
   }
 
   /**
-   * This test proves the ByteBuf leak when write(ByteBuffer) creates an internal wrapper.
+   * Verifies that write(ByteBuffer) properly releases internal wrapper ByteBufs.
    *
-   * Test flow:
-   * 1. Call write(ByteBuffer) which creates internal ByteBuf wrapper
-   * 2. Process the write through completion
-   * 3. NettyByteBufLeakHelper will detect leaked ByteBuf in tearDown()
+   * Bug: write(ByteBuffer) calls Unpooled.wrappedBuffer() which creates a ByteBuf
+   * with refCnt=1. This wrapper is stored in a Chunk, but resolveChunk() never
+   * calls release(), causing a memory leak.
    *
-   * Before fix: Test FAILS - NettyByteBufLeakHelper detects the internal ByteBuf wrapper leaked
-   * After fix: Test PASSES - Internal ByteBuf wrapper is released in resolveChunk()
+   * Test strategy:
+   * 1. Call write(ByteBuffer) to create internal wrapper via Unpooled.wrappedBuffer()
+   * 2. Use reflection to extract the wrapper ByteBuf from the Chunk
+   * 3. Verify wrapper has refCnt=1 before chunk processing
+   * 4. Trigger chunk processing through normal flow (readChunk creates duplicate)
+   * 5. After Netty releases the duplicate and resolveChunk() is called
+   * 6. Assert wrapper has refCnt=0 (released)
+   *
+   * Before fix: Assertion FAILS - wrapper has refCnt=1 (leaked)
+   * After fix: Assertion PASSES - wrapper has refCnt=0 (released in resolveChunk)
    */
   @Test
-  public void testWriteByteBufferLeaksInternalWrapper() throws Exception {
+  public void testWriteByteBufferReleasesWrapper() throws Exception {
     HttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/test");
-    NettyRequest request = new NettyRequest(httpRequest, channel, nettyMetrics, Collections.emptySet());
 
     NettyResponseChannel responseChannel = new NettyResponseChannel(
         new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
@@ -102,23 +116,39 @@ public class NettyResponseChannelByteBufLeakTest {
 
     // PRODUCTION PATTERN: Call write(ByteBuffer)
     // This creates an internal ByteBuf wrapper via Unpooled.wrappedBuffer()
-    String data = "test data that will leak";
-    ByteBuffer byteBuffer = ByteBuffer.wrap(data.getBytes(StandardCharsets.UTF_8));
+    ByteBuffer byteBuffer = ByteBuffer.allocate(100);
+    byteBuffer.put(new byte[100]);
+    byteBuffer.flip();
 
-    TestCallback callback = new TestCallback();
-    responseChannel.write(byteBuffer, callback);
+    CountDownLatch latch = new CountDownLatch(1);
+    responseChannel.write(byteBuffer, new Callback<Long>() {
+      @Override
+      public void onCompletion(Long result, Exception exception) {
+        assertNull("Should have no exception", exception);
+        latch.countDown();
+      }
+    });
+
+    // Get the wrapper ByteBuf from the channel before processing
+    ByteBuf wrapper = getWrapperFromChannel(responseChannel);
+    assertNotNull("Wrapper should exist", wrapper);
+
+    // Wrapper should have refCnt=1 initially (created by Unpooled.wrappedBuffer)
+    assertEquals("Wrapper should have refCnt=1 before chunk processing", 1, wrapper.refCnt());
 
     // Complete the response to trigger chunk processing
+    // This will call readChunk() which creates a retainedDuplicate (refCnt becomes 2)
+    // Then Netty releases the duplicate (refCnt becomes 1)
+    // Then resolveChunk() is called
     responseChannel.onResponseComplete(null);
 
     // Wait for callback
-    assertTrue("Callback should complete", callback.awaitCompletion(1000));
+    assertTrue("Callback should complete", latch.await(5, TimeUnit.SECONDS));
 
-    // Read response
+    // Read and release HttpContent objects
     HttpResponse response = channel.readOutbound();
     assertNotNull("Should have response", response);
 
-    // Read and release HttpContent objects
     Object outbound;
     while ((outbound = channel.readOutbound()) != null) {
       if (outbound instanceof HttpContent) {
@@ -127,10 +157,39 @@ public class NettyResponseChannelByteBufLeakTest {
       }
     }
 
-    // LEAK DETECTION:
-    // The NettyByteBufLeakHelper.afterTest() in tearDown() will detect any ByteBuf leaks.
-    // Before fix: Will detect the leaked internal ByteBuf wrapper → TEST FAILS
-    // After fix: No leak detected → TEST PASSES
+    // CRITICAL ASSERTION: Wrapper ByteBuf should be released after resolveChunk()
+    // Before fix: refCnt=1 (LEAKED - resolveChunk doesn't call release)
+    // After fix: refCnt=0 (RELEASED - resolveChunk calls buffer.release())
+    assertEquals("Wrapper ByteBuf should be released after resolveChunk()", 0, wrapper.refCnt());
+  }
+
+  // Helper methods
+
+  /**
+   * Gets the wrapper ByteBuf from the channel's chunk queue using reflection.
+   * This allows us to verify the internal ByteBuf's refCount before and after resolution.
+   *
+   * @param responseChannel the NettyResponseChannel to extract the wrapper from
+   * @return the wrapper ByteBuf from chunksToWrite queue
+   * @throws Exception if reflection fails
+   */
+  private ByteBuf getWrapperFromChannel(NettyResponseChannel responseChannel) throws Exception {
+    // Access the private chunksToWrite field
+    Field chunksToWriteField = NettyResponseChannel.class.getDeclaredField("chunksToWrite");
+    chunksToWriteField.setAccessible(true);
+    Queue<?> chunksToWrite = (Queue<?>) chunksToWriteField.get(responseChannel);
+
+    // Get the first Chunk
+    Object chunk = chunksToWrite.peek();
+    if (chunk == null) {
+      return null;
+    }
+
+    // Access the Chunk's buffer field
+    Class<?> chunkClass = chunk.getClass();
+    Field bufferField = chunkClass.getDeclaredField("buffer");
+    bufferField.setAccessible(true);
+    return (ByteBuf) bufferField.get(chunk);
   }
 
   /**
