@@ -73,9 +73,9 @@ public class NettyResponseChannelByteBufLeakTest {
     nettyConfig = new NettyConfig(verifiableProperties);
     performanceConfig = new PerformanceConfig(verifiableProperties);
 
-    channel = new EmbeddedChannel();
+    // Create channel with handler in constructor to ensure it's registered and active
     ChunkedWriteHandler chunkedWriteHandler = new ChunkedWriteHandler();
-    channel.pipeline().addLast(chunkedWriteHandler);
+    channel = new EmbeddedChannel(chunkedWriteHandler);
   }
 
   @After
