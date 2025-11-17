@@ -14,6 +14,7 @@
 package com.github.ambry.router;
 
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.utils.NettyByteBufLeakHelper;
 import com.github.ambry.account.Account;
 import com.github.ambry.account.Container;
 import com.github.ambry.clustermap.DataNodeId;
@@ -22,6 +23,7 @@ import com.github.ambry.clustermap.MockDataNodeId;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
+import com.github.ambry.commons.ByteBufReadableStreamChannel;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.Callback;
 import com.github.ambry.commons.LoggingNotificationSystem;
@@ -87,6 +89,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -97,6 +101,8 @@ import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import javax.sql.DataSource;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import org.json.JSONObject;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -4549,5 +4555,76 @@ public class NonBlockingRouterTest extends NonBlockingRouterTestBase {
       assertEquals(expectedRecord.getLifeVersion(), record.getLifeVersion());
       assertEquals(expectedRecord.getExpirationTimeMs(), record.getExpirationTimeMs());
     }
+  }
+
+  /**
+   * Test for ByteBuf memory leak in PutOperation when operations are aborted with chunks in Building state.
+   *
+   * This test verifies that PutOperation properly releases ByteBufs when the operation completes/fails, even if
+   * the ChunkFiller thread hasn't processed some data yet. High concurrency triggers the race where operations
+   * complete before ChunkFiller processes all queued ByteBufs, which would cause a leak without proper cleanup.
+   */
+  @Test
+  public void testPutOperationByteBufLeakOnAbort() throws Exception {
+    NettyByteBufLeakHelper testLeakHelper = new NettyByteBufLeakHelper();
+    testLeakHelper.beforeTest();
+
+    Properties props = getNonBlockingRouterProperties(localDcName);
+    int chunkSize = 512;
+    props.setProperty("router.max.put.chunk.size.bytes", Integer.toString(chunkSize));
+    setRouter(props, mockServerLayout, new LoggingNotificationSystem());
+
+    // Configure servers to succeed for first few chunks, then fail
+    List<ServerErrorCode> serverErrorList = new ArrayList<>();
+    serverErrorList.add(ServerErrorCode.NoError);
+    serverErrorList.add(ServerErrorCode.NoError);
+    serverErrorList.add(ServerErrorCode.NoError);
+    for (int i = 0; i < 20000; i++) {
+      serverErrorList.add(ServerErrorCode.PartitionReadOnly);
+    }
+    mockServerLayout.getMockServers().forEach(server -> server.setServerErrors(serverErrorList));
+
+      int numTasks = 100;
+      int threadPoolSize = 100;
+      int blobSize = 10 * chunkSize;
+      CountDownLatch startLatch = new CountDownLatch(1);
+      ExecutorService executor = Executors.newFixedThreadPool(threadPoolSize);
+
+    for (int i = 0; i < numTasks; i++) {
+      executor.submit(() -> {
+        try {
+          startLatch.await();
+
+          byte[] blobData = new byte[blobSize];
+          ThreadLocalRandom.current().nextBytes(blobData);
+          ByteBuf pooledBuf = PooledByteBufAllocator.DEFAULT.buffer(blobSize);
+          pooledBuf.writeBytes(blobData);
+          ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(pooledBuf);
+
+            BlobProperties blobProperties = new BlobProperties(blobSize, "serviceId", "ownerId", "contentType",
+                false, Utils.Infinite_Time, Utils.getRandomShort(ThreadLocalRandom.current()),
+                Utils.getRandomShort(ThreadLocalRandom.current()), false, null, null, null);
+
+            try {
+              router.putBlob(blobProperties, new byte[10], channel, PutBlobOptions.DEFAULT).get();
+            } catch (ExecutionException e) {
+              // Expected for operations that hit error responses
+            }
+          } catch (Exception e) {
+            fail("Unexpected exception: " + e.getMessage());
+          }
+        });
+      }
+
+      startLatch.countDown();
+      executor.shutdown();
+      assertTrue("Operations should complete within reasonable time",
+          executor.awaitTermination(1, TimeUnit.SECONDS));
+
+    // Check for leaks before router.close() because close() calls cleanupChunks() which would mask the bug
+    testLeakHelper.afterTest();
+
+    router.close();
+    router = null;
   }
 }

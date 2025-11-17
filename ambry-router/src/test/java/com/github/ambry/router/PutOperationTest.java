@@ -248,7 +248,7 @@ public class PutOperationTest {
     // Calling fillChunks would fetch the buffer chunk and the empty chunk from the channel
     op.fillChunks();
     // Now fail the operation
-    op.setOperationCompleted();
+    op.setOperationCompletedAndReleaseChunks();
     // Calling fillChunks again, this would force fillChunk to release the empty chunk
     op.fillChunks();
     // Now call fillChunk again
@@ -407,7 +407,7 @@ public class PutOperationTest {
         PutOperation.PutChunk putChunk = op.getPutChunks()
             .stream().filter(chunk -> chunk.state == PutOperation.ChunkState.Ready).collect(Collectors.toList()).get(0);
         // Verify that CRC matches
-        Assert.assertTrue("CRC should match", putChunk.verifyCRC());
+        Assert.assertTrue("CRC should match", putChunk.verifyCRCUnderLock());
       }
       op.handleResponse(responseInfo, putResponse);
       requestInfos.get(i).getRequest().release();
@@ -897,7 +897,7 @@ public class PutOperationTest {
     op.poll(requestRegistrationCallback);
     // CRC on empty content should always succeed (typically CRC32(0 bytes) == 0)
     PutOperation.PutChunk putChunk = op.getPutChunks().get(0);
-    Assert.assertTrue("CRC should match for empty content", putChunk.verifyCRC());
+    Assert.assertTrue("CRC should match for empty content", putChunk.verifyCRCUnderLock());
     for (RequestInfo requestInfo : requestInfos) {
       requestInfo.getRequest().release();
     }
@@ -980,7 +980,7 @@ public class PutOperationTest {
     op.poll(requestRegistrationCallback);
 
     for (PutOperation.PutChunk putChunk : op.getPutChunks()) {
-      Assert.assertTrue("CRC should match for each chunk", putChunk.verifyCRC());
+      Assert.assertTrue("CRC should match for each chunk", putChunk.verifyCRCUnderLock());
     }
   }
 
@@ -1012,7 +1012,7 @@ public class PutOperationTest {
     MethodUtils.invokeMethod(putChunk, true, "compressChunk", false);
 
     // CRC should work for compressed chunk
-    Assert.assertTrue("CRC should match for compressed chunk", putChunk.verifyCRC());
+    Assert.assertTrue("CRC should match for compressed chunk", putChunk.verifyCRCUnderLock());
 
     // Verify the chunk is compressed.
     Assert.assertTrue((boolean) FieldUtils.readField(putChunk, "isChunkCompressed", true));
@@ -1048,7 +1048,7 @@ public class PutOperationTest {
     allowedOp.startOperation();
     allowedOp.fillChunks();
     // CRC should be verified for allowed account/container
-    Assert.assertTrue("CRC should be verified for allowed account/container", allowedOp.putChunks.peek().verifyCRC());
+    Assert.assertTrue("CRC should be verified for allowed account/container", allowedOp.putChunks.peek().verifyCRCUnderLock());
 
     // Disallowed account/container
     BlobProperties disallowedBlobProperties =
@@ -1066,7 +1066,7 @@ public class PutOperationTest {
     // CRC should NOT be verified for disallowed account/container
     Assert.assertTrue(
         "CRC should not be verified for disallowed account/container (always returns true if not checked)",
-        disallowedOp.putChunks.peek().verifyCRC());
+        disallowedOp.putChunks.peek().verifyCRCUnderLock());
   }
 
   @Test
@@ -1094,7 +1094,7 @@ public class PutOperationTest {
     op1.startOperation();
     op1.fillChunks();
     Assert.assertTrue("CRC should be verified for any account/container when wildcard is present",
-        op1.putChunks.peek().verifyCRC());
+        op1.putChunks.peek().verifyCRCUnderLock());
 
     // Try with another arbitrary account/container
     BlobProperties blobProperties2 =
@@ -1109,7 +1109,7 @@ public class PutOperationTest {
     op2.startOperation();
     op2.fillChunks();
     Assert.assertTrue("CRC should be verified for any account/container when wildcard is present",
-        op2.putChunks.peek().verifyCRC());
+        op2.putChunks.peek().verifyCRCUnderLock());
   }
 
 
@@ -1212,7 +1212,7 @@ public class PutOperationTest {
       op.handleResponse(responseInfo, null);
       responseInfo.release();
     }
-    op.setOperationCompleted();
+    op.setOperationCompletedAndReleaseChunks();
   }
 
   /**
