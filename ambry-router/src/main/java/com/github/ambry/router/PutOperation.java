@@ -1522,13 +1522,15 @@ class PutOperation {
             buf != null ? buf.readableBytes() : 0);
       }
 
-      // Verify CRC under BUFFER_LOCK because CRC read the buffer content
-      boolean crcValid;
-      synchronized (BUFFER_LOCK) {
-        crcValid = exception == null && verifyCRCUnderLock();
+      // Only verify CRC if encryption succeeded - encryption exceptions should go to UnexpectedInternalError path
+      boolean crcMismatch = false;
+      if (exception == null) {
+        synchronized (BUFFER_LOCK) {
+          crcMismatch = !verifyCRCUnderLock();
+        }
       }
 
-      if (!crcValid) {
+      if (crcMismatch) {
         // CRC mismatch indicates data corruption
         logger.error("CRC of the chunk {} is different before and after encryption", chunkBlobId);
         releaseBlobContent();
@@ -1536,7 +1538,7 @@ class PutOperation {
           result.release();
         }
         setOperationExceptionAndComplete(
-            new RouterException("CRC of chunk {} is different before and after encryption" + chunkBlobId, exception,
+            new RouterException("CRC of chunk {} is different before and after encryption" + chunkBlobId, null,
                 RouterErrorCode.BlobCorrupted));
         routerMetrics.encryptTimeMs.update(time.milliseconds() - chunkEncryptReadyAtMs);
         routerCallback.onPollReady();
