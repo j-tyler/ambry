@@ -762,14 +762,12 @@ class PutOperation {
 
         if (lastChunk != null) {
           boolean shouldDiscard = false;
-          synchronized (lastChunk.BUFFER_LOCK) {
+          synchronized (BUFFER_LOCK) {
             // Principle 3: Check operationCompleted after acquiring lock
-            if (lastChunk.isOperationComplete()) {
-              logger.debug("{}: Chunk {} already complete, skipping fillChunks processing", loggingContext, lastChunk.chunkIndex);
-              continue;
+            if (!isOperationComplete()) {
+              // Principle 1: Read buf under lock
+              shouldDiscard = chunkCounter != 0 && lastChunk.buf != null && lastChunk.buf.readableBytes() == 0;
             }
-            // Principle 1: Read buf under lock
-            shouldDiscard = chunkCounter != 0 && lastChunk.buf.readableBytes() == 0;
           }
 
           if (shouldDiscard) {
@@ -777,7 +775,7 @@ class PutOperation {
                 loggingContext);
             lastChunk.releaseBlobContent();
             lastChunk.state = ChunkState.Free;
-          } else {
+          } else if (!isOperationComplete()) {
             lastChunk.onFillComplete(true);
             updateChunkFillerWaitTimeMetrics();
           }
