@@ -52,8 +52,9 @@ class PutManager {
   private static final Logger logger = LoggerFactory.getLogger(PutManager.class);
 
   private final Set<PutOperation> putOperations;
-  // Queue of operations that have completed/failed but may have Building chunks that need cleanup.
-  // ChunkFiller thread processes this queue to release any Building chunk buffers.
+  // Queue of operations that have completed/failed and need chunk cleanup.
+  // ChunkFiller thread processes this queue to release all chunk buffers (except Free/Encrypting).
+  // This is the ONLY cleanup path for normal operation completion - no synchronous cleanup on error.
   private final Queue<PutOperation> cleanupQueue = new ConcurrentLinkedQueue<>();
   private final NotificationSystem notificationSystem;
   private final KeyManagementService kms;
@@ -297,7 +298,8 @@ class PutManager {
       routerMetrics.operationFailureWithUnsetExceptionCount.inc();
     }
     if (e != null) {
-      op.cleanupChunks();
+      // Chunk cleanup now handled asynchronously by ChunkFiller via cleanup queue
+      // This prevents race conditions where chunks transition states during cleanup
       blobId = null;
       routerMetrics.onPutBlobError(e, op.isEncryptionEnabled(), op.isStitchOperation());
       routerCallback.scheduleDeletes(op.getSuccessfullyPutChunkIdsIfCompositeDirectUpload(), op.getServiceId(),
@@ -305,8 +307,9 @@ class PutManager {
     } else {
       updateChunkingAndSizeMetricsOnSuccessfulPut(op);
     }
-    // Add to cleanup queue so ChunkFiller can release any Building chunks that may not have been processed yet.
-    // This prevents memory leaks when operations complete before ChunkFiller processes in-flight Building chunks.
+    // Add to cleanup queue so ChunkFiller can release all chunks asynchronously.
+    // This is the ONLY cleanup path for normal operation completion (success or error).
+    // By centralizing cleanup in ChunkFiller, we avoid race conditions and respect thread ownership.
     cleanupQueue.offer(op);
     routerMetrics.operationDequeuingRate.mark();
     long operationLatencyMs = time.milliseconds() - op.getSubmissionTimeMs();
@@ -424,10 +427,10 @@ class PutManager {
               chunkFillerThreadMaySleep = false;
             }
           }
-          // Process cleanup queue - release any Building chunks from completed operations
+          // Process cleanup queue - release all chunks (except Free/Encrypting) from completed operations
           PutOperation opToClean;
           while ((opToClean = cleanupQueue.poll()) != null) {
-            opToClean.releaseUnprocessedChunks();
+            opToClean.releaseAllChunks();
           }
           if (chunkFillerThreadMaySleep || forceChunkFillerThreadToSleep) {
             synchronized (chunkFillerSynchronizer) {

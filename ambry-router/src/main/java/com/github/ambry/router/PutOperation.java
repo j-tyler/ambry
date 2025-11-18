@@ -569,7 +569,8 @@ class PutOperation {
 
   void setOperationCompleted() {
     operationCompleted = true;
-    clearReadyChunks();
+    // Chunk cleanup now handled asynchronously by ChunkFiller via cleanup queue
+    // This prevents race conditions where chunks transition states during cleanup
   }
 
   /**
@@ -581,20 +582,23 @@ class PutOperation {
   }
 
   /**
-   * Release any unprocessed chunks (Building or AwaitingBlobTypeResolution) that haven't been transitioned to
-   * Ready/Complete/Encrypting states. This is called by the ChunkFiller thread after an operation completes
-   * to clean up chunks that were being filled when the operation was removed from the active operations set.
+   * Release all chunks except Free (no buffer allocated) and Encrypting (owned by encryption thread).
+   * This is called by the ChunkFiller thread after an operation completes to clean up all chunk buffers.
    *
-   * This method is intentionally NOT synchronized - it's called exclusively by ChunkFiller thread which is the
-   * only thread that creates and accesses Building chunks, avoiding race conditions.
+   * This is the ONLY place where chunk cleanup happens for normal operation completion (success or error).
+   * By centralizing cleanup here, we avoid race conditions where chunks transition between states during
+   * cleanup, and we respect thread ownership (ChunkFiller owns all non-Encrypting chunks, encryption thread
+   * owns Encrypting chunks).
+   *
+   * This method is intentionally NOT synchronized - it's called exclusively by ChunkFiller thread.
    */
-  void releaseUnprocessedChunks() {
+  void releaseAllChunks() {
     for (PutChunk chunk : putChunks) {
-      // Only release chunks in Building or AwaitingBlobTypeResolution states.
-      // These are states that only ChunkFiller manages, so no synchronization is needed.
-      // Skip Free (no content), Encrypting (encryption thread owns), Ready/Complete (already processed).
-      if (chunk.isBuilding() || chunk.state == ChunkState.AwaitingBlobTypeResolution) {
-        logger.debug("{}: Releasing unprocessed chunk {} in state {}", loggingContext, chunk.getChunkIndex(),
+      // Release all chunks except:
+      // - Free: No buffer allocated, nothing to release
+      // - Encrypting: Owned by encryption thread, which handles its own cleanup
+      if (!chunk.isFree() && !chunk.isEncrypting()) {
+        logger.debug("{}: Releasing chunk {} in state {} during cleanup", loggingContext, chunk.getChunkIndex(),
             chunk.getState());
         chunk.releaseBlobContent();
       }
