@@ -311,11 +311,13 @@ class PutManager {
     // This is the ONLY cleanup path for normal operation completion (success or error).
     // By centralizing cleanup in ChunkFiller, we avoid race conditions and respect thread ownership.
     cleanupQueue.offer(op);
-    // Wake up ChunkFiller to process cleanup queue immediately
-    synchronized (chunkFillerSynchronizer) {
-      chunkFillerThreadMaySleep = false;
-      if (isChunkFillerThreadAsleep) {
-        chunkFillerSynchronizer.notify();
+    // Wake up ChunkFiller to process cleanup queue immediately (only if router is still open)
+    if (isOpen.get()) {
+      synchronized (chunkFillerSynchronizer) {
+        chunkFillerThreadMaySleep = false;
+        if (isChunkFillerThreadAsleep) {
+          chunkFillerSynchronizer.notify();
+        }
       }
     }
     routerMetrics.operationDequeuingRate.mark();
