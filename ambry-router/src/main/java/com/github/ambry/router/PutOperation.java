@@ -765,8 +765,9 @@ class PutOperation {
           synchronized (BUFFER_LOCK) {
             // Principle 3: Check operationCompleted after acquiring lock
             if (!isOperationComplete()) {
-              // Principle 1: Read buf under lock
-              shouldDiscard = chunkCounter != 0 && lastChunk.buf != null && lastChunk.buf.readableBytes() == 0;
+              // Principle 1: Read buffer under lock
+              shouldDiscard = chunkCounter != 0 && !lastChunk.bufferManager.isReleased()
+                  && lastChunk.bufferManager.getBufferSize() == 0;
             }
           }
 
@@ -1184,6 +1185,412 @@ class PutOperation {
   }
 
   /**
+   * Manages the lifecycle of a single chunk's ByteBuf with proper thread-safety.
+   * <p>
+   * Thread-safety model:
+   * <ul>
+   *   <li>All operations synchronized on internal lock</li>
+   *   <li>Supports ownership transfer via retainedDuplicate()</li>
+   *   <li>Tracks whether operation is complete to prevent use-after-free</li>
+   * </ul>
+   * <p>
+   * Ownership model:
+   * <ul>
+   *   <li>ChunkBufferManager owns the primary buffer</li>
+   *   <li>retainForX() methods transfer ownership to caller (caller MUST release)</li>
+   *   <li>replaceBuffer() transfers ownership TO manager</li>
+   * </ul>
+   */
+  static class ChunkBufferManager {
+    private final Object LOCK = new Object();
+
+    // State
+    private volatile ByteBuf buffer;
+    private volatile boolean operationComplete;
+
+    // Metrics/debugging
+    private final String chunkLoggingContext;
+    private final Logger logger = LoggerFactory.getLogger(ChunkBufferManager.class);
+
+    // CRC tracking
+    private final Crc32 crc32;
+    private final RouterConfig config;
+
+    ChunkBufferManager(String loggingContext, RouterConfig config) {
+      this.chunkLoggingContext = loggingContext;
+      this.config = config;
+      this.crc32 = new Crc32();
+    }
+
+    /**
+     * Initialize buffer for building.
+     * @param initialCapacity Initial buffer capacity
+     */
+    void initializeBuffer(int initialCapacity) {
+      synchronized (LOCK) {
+        if (operationComplete) {
+          throw new IllegalStateException("Cannot initialize after operation complete");
+        }
+        if (buffer != null) {
+          throw new IllegalStateException("Buffer already initialized");
+        }
+        buffer = PooledByteBufAllocator.DEFAULT.ioBuffer(initialCapacity);
+        logger.trace("{}: Initialized buffer with capacity {}", chunkLoggingContext, initialCapacity);
+      }
+    }
+
+    /**
+     * Fill buffer from source ByteBuf.
+     * Called by ChunkFiller thread during building phase.
+     *
+     * @param source Source buffer to read from
+     * @param maxBytes Maximum bytes to transfer
+     * @return Number of bytes transferred, or 0 if operation complete
+     */
+    int fillFromSource(ByteBuf source, int maxBytes) {
+      synchronized (LOCK) {
+        if (operationComplete) {
+          logger.trace("{}: Operation complete, skipping fill", chunkLoggingContext);
+          return 0;
+        }
+
+        if (buffer == null) {
+          throw new IllegalStateException("Buffer not initialized");
+        }
+
+        int bytesAvailable = source.readableBytes();
+        int bufferSpace = maxBytes - buffer.readableBytes();
+        int toTransfer = Math.min(bytesAvailable, bufferSpace);
+
+        if (toTransfer > 0) {
+          int readerIndexBefore = source.readerIndex();
+          buffer.writeBytes(source, toTransfer);
+
+          // Update CRC if enabled
+          if (config.routerVerifyCrcForPutRequests) {
+            // Read what we just wrote for CRC
+            source.readerIndex(readerIndexBefore);
+            ByteBuf slice = source.readSlice(toTransfer);
+            for (ByteBuffer bb : slice.nioBuffers()) {
+              crc32.update(bb);
+            }
+          }
+
+          logger.trace("{}: Filled {} bytes, buffer now at {}/{}", chunkLoggingContext, toTransfer,
+              buffer.readableBytes(), maxBytes);
+        }
+
+        return toTransfer;
+      }
+    }
+
+    /**
+     * Initialize buffer with a retained slice (zero-copy approach).
+     * Called for first chunk of data.
+     *
+     * @param slice Retained slice to use as initial buffer
+     */
+    void initializeWithSlice(ByteBuf slice) {
+      synchronized (LOCK) {
+        if (operationComplete) {
+          slice.release();
+          logger.trace("{}: Operation complete, rejecting initial slice", chunkLoggingContext);
+          return;
+        }
+        if (buffer != null) {
+          throw new IllegalStateException("Buffer already initialized");
+        }
+        buffer = slice;
+        buffer.touch(chunkLoggingContext);
+        logger.trace("{}: Initialized buffer with slice (size: {})", chunkLoggingContext, slice.readableBytes());
+      }
+    }
+
+    /**
+     * Append a retained slice to existing buffer (zero-copy approach).
+     * Converts to CompositeByteBuf if needed.
+     *
+     * @param slice Retained slice to append
+     * @param maxComponents Maximum components for CompositeByteBuf
+     */
+    void appendSlice(ByteBuf slice, int maxComponents) {
+      synchronized (LOCK) {
+        if (operationComplete) {
+          slice.release();
+          logger.trace("{}: Operation complete, rejecting slice", chunkLoggingContext);
+          return;
+        }
+        if (buffer == null) {
+          throw new IllegalStateException("Buffer not initialized");
+        }
+
+        slice.touch(chunkLoggingContext);
+
+        if (buffer instanceof CompositeByteBuf) {
+          // Buffer is already composite, just add component
+          ((CompositeByteBuf) buffer).addComponent(true, slice);
+        } else {
+          // Convert to CompositeByteBuf
+          CompositeByteBuf composite = buffer.isDirect() ? buffer.alloc().compositeDirectBuffer(maxComponents)
+              : buffer.alloc().compositeHeapBuffer(maxComponents);
+          composite.addComponents(true, buffer, slice);
+          buffer = composite;
+          buffer.touch(chunkLoggingContext);
+        }
+
+        logger.trace("{}: Appended slice, buffer now at {} bytes", chunkLoggingContext, buffer.readableBytes());
+      }
+    }
+
+    /**
+     * Update CRC with data from a slice.
+     * Should be called after adding slice to buffer.
+     *
+     * @param slice The slice that was just added
+     */
+    void updateCRC(ByteBuf slice) {
+      synchronized (LOCK) {
+        if (config.routerVerifyCrcForPutRequests && !operationComplete) {
+          for (ByteBuffer bb : slice.nioBuffers()) {
+            crc32.update(bb);
+          }
+        }
+      }
+    }
+
+    /**
+     * Get current buffer size.
+     */
+    int getBufferSize() {
+      synchronized (LOCK) {
+        return buffer != null ? buffer.readableBytes() : 0;
+      }
+    }
+
+    /**
+     * Check if buffer is empty (already released).
+     */
+    boolean isReleased() {
+      synchronized (LOCK) {
+        return buffer == null;
+      }
+    }
+
+    /**
+     * Replace current buffer with compressed version.
+     * Takes ownership of new buffer, releases old buffer.
+     *
+     * @param compressedBuffer New buffer (caller transfers ownership to us)
+     * @param preCrc CRC value before compression (for logging)
+     */
+    void replaceWithCompressed(ByteBuf compressedBuffer, long preCrc) {
+      synchronized (LOCK) {
+        if (operationComplete) {
+          // Reject the buffer we were given
+          compressedBuffer.release();
+          logger.trace("{}: Operation complete, rejecting compressed buffer", chunkLoggingContext);
+          return;
+        }
+
+        if (buffer != null) {
+          logger.trace("{}: Replacing buffer (size {}) with compressed (size {})", chunkLoggingContext,
+              buffer.readableBytes(), compressedBuffer.readableBytes());
+          buffer.release();
+        }
+
+        buffer = compressedBuffer;
+
+        // Recalculate CRC on compressed buffer
+        if (config.routerVerifyCrcForPutRequests) {
+          crc32.reset();
+          for (ByteBuffer bb : buffer.nioBuffers()) {
+            crc32.update(bb);
+          }
+          logger.trace("{}: CRC update after compression - before: {}, after: {}, compressed size: {}",
+              chunkLoggingContext, preCrc, crc32.getValue(), buffer.readableBytes());
+        }
+      }
+    }
+
+    /**
+     * Access buffer temporarily for reading (e.g., for compression).
+     * Caller must NOT retain or release the returned buffer.
+     * This is a temporary borrow for read-only operations.
+     *
+     * @return Current buffer for reading, or null if released/complete
+     */
+    ByteBuf borrowBufferForReading() {
+      synchronized (LOCK) {
+        if (operationComplete || buffer == null) {
+          return null;
+        }
+        return buffer;
+      }
+    }
+
+    /**
+     * Create a retained duplicate for encryption.
+     * Transfers ownership to caller (EncryptJob).
+     *
+     * @return Retained duplicate, or null if operation complete
+     */
+    ByteBuf retainForEncryption() {
+      synchronized (LOCK) {
+        if (operationComplete || buffer == null) {
+          logger.trace("{}: Operation complete or no buffer, cannot retain for encryption", chunkLoggingContext);
+          return null;
+        }
+
+        ByteBuf retained = buffer.retainedDuplicate();
+        logger.trace("{}: Retained buffer for encryption (refCnt now {})", chunkLoggingContext, buffer.refCnt());
+        return retained;
+      }
+    }
+
+    /**
+     * Replace current buffer with encrypted version.
+     * Takes ownership of new buffer, releases old buffer.
+     *
+     * @param encryptedBuffer New encrypted buffer (caller transfers ownership to us)
+     */
+    void replaceWithEncrypted(ByteBuf encryptedBuffer) {
+      synchronized (LOCK) {
+        if (operationComplete) {
+          // Reject the buffer we were given
+          encryptedBuffer.release();
+          logger.trace("{}: Operation complete, rejecting encrypted buffer", chunkLoggingContext);
+          return;
+        }
+
+        if (buffer != null) {
+          logger.trace("{}: Replacing buffer (size {}) with encrypted (size {})", chunkLoggingContext,
+              buffer.readableBytes(), encryptedBuffer.readableBytes());
+          buffer.release();
+        }
+
+        buffer = encryptedBuffer;
+
+        // Recalculate CRC on encrypted buffer
+        if (config.routerVerifyCrcForPutRequests) {
+          crc32.reset();
+          for (ByteBuffer bb : buffer.nioBuffers()) {
+            crc32.update(bb);
+          }
+          logger.trace("{}: Recalculated CRC on encrypted buffer: {}", chunkLoggingContext, crc32.getValue());
+        }
+      }
+    }
+
+    /**
+     * Create a retained duplicate for network send.
+     * Transfers ownership to caller (PutRequest/NetworkClient).
+     *
+     * @return Retained duplicate for network, or null if operation complete
+     */
+    ByteBuf retainForNetwork() {
+      synchronized (LOCK) {
+        if (operationComplete || buffer == null) {
+          logger.trace("{}: Operation complete or no buffer, cannot retain for network", chunkLoggingContext);
+          return null;
+        }
+
+        ByteBuf retained = buffer.retainedDuplicate();
+        logger.trace("{}: Retained buffer for network (refCnt now {})", chunkLoggingContext, buffer.refCnt());
+        return retained;
+      }
+    }
+
+    /**
+     * Verify CRC of current buffer matches stored CRC.
+     * MUST be called under LOCK.
+     *
+     * @return true if CRC matches or verification disabled, false if mismatch
+     */
+    boolean verifyCRC() {
+      synchronized (LOCK) {
+        if (operationComplete || buffer == null) {
+          // Already complete or no buffer - skip verification
+          return true;
+        }
+
+        if (!config.routerVerifyCrcForPutRequests) {
+          return true; // Verification disabled
+        }
+
+        long storedCrc = crc32.getValue();
+        Crc32 computedCrc32 = new Crc32();
+        for (ByteBuffer bb : buffer.nioBuffers()) {
+          computedCrc32.update(bb);
+        }
+        long computedCrc = computedCrc32.getValue();
+
+        boolean matches = storedCrc == computedCrc;
+        if (!matches) {
+          logger.error("{}: CRC mismatch! Stored: {}, Computed: {}", chunkLoggingContext, storedCrc, computedCrc);
+        }
+
+        return matches;
+      }
+    }
+
+    /**
+     * Get current CRC value for logging/debugging.
+     */
+    long getCurrentCRC() {
+      synchronized (LOCK) {
+        return crc32.getValue();
+      }
+    }
+
+    /**
+     * Mark operation as complete.
+     * After this, all retain operations will return null.
+     * Does NOT release buffer - call releaseBuffer() for that.
+     */
+    void markOperationComplete() {
+      synchronized (LOCK) {
+        operationComplete = true;
+        logger.trace("{}: Marked operation complete", chunkLoggingContext);
+      }
+    }
+
+    /**
+     * Release the buffer.
+     * Safe to call multiple times.
+     * Safe to call from any thread.
+     */
+    void releaseBuffer() {
+      synchronized (LOCK) {
+        if (buffer != null) {
+          int refCnt = buffer.refCnt();
+          logger.trace("{}: Releasing buffer (refCnt: {}, size: {})", chunkLoggingContext, refCnt,
+              buffer.readableBytes());
+          buffer.release();
+          buffer = null;
+        }
+      }
+    }
+
+    /**
+     * Mark complete and release in one operation.
+     * Called during abort or failure.
+     */
+    void completeAndRelease() {
+      synchronized (LOCK) {
+        operationComplete = true;
+        releaseBuffer();
+      }
+    }
+
+    /**
+     * Check if operation is complete.
+     */
+    boolean isOperationComplete() {
+      return operationComplete; // volatile read, no lock needed
+    }
+  }
+
+  /**
    * PutChunk is responsible for storing chunks to be put, managing their state and completing the operation on the
    * chunks. A PutChunk object is not really associated with one single chunk of data. Instead, it acts a holder that
    * handles a chunk of data and takes it to completion, and once done, moves on to handle more chunks of data. This
@@ -1213,6 +1620,8 @@ class PutOperation {
     private RouterException chunkException;
     // the state of the current chunk.
     protected volatile ChunkState state;
+    // Manages buffer lifecycle with thread-safety
+    private final ChunkBufferManager bufferManager;
     // the ByteBuffer that has the data for the current chunk.
     protected volatile ByteBuf buf;
     // the ByteBuffer that has the encryptedPerBlobKey (encrypted using containerKey). Could be null if encryption is not required.
@@ -1245,6 +1654,7 @@ class PutOperation {
      * Construct a PutChunk
      */
     public PutChunk() {
+      bufferManager = new ChunkBufferManager(loggingContext, routerConfig);
       clear();
     }
 
@@ -1276,15 +1686,16 @@ class PutOperation {
      * This method might be called in main thread, encryption job thread or chunk filler thread, so it has to be protected.
      */
     void releaseBlobContent() {
-      synchronized (BUFFER_LOCK) {
-        releaseBufferUnderLock();
-      }
+      bufferManager.releaseBuffer();
     }
 
     /**
      * Release the buffer. MUST be called while holding BUFFER_LOCK.
+     * @deprecated Use bufferManager.releaseBuffer() instead
      */
+    @Deprecated
     private void releaseBufferUnderLock() {
+      bufferManager.releaseBuffer();
       if (buf != null) {
         logger.debug("{}: releasing the chunk data for chunk {}", loggingContext, chunkIndex);
         if (routerConfig.routerVerifyCrcForPutRequests) {
@@ -1517,17 +1928,15 @@ class PutOperation {
       logger.trace("{}: Processing encrypt job callback for chunk at index {}", loggingContext, chunkIndex);
 
       if (routerConfig.routerVerifyCrcForPutRequests) {
-        long preCrc = chunkCrc32.getValue();
+        long preCrc = bufferManager.getCurrentCRC();
         logger.debug("{}: Chunk {} pre-encryption CRC: {}, size: {}", loggingContext, chunkIndex, preCrc,
-            buf != null ? buf.readableBytes() : 0);
+            bufferManager.getBufferSize());
       }
 
       // Only verify CRC if encryption succeeded - encryption exceptions should go to UnexpectedInternalError path
       boolean crcMismatch = false;
       if (exception == null) {
-        synchronized (BUFFER_LOCK) {
-          crcMismatch = !verifyCRCUnderLock();
-        }
+        crcMismatch = !bufferManager.verifyCRC();
       }
 
       if (crcMismatch) {
@@ -1553,27 +1962,14 @@ class PutOperation {
       }
       encryptJobMetricsTracker.onJobResultProcessingStart();
       if (exception == null && !isOperationComplete()) {
-        synchronized (BUFFER_LOCK) {
-          // Principle 3: Check operationCompleted after acquiring lock
-          if (isOperationComplete()) {
-            if (result != null) {
-              result.release();
-            }
-            return;
-          }
+        // Get encrypted buffer from result
+        ByteBuf encryptedBuffer = !isMetadataChunk() ? result.getEncryptedBlobContent() : null;
 
-          // Principle 1: Access buf under lock
-          if (!isMetadataChunk()) {
-            buf = result.getEncryptedBlobContent();
-            if (routerConfig.routerVerifyCrcForPutRequests) {
-              for (ByteBuffer byteBuffer : buf.nioBuffers()) {
-                chunkCrc32.update(byteBuffer);
-              }
-              logger.debug("{}: Chunk {} post-encryption CRC: {}, size: {}", loggingContext, chunkIndex,
-                  chunkCrc32.getValue(), buf.readableBytes());
-            }
-          }
+        if (encryptedBuffer != null) {
+          // Replace buffer with encrypted version (handles operation-complete check internally)
+          bufferManager.replaceWithEncrypted(encryptedBuffer);
         }
+
         encryptedPerBlobKey = result.getEncryptedKey();
         chunkUserMetadata = result.getEncryptedUserMetadata().array();
         logger.trace("{}: Completing encrypt job result for chunk at index {}", loggingContext, chunkIndex);
@@ -1626,24 +2022,21 @@ class PutOperation {
         return;
       }
 
-      long preCrc = routerConfig.routerVerifyCrcForPutRequests ? chunkCrc32.getValue() : 0;
+      long preCrc = bufferManager.getCurrentCRC();
+
+      // Borrow buffer for reading during compression
+      ByteBuf currentBuffer = bufferManager.borrowBufferForReading();
+      if (currentBuffer == null) {
+        return; // Operation complete or no buffer
+      }
 
       // Note: compress() returns null if it failed.
-      boolean isFullChunk = (buf.readableBytes() == routerConfig.routerMaxPutChunkSizeBytes);
-      ByteBuf newBuffer = compressionService.compressChunk(buf, isFullChunk, outputDirectMemory);
-      if (newBuffer != null) {
-        buf.release();
-        buf = newBuffer;
+      boolean isFullChunk = (currentBuffer.readableBytes() == routerConfig.routerMaxPutChunkSizeBytes);
+      ByteBuf compressedBuffer = compressionService.compressChunk(currentBuffer, isFullChunk, outputDirectMemory);
+
+      if (compressedBuffer != null) {
+        bufferManager.replaceWithCompressed(compressedBuffer, preCrc);
         isChunkCompressed = true;
-        // Recalculate CRC on compressed buffer if CRC verification is enabled
-        if (routerConfig.routerVerifyCrcForPutRequests) {
-          chunkCrc32.reset();
-          for (ByteBuffer byteBuffer : buf.nioBuffers()) {
-            chunkCrc32.update(byteBuffer);
-          }
-          logger.debug("{}: Chunk {} CRC update after compression - before: {}, after: {}, compressed size: {}",
-              loggingContext, chunkIndex, preCrc, chunkCrc32.getValue(), buf.readableBytes());
-        }
       }
     }
 
@@ -1663,8 +2056,8 @@ class PutOperation {
           return;
         }
 
-        // Principle 1: Read buf under lock
-        chunkBlobSize = buf.readableBytes();
+        // Principle 1: Read buffer under lock
+        chunkBlobSize = bufferManager.getBufferSize();
         chunkFillCompleteAtMs = time.milliseconds();
         if (updateMetric) {
           routerMetrics.chunkFillTimeMs.update(time.milliseconds() - chunkFreeAtMs);
@@ -1672,10 +2065,10 @@ class PutOperation {
 
         if (routerConfig.routerVerifyCrcForPutRequests) {
           logger.debug("{}: Chunk {} fill complete - final size: {}, CRC: {}", loggingContext, chunkIndex,
-              buf.readableBytes(), chunkCrc32.getValue());
+              bufferManager.getBufferSize(), bufferManager.getCurrentCRC());
         }
 
-        // Compress under lock - modifies buf
+        // Compress under lock - modifies buffer
         compressChunkUnderLock(!passedInBlobProperties.isEncrypted());
 
         if (!passedInBlobProperties.isEncrypted()) {
@@ -1690,8 +2083,8 @@ class PutOperation {
           encryptJobMetricsTracker.onJobSubmission();
           logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
 
-          // Principle 1: Access buf under lock
-          ByteBuf retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
+          // Principle 1: Retain buffer copy for encryption under lock
+          ByteBuf retainedCopy = isMetadataChunk() ? null : bufferManager.retainForEncryption();
 
           try {
             // Submit job under lock - this is a quick synchronous call that queues the job
@@ -1742,37 +2135,23 @@ class PutOperation {
         }
 
         ByteBuf slice;
-        if (buf == null) {
-          // If current buf is null, then only read the up to routerMaxPutChunkSizeBytes.
+        if (bufferManager.isReleased()) {
+          // If current buffer is null, initialize with first slice
           toWrite = Math.min(channelReadBuf.readableBytes(), routerConfig.routerMaxPutChunkSizeBytes);
           slice = channelReadBuf.readRetainedSlice(toWrite);
-          buf = slice;
-          buf.touch(loggingContext);
+          bufferManager.initializeWithSlice(slice);
         } else {
-          int remainingSize = routerConfig.routerMaxPutChunkSizeBytes - buf.readableBytes();
+          // Append to existing buffer
+          int remainingSize = routerConfig.routerMaxPutChunkSizeBytes - bufferManager.getBufferSize();
           toWrite = Math.min(channelReadBuf.readableBytes(), remainingSize);
           slice = channelReadBuf.readRetainedSlice(toWrite);
-          slice.touch(loggingContext);
-          // buf already has some bytes
-          if (buf instanceof CompositeByteBuf) {
-            // Buf is already a CompositeByteBuf, then just add the slice from
-            ((CompositeByteBuf) buf).addComponent(true, slice);
-          } else {
-            int maxComponents = routerConfig.routerMaxPutChunkSizeBytes;
-            CompositeByteBuf composite = buf.isDirect() ? buf.alloc().compositeDirectBuffer(maxComponents)
-                : buf.alloc().compositeHeapBuffer(maxComponents);
-            composite.addComponents(true, buf, slice);
-            buf = composite;
-            buf.touch(loggingContext);
-          }
+          bufferManager.appendSlice(slice, routerConfig.routerMaxPutChunkSizeBytes);
         }
 
-        // Update crc for the chunk data
-        if (routerConfig.routerVerifyCrcForPutRequests) {
-          chunkCrc32.update(slice.nioBuffer());
-        }
+        // Update CRC for the chunk data
+        bufferManager.updateCRC(slice);
 
-        if (buf.readableBytes() == routerConfig.routerMaxPutChunkSizeBytes) {
+        if (bufferManager.getBufferSize() == routerConfig.routerMaxPutChunkSizeBytes) {
           if (chunkIndex == 0) {
             // If first put chunk is full, but not yet prepared then mark it awaiting resolution instead of completing it.
             // This chunk will be prepared as soon as either more bytes are read from the channel, or the chunk filling
@@ -1964,17 +2343,21 @@ class PutOperation {
      * @return the crated {@link PutRequest}.
      */
     protected PutRequest createPutRequest() {
-      synchronized (BUFFER_LOCK) {
-        // Principle 3: Check after acquiring lock
-        if (isOperationComplete()) {
-          throw new IllegalStateException("Cannot create PutRequest for chunk " + chunkIndex + ", operation is complete");
-        }
+      // Retain buffer for network (handles operation-complete check internally)
+      ByteBuf networkBuffer = bufferManager.retainForNetwork();
+      if (networkBuffer == null) {
+        throw new IllegalStateException("Cannot create PutRequest for chunk " + chunkIndex + ", operation is complete");
+      }
 
-        // Principle 1: Read buf under lock
+      try {
         return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
-            chunkBlobId, chunkBlobProperties, ByteBuffer.wrap(chunkUserMetadata), buf.retainedDuplicate(),
-            buf.readableBytes(), BlobType.DataBlob, encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null,
+            chunkBlobId, chunkBlobProperties, ByteBuffer.wrap(chunkUserMetadata), networkBuffer,
+            bufferManager.getBufferSize(), BlobType.DataBlob, encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null,
             isChunkCompressed);
+      } catch (Exception e) {
+        // If request creation fails, release the buffer we retained
+        networkBuffer.release();
+        throw e;
       }
     }
 
@@ -2474,15 +2857,9 @@ class PutOperation {
         }
         serialized.flip();
 
-        synchronized (BUFFER_LOCK) {
-          // Principle 3: Check after acquiring lock
-          if (isOperationComplete()) {
-            logger.debug("{}: Operation complete, skipping metadata chunk assembly", loggingContext);
-            return;
-          }
-          // Principle 1: Write buf under lock
-          buf = Unpooled.wrappedBuffer(serialized);
-        }
+        // Initialize buffer with serialized metadata
+        ByteBuf wrappedBuffer = Unpooled.wrappedBuffer(serialized);
+        bufferManager.initializeWithSlice(wrappedBuffer);
 
         onFillComplete(false);
         checkReservedPartitionState();
@@ -2509,17 +2886,21 @@ class PutOperation {
      */
     @Override
     protected PutRequest createPutRequest() {
-      synchronized (BUFFER_LOCK) {
-        // Principle 3: Check after acquiring lock
-        if (isOperationComplete()) {
-          throw new IllegalStateException("Cannot create PutRequest for metadata chunk, operation is complete");
-        }
+      // Retain buffer for network (handles operation-complete check internally)
+      ByteBuf networkBuffer = bufferManager.retainForNetwork();
+      if (networkBuffer == null) {
+        throw new IllegalStateException("Cannot create PutRequest for metadata chunk, operation is complete");
+      }
 
-        // Principle 1: Read buf under lock
+      try {
         return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
-            chunkBlobId, finalBlobProperties, ByteBuffer.wrap(chunkUserMetadata), buf.retainedDuplicate(),
-            buf.readableBytes(), BlobType.MetadataBlob,
+            chunkBlobId, finalBlobProperties, ByteBuffer.wrap(chunkUserMetadata), networkBuffer,
+            bufferManager.getBufferSize(), BlobType.MetadataBlob,
             encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null);
+      } catch (Exception e) {
+        // If request creation fails, release the buffer we retained
+        networkBuffer.release();
+        throw e;
       }
     }
 
