@@ -1591,6 +1591,10 @@ class PutOperation {
      * Compress the buffer in "buf" field for data chunks.  It does not compress metadata chunks.
      * It also applies rules specified in config.
      * After compression, it replaces "buf" field and update isCompressed field in blob properties.
+     * Thread-safety: This accesses buf but is safe because:
+     * - Called from onFillComplete which has checked isOperationComplete()
+     * - At this point the chunk is in Building state with exclusive access
+     * - State transitions prevent concurrent modification
      * @param outputDirectMemory Whether the compression output should be direct memory (True) or heap memory (false).
      *                           If the next step is encryption, it should use Heap (since encryption takes an array).
      *                           If the next step is output to Netty, it should use direct memory.
@@ -1625,8 +1629,11 @@ class PutOperation {
     /**
      * Submits encrypt job for the given {@link PutChunk} and processes the callback for the same.
      * Thread-safety: Accesses buf to create a retained duplicate, but this is safe because:
-     * 1. When called from onFillComplete within fillFrom, BUFFER_LOCK is already held
+     * 1. When called from onFillComplete (which is now outside BUFFER_LOCK), the chunk is in Building state
+     *    with exclusive access, and onFillComplete has already verified operation is not complete
      * 2. When called from other paths, the chunk state transition ensures exclusive access
+     * If an exception occurs here and triggers setOperationExceptionAndComplete(), it will NOT cause nested
+     * lock acquisition since we're not holding BUFFER_LOCK.
      */
     private void encryptChunk() {
       ByteBuf retainedCopy = null;
@@ -1636,9 +1643,10 @@ class PutOperation {
         chunkEncryptReadyAtMs = time.milliseconds();
         encryptJobMetricsTracker.onJobSubmission();
         logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
-        // Note: This buf access is safe because either:
-        // (a) We're called from fillFrom while holding BUFFER_LOCK, or
-        // (b) We're called from a state where the chunk has exclusive ownership
+        // Note: This buf access is safe because:
+        // - We're called from onFillComplete which verified operation is not complete
+        // - Chunk is in Building state with exclusive ownership
+        // - If abort happens concurrently, buf won't be released until state transition
         retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
         cryptoJobHandler.submitJob(
             new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
@@ -1662,10 +1670,20 @@ class PutOperation {
 
     /**
      * Do the actions required when the chunk has been completely built.
+     * Thread-safety: This method accesses buf to read its size and for compression/encryption.
+     * It's safe because either:
+     * 1. Called from fillFrom() after releasing BUFFER_LOCK, with chunkBlobSize pre-captured
+     * 2. Called from other single-threaded contexts with exclusive chunk ownership
      * @param updateMetric whether chunk fill completion metrics should be updated.
      */
     void onFillComplete(boolean updateMetric) {
-      chunkBlobSize = buf.readableBytes();
+      // Early exit if operation was completed/aborted while we were transitioning
+      if (isOperationComplete()) {
+        logger.debug("{}: Operation already complete, skipping onFillComplete for chunk {}", loggingContext, chunkIndex);
+        return;
+      }
+
+      // chunkBlobSize should have been set by caller before releasing any locks
       chunkFillCompleteAtMs = time.milliseconds();
       if (updateMetric) {
         routerMetrics.chunkFillTimeMs.update(time.milliseconds() - chunkFreeAtMs);
@@ -1692,12 +1710,17 @@ class PutOperation {
     /**
      * Fill the buffer of the current chunk with the data from the given {@link ByteBuf}.
      * Thread-safety: This method is synchronized on BUFFER_LOCK to prevent concurrent access to buf during
-     * operation abort/completion. The lock protects against race conditions where releaseBufferUnderLock()
-     * could be called from another thread while this method is manipulating the buffer.
+     * operation abort/completion. The lock protects buffer manipulation but DOES NOT hold the lock when calling
+     * onFillComplete() to avoid nested synchronization issues where encryption failures or channel close callbacks
+     * could cause deadlocks or exception handling problems.
      * @param channelReadBuf the {@link ByteBuf} from which to read data.
      * @return the number of bytes transferred in this operation.
      */
     int fillFrom(ByteBuf channelReadBuf) {
+      // Flags and state to capture under lock, act on outside lock
+      boolean shouldCallOnFillComplete = false;
+      int toWrite = 0;
+
       synchronized (BUFFER_LOCK) {
         // If operation is already complete, don't fill any more data
         if (isOperationComplete()) {
@@ -1705,7 +1728,6 @@ class PutOperation {
           return 0;
         }
 
-        int toWrite;
         ByteBuf slice;
         if (buf == null) {
           // If current buf is null, then only read the up to routerMaxPutChunkSizeBytes.
@@ -1744,11 +1766,22 @@ class PutOperation {
             // is complete. At that point we will have enough information to mark this blob as simple or composite blob.
             state = ChunkState.AwaitingBlobTypeResolution;
           } else {
-            onFillComplete(true);
+            // Capture state under lock to use outside lock
+            shouldCallOnFillComplete = true;
+            // Pre-capture the blob size while we still hold the lock and buf is valid
+            // onFillComplete() will use this value instead of reading from buf
+            chunkBlobSize = buf.readableBytes();
           }
         }
-        return toWrite;
       }
+
+      // Call onFillComplete OUTSIDE the lock to avoid nested synchronization issues
+      // If abort happens after we release lock but before this call, onFillComplete checks isOperationComplete()
+      if (shouldCallOnFillComplete) {
+        onFillComplete(true);
+      }
+
+      return toWrite;
     }
 
     /**
