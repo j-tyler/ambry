@@ -54,6 +54,7 @@ import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCountUtil;
 import java.nio.ByteBuffer;
@@ -570,7 +571,7 @@ class PutOperation {
     for (PutChunk chunk : putChunks) {
       if (!(chunk.isFree() || chunk.isEncrypting())) {
         logger.debug("{}: Releasing chunk {} in state {}", loggingContext, chunk.getChunkIndex(), chunk.getState());
-        chunk.releaseBufferUnderLock();
+        chunk.releaseBlobContent();
       }
     }
   }
@@ -1656,7 +1657,7 @@ class PutOperation {
     // the state of the current chunk.
     protected volatile ChunkState state;
     // Manages buffer lifecycle with thread-safety
-    private final ChunkBufferManager bufferManager;
+    protected final ChunkBufferManager bufferManager;
     // the ByteBuffer that has the encryptedPerBlobKey (encrypted using containerKey). Could be null if encryption is not required.
     protected ByteBuffer encryptedPerBlobKey;
     // the OperationTracker used to track the status of requests for the current chunk.
