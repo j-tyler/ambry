@@ -181,10 +181,23 @@ class PutOperation {
   // The set of slipped blob ids generated during the put operation.
   private Set<BlobId> slippedPutBlobIds = new HashSet<>();
 
-  // Lock to coordinate operation state across threads
-  // Protects: setting operationCompleted flag, operationException, and related cleanup operations
-  // Note: Buffer access is now protected by ChunkBufferManager's internal lock
-  private final Object BUFFER_LOCK = new Object();
+  /**
+   * Lock to coordinate operation-level state across threads.
+   *
+   * This lock synchronizes operation completion and cleanup to prevent race conditions where:
+   * - ChunkFiller thread checks operation status and attempts to fill chunks
+   * - Completion thread sets operationCompleted flag and releases all chunk buffers
+   *
+   * Protected state:
+   * - operationCompleted flag
+   * - operationException
+   * - Calling releaseBlobContent() on all chunks during cleanup
+   * - Channel close operations
+   *
+   * Note: Individual chunk buffer operations are protected by each ChunkBufferManager's internal lock.
+   * This lock coordinates higher-level operation state, not buffer-level operations.
+   */
+  private final Object OPERATION_STATE_LOCK = new Object();
 
   // Variables to keep track of netty chunks
   private final RestRequest restRequest;
@@ -440,10 +453,10 @@ class PutOperation {
     // the chunk filling process for this PutOperation is finished.
     channel.readInto(chunkFillerChannel, (result, exception) -> {
       if (exception != null) {
-        // Check under BUFFER_LOCK: only set exception if operation not already complete
+        // Check under OPERATION_STATE_LOCK: only set exception if operation not already complete
         // This prevents ClosedChannelException (from our own cleanup) from overwriting the real error
         boolean shouldComplete;
-        synchronized (BUFFER_LOCK) {
+        synchronized (OPERATION_STATE_LOCK) {
           shouldComplete = !isOperationComplete();
           if (shouldComplete) {
             logger.info("{}: ChannelRead has exception, will terminate the operation", loggingContext, exception.getMessage());
@@ -454,7 +467,7 @@ class PutOperation {
         if (shouldComplete) {
           routerCallback.onPollReady();
           // Release buffers now that operation is complete
-          synchronized (BUFFER_LOCK) {
+          synchronized (OPERATION_STATE_LOCK) {
             chunkFillerChannel.close();
             releaseAllChunkBuffersUnderLock();
           }
@@ -565,7 +578,7 @@ class PutOperation {
   }
 
   /**
-   * Release all chunk buffers. MUST be called while holding BUFFER_LOCK.
+   * Release all chunk buffers. MUST be called while holding OPERATION_STATE_LOCK.
    */
   private void releaseAllChunkBuffersUnderLock() {
     for (PutChunk chunk : putChunks) {
@@ -581,7 +594,7 @@ class PutOperation {
    * other thread to release the data.
    */
   private void releaseDataForAllChunks() {
-    synchronized (BUFFER_LOCK) {
+    synchronized (OPERATION_STATE_LOCK) {
       releaseAllChunkBuffersUnderLock();
     }
   }
@@ -594,10 +607,10 @@ class PutOperation {
    * 1. Channel queue: ByteBufs written to chunkFillerChannel but not yet consumed by ChunkFiller
    * 2. Chunk buffers: ByteBufs already pulled from channel and stored in Building/Ready/Complete state chunks
    *
-   * All operations (set flag + close channel + release buffers) happen atomically under BUFFER_LOCK.
+   * All operations (set flag + close channel + release buffers) happen atomically under OPERATION_STATE_LOCK.
    */
   void setOperationCompletedAndReleaseChunks() {
-    synchronized (BUFFER_LOCK) {
+    synchronized (OPERATION_STATE_LOCK) {
       operationCompleted = true;
       // Close channel to trigger callbacks that release queued ByteBufs not yet consumed by ChunkFiller
       chunkFillerChannel.close();
@@ -764,7 +777,7 @@ class PutOperation {
 
         if (lastChunk != null) {
           boolean shouldDiscard = false;
-          synchronized (BUFFER_LOCK) {
+          synchronized (OPERATION_STATE_LOCK) {
             // Principle 3: Check operationCompleted after acquiring lock
             if (!isOperationComplete()) {
               // Principle 1: Read buffer under lock
@@ -1188,27 +1201,35 @@ class PutOperation {
 
   /**
    * Manages the lifecycle of a single chunk's ByteBuf with proper thread-safety.
-   * <p>
-   * Thread-safety model:
+   *
+   * <p><b>Thread-Safety Model:</b></p>
    * <ul>
-   *   <li>All operations synchronized on internal lock</li>
+   *   <li>All buffer operations synchronized on internal LOCK</li>
+   *   <li>Does NOT track operation-level completion (coordinated by PutOperation.OPERATION_STATE_LOCK)</li>
    *   <li>Supports ownership transfer via retainedDuplicate()</li>
-   *   <li>Tracks whether operation is complete to prevent use-after-free</li>
    * </ul>
-   * <p>
-   * Ownership model:
+   *
+   * <p><b>Ownership Model:</b></p>
    * <ul>
    *   <li>ChunkBufferManager owns the primary buffer</li>
    *   <li>retainForX() methods transfer ownership to caller (caller MUST release)</li>
-   *   <li>replaceBuffer() transfers ownership TO manager</li>
+   *   <li>initializeWithSlice/appendSlice/replaceWith methods accept ownership from caller</li>
    * </ul>
+   *
+   * <p><b>Operation Completion Coordination:</b></p>
+   * <p>
+   * Operation-level completion is coordinated by PutOperation.OPERATION_STATE_LOCK, NOT by this class.
+   * When operation completes, PutOperation holds OPERATION_STATE_LOCK while:
+   * 1. Setting operationCompleted flag
+   * 2. Calling releaseBuffer() on all chunks
+   * This prevents race conditions where ChunkFiller might attempt to fill chunks after completion.
+   * </p>
    */
   static class ChunkBufferManager {
     private final Object LOCK = new Object();
 
     // State
     private volatile ByteBuf buffer;
-    private volatile boolean operationComplete;
 
     // Metrics/debugging
     private final String chunkLoggingContext;
@@ -1226,13 +1247,11 @@ class PutOperation {
 
     /**
      * Initialize buffer for building.
+     * Operation-level completion is coordinated by PutOperation.OPERATION_STATE_LOCK.
      * @param initialCapacity Initial buffer capacity
      */
     void initializeBuffer(int initialCapacity) {
       synchronized (LOCK) {
-        if (operationComplete) {
-          throw new IllegalStateException("Cannot initialize after operation complete");
-        }
         if (buffer != null) {
           throw new IllegalStateException("Buffer already initialized");
         }
@@ -1244,18 +1263,14 @@ class PutOperation {
     /**
      * Fill buffer from source ByteBuf.
      * Called by ChunkFiller thread during building phase.
+     * Operation-level completion is coordinated by PutOperation.OPERATION_STATE_LOCK.
      *
      * @param source Source buffer to read from
      * @param maxBytes Maximum bytes to transfer
-     * @return Number of bytes transferred, or 0 if operation complete
+     * @return Number of bytes transferred
      */
     int fillFromSource(ByteBuf source, int maxBytes) {
       synchronized (LOCK) {
-        if (operationComplete) {
-          logger.trace("{}: Operation complete, skipping fill", chunkLoggingContext);
-          return 0;
-        }
-
         if (buffer == null) {
           throw new IllegalStateException("Buffer not initialized");
         }
@@ -1289,16 +1304,12 @@ class PutOperation {
     /**
      * Initialize buffer with a retained slice (zero-copy approach).
      * Called for first chunk of data.
+     * Operation-level completion is coordinated by PutOperation.OPERATION_STATE_LOCK.
      *
-     * @param slice Retained slice to use as initial buffer
+     * @param slice Retained slice to use as initial buffer (ownership transferred to manager)
      */
     void initializeWithSlice(ByteBuf slice) {
       synchronized (LOCK) {
-        if (operationComplete) {
-          slice.release();
-          logger.trace("{}: Operation complete, rejecting initial slice", chunkLoggingContext);
-          return;
-        }
         if (buffer != null) {
           throw new IllegalStateException("Buffer already initialized");
         }
@@ -1311,17 +1322,13 @@ class PutOperation {
     /**
      * Append a retained slice to existing buffer (zero-copy approach).
      * Converts to CompositeByteBuf if needed.
+     * Operation-level completion is coordinated by PutOperation.OPERATION_STATE_LOCK.
      *
-     * @param slice Retained slice to append
+     * @param slice Retained slice to append (ownership transferred to manager)
      * @param maxComponents Maximum components for CompositeByteBuf
      */
     void appendSlice(ByteBuf slice, int maxComponents) {
       synchronized (LOCK) {
-        if (operationComplete) {
-          slice.release();
-          logger.trace("{}: Operation complete, rejecting slice", chunkLoggingContext);
-          return;
-        }
         if (buffer == null) {
           throw new IllegalStateException("Buffer not initialized");
         }
@@ -1352,7 +1359,7 @@ class PutOperation {
      */
     void updateCRC(ByteBuf slice) {
       synchronized (LOCK) {
-        if (config.routerVerifyCrcForPutRequests && !operationComplete) {
+        if (config.routerVerifyCrcForPutRequests) {
           for (ByteBuffer bb : slice.nioBuffers()) {
             crc32.update(bb);
           }
@@ -1381,19 +1388,13 @@ class PutOperation {
     /**
      * Replace current buffer with compressed version.
      * Takes ownership of new buffer, releases old buffer.
+     * Operation-level completion is coordinated by PutOperation.OPERATION_STATE_LOCK.
      *
      * @param compressedBuffer New buffer (caller transfers ownership to us)
      * @param preCrc CRC value before compression (for logging)
      */
     void replaceWithCompressed(ByteBuf compressedBuffer, long preCrc) {
       synchronized (LOCK) {
-        if (operationComplete) {
-          // Reject the buffer we were given
-          compressedBuffer.release();
-          logger.trace("{}: Operation complete, rejecting compressed buffer", chunkLoggingContext);
-          return;
-        }
-
         if (buffer != null) {
           logger.trace("{}: Replacing buffer (size {}) with compressed (size {})", chunkLoggingContext,
               buffer.readableBytes(), compressedBuffer.readableBytes());
@@ -1419,13 +1420,10 @@ class PutOperation {
      * Caller must NOT retain or release the returned buffer.
      * This is a temporary borrow for read-only operations.
      *
-     * @return Current buffer for reading, or null if released/complete
+     * @return Current buffer for reading, or null if released
      */
     ByteBuf borrowBufferForReading() {
       synchronized (LOCK) {
-        if (operationComplete || buffer == null) {
-          return null;
-        }
         return buffer;
       }
     }
@@ -1434,12 +1432,12 @@ class PutOperation {
      * Create a retained duplicate for encryption.
      * Transfers ownership to caller (EncryptJob).
      *
-     * @return Retained duplicate, or null if operation complete
+     * @return Retained duplicate, or null if buffer not available
      */
     ByteBuf retainForEncryption() {
       synchronized (LOCK) {
-        if (operationComplete || buffer == null) {
-          logger.trace("{}: Operation complete or no buffer, cannot retain for encryption", chunkLoggingContext);
+        if (buffer == null) {
+          logger.trace("{}: No buffer, cannot retain for encryption", chunkLoggingContext);
           return null;
         }
 
@@ -1452,18 +1450,12 @@ class PutOperation {
     /**
      * Replace current buffer with encrypted version.
      * Takes ownership of new buffer, releases old buffer.
+     * Operation-level completion is coordinated by PutOperation.OPERATION_STATE_LOCK.
      *
      * @param encryptedBuffer New encrypted buffer (caller transfers ownership to us)
      */
     void replaceWithEncrypted(ByteBuf encryptedBuffer) {
       synchronized (LOCK) {
-        if (operationComplete) {
-          // Reject the buffer we were given
-          encryptedBuffer.release();
-          logger.trace("{}: Operation complete, rejecting encrypted buffer", chunkLoggingContext);
-          return;
-        }
-
         if (buffer != null) {
           logger.trace("{}: Replacing buffer (size {}) with encrypted (size {})", chunkLoggingContext,
               buffer.readableBytes(), encryptedBuffer.readableBytes());
@@ -1487,12 +1479,12 @@ class PutOperation {
      * Create a retained duplicate for network send.
      * Transfers ownership to caller (PutRequest/NetworkClient).
      *
-     * @return Retained duplicate for network, or null if operation complete
+     * @return Retained duplicate for network, or null if buffer not available
      */
     ByteBuf retainForNetwork() {
       synchronized (LOCK) {
-        if (operationComplete || buffer == null) {
-          logger.trace("{}: Operation complete or no buffer, cannot retain for network", chunkLoggingContext);
+        if (buffer == null) {
+          logger.trace("{}: No buffer, cannot retain for network", chunkLoggingContext);
           return null;
         }
 
@@ -1504,14 +1496,13 @@ class PutOperation {
 
     /**
      * Verify CRC of current buffer matches stored CRC.
-     * MUST be called under LOCK.
      *
      * @return true if CRC matches or verification disabled, false if mismatch
      */
     boolean verifyCRC() {
       synchronized (LOCK) {
-        if (operationComplete || buffer == null) {
-          // Already complete or no buffer - skip verification
+        if (buffer == null) {
+          // No buffer - skip verification
           return true;
         }
 
@@ -1545,18 +1536,6 @@ class PutOperation {
     }
 
     /**
-     * Mark operation as complete.
-     * After this, all retain operations will return null.
-     * Does NOT release buffer - call releaseBuffer() for that.
-     */
-    void markOperationComplete() {
-      synchronized (LOCK) {
-        operationComplete = true;
-        logger.trace("{}: Marked operation complete", chunkLoggingContext);
-      }
-    }
-
-    /**
      * Release the buffer.
      * Safe to call multiple times.
      * Safe to call from any thread.
@@ -1571,24 +1550,6 @@ class PutOperation {
           buffer = null;
         }
       }
-    }
-
-    /**
-     * Mark complete and release in one operation.
-     * Called during abort or failure.
-     */
-    void completeAndRelease() {
-      synchronized (LOCK) {
-        operationComplete = true;
-        releaseBuffer();
-      }
-    }
-
-    /**
-     * Check if operation is complete.
-     */
-    boolean isOperationComplete() {
-      return operationComplete; // volatile read, no lock needed
     }
 
     // ========================================
@@ -2057,7 +2018,7 @@ class PutOperation {
      * Compress the buffer in "buf" field for data chunks.  It does not compress metadata chunks.
      * It also applies rules specified in config.
      * After compression, it replaces "buf" field and update isCompressed field in blob properties.
-     * MUST be called while holding BUFFER_LOCK.
+     * MUST be called while holding OPERATION_STATE_LOCK.
      * @param outputDirectMemory Whether the compression output should be direct memory (True) or heap memory (false).
      *                           If the next step is encryption, it should use Heap (since encryption takes an array).
      *                           If the next step is output to Netty, it should use direct memory.
@@ -2088,14 +2049,14 @@ class PutOperation {
 
     /**
      * Do the actions required when the chunk has been completely built.
-     * Thread-safety: Holds BUFFER_LOCK for all buf access operations. Releases lock before
+     * Thread-safety: Holds OPERATION_STATE_LOCK for all buf access operations. Releases lock before
      * calling setOperationExceptionAndComplete to avoid nested lock acquisition.
      * @param updateMetric whether chunk fill completion metrics should be updated.
      */
     void onFillComplete(boolean updateMetric) {
       Exception encryptionException = null;
 
-      synchronized (BUFFER_LOCK) {
+      synchronized (OPERATION_STATE_LOCK) {
         // Principle 3: Check operationCompleted after acquiring lock
         if (isOperationComplete()) {
           logger.debug("{}: Operation already complete, skipping onFillComplete for chunk {}", loggingContext, chunkIndex);
@@ -2146,7 +2107,7 @@ class PutOperation {
             encryptionException = e;
           }
         }
-      }  // Release BUFFER_LOCK
+      }  // Release OPERATION_STATE_LOCK
 
       // Principle 2: Handle exception outside lock to avoid nested lock acquisition
       if (encryptionException != null) {
@@ -2161,7 +2122,7 @@ class PutOperation {
 
     /**
      * Fill the buffer of the current chunk with the data from the given {@link ByteBuf}.
-     * Thread-safety: This method is synchronized on BUFFER_LOCK to prevent concurrent access to buf during
+     * Thread-safety: This method is synchronized on OPERATION_STATE_LOCK to prevent concurrent access to buf during
      * operation abort/completion. The lock protects buffer manipulation but DOES NOT hold the lock when calling
      * onFillComplete() to avoid nested synchronization issues where encryption failures or channel close callbacks
      * could cause deadlocks or exception handling problems.
@@ -2173,7 +2134,7 @@ class PutOperation {
       boolean shouldCallOnFillComplete = false;
       int toWrite = 0;
 
-      synchronized (BUFFER_LOCK) {
+      synchronized (OPERATION_STATE_LOCK) {
         // If operation is already complete, don't fill any more data
         if (isOperationComplete()) {
           logger.debug("{}: Operation complete, skipping fillFrom for chunk {}", loggingContext, chunkIndex);
