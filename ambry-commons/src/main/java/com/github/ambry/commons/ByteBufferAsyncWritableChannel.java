@@ -139,14 +139,17 @@ public class ByteBufferAsyncWritableChannel implements AsyncWritableChannel {
   /**
    * Closes the channel and resolves all pending chunks with a {@link ClosedChannelException}. Also queues a poison
    * so that {@link #getNextChunk()} starts returning {@code null}.
+   * Thread-safety: This method is idempotent and can be safely called multiple times. The CAS operation ensures
+   * that cleanup and event notification only happen once, even if close() is called concurrently from multiple threads.
    */
   @Override
   public void close() {
     if (channelOpen.compareAndSet(true, false)) {
       resolveAllRemainingChunks(new ClosedChannelException());
-    }
-    if (channelEventListener != null) {
-      channelEventListener.onEvent(EventType.Close);
+      // Notify listener inside the CAS guard to ensure it's only called once
+      if (channelEventListener != null) {
+        channelEventListener.onEvent(EventType.Close);
+      }
     }
   }
 

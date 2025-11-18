@@ -1623,7 +1623,10 @@ class PutOperation {
     }
 
     /**
-     * Submits encrypt job for the given {@link PutChunk} and processes the callback for the same
+     * Submits encrypt job for the given {@link PutChunk} and processes the callback for the same.
+     * Thread-safety: Accesses buf to create a retained duplicate, but this is safe because:
+     * 1. When called from onFillComplete within fillFrom, BUFFER_LOCK is already held
+     * 2. When called from other paths, the chunk state transition ensures exclusive access
      */
     private void encryptChunk() {
       ByteBuf retainedCopy = null;
@@ -1633,6 +1636,9 @@ class PutOperation {
         chunkEncryptReadyAtMs = time.milliseconds();
         encryptJobMetricsTracker.onJobSubmission();
         logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
+        // Note: This buf access is safe because either:
+        // (a) We're called from fillFrom while holding BUFFER_LOCK, or
+        // (b) We're called from a state where the chunk has exclusive ownership
         retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
         cryptoJobHandler.submitJob(
             new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
@@ -1685,53 +1691,64 @@ class PutOperation {
 
     /**
      * Fill the buffer of the current chunk with the data from the given {@link ByteBuf}.
+     * Thread-safety: This method is synchronized on BUFFER_LOCK to prevent concurrent access to buf during
+     * operation abort/completion. The lock protects against race conditions where releaseBufferUnderLock()
+     * could be called from another thread while this method is manipulating the buffer.
      * @param channelReadBuf the {@link ByteBuf} from which to read data.
      * @return the number of bytes transferred in this operation.
      */
     int fillFrom(ByteBuf channelReadBuf) {
-      int toWrite;
-      ByteBuf slice;
-      if (buf == null) {
-        // If current buf is null, then only read the up to routerMaxPutChunkSizeBytes.
-        toWrite = Math.min(channelReadBuf.readableBytes(), routerConfig.routerMaxPutChunkSizeBytes);
-        slice = channelReadBuf.readRetainedSlice(toWrite);
-        buf = slice;
-        buf.touch(loggingContext);
-      } else {
-        int remainingSize = routerConfig.routerMaxPutChunkSizeBytes - buf.readableBytes();
-        toWrite = Math.min(channelReadBuf.readableBytes(), remainingSize);
-        slice = channelReadBuf.readRetainedSlice(toWrite);
-        slice.touch(loggingContext);
-        // buf already has some bytes
-        if (buf instanceof CompositeByteBuf) {
-          // Buf is already a CompositeByteBuf, then just add the slice from
-          ((CompositeByteBuf) buf).addComponent(true, slice);
-        } else {
-          int maxComponents = routerConfig.routerMaxPutChunkSizeBytes;
-          CompositeByteBuf composite = buf.isDirect() ? buf.alloc().compositeDirectBuffer(maxComponents)
-              : buf.alloc().compositeHeapBuffer(maxComponents);
-          composite.addComponents(true, buf, slice);
-          buf = composite;
+      synchronized (BUFFER_LOCK) {
+        // If operation is already complete, don't fill any more data
+        if (isOperationComplete()) {
+          logger.debug("{}: Operation complete, skipping fillFrom for chunk {}", loggingContext, chunkIndex);
+          return 0;
+        }
+
+        int toWrite;
+        ByteBuf slice;
+        if (buf == null) {
+          // If current buf is null, then only read the up to routerMaxPutChunkSizeBytes.
+          toWrite = Math.min(channelReadBuf.readableBytes(), routerConfig.routerMaxPutChunkSizeBytes);
+          slice = channelReadBuf.readRetainedSlice(toWrite);
+          buf = slice;
           buf.touch(loggingContext);
-        }
-      }
-
-      // Update crc for the chunk data
-      if (routerConfig.routerVerifyCrcForPutRequests) {
-        chunkCrc32.update(slice.nioBuffer());
-      }
-
-      if (buf.readableBytes() == routerConfig.routerMaxPutChunkSizeBytes) {
-        if (chunkIndex == 0) {
-          // If first put chunk is full, but not yet prepared then mark it awaiting resolution instead of completing it.
-          // This chunk will be prepared as soon as either more bytes are read from the channel, or the chunk filling
-          // is complete. At that point we will have enough information to mark this blob as simple or composite blob.
-          state = ChunkState.AwaitingBlobTypeResolution;
         } else {
-          onFillComplete(true);
+          int remainingSize = routerConfig.routerMaxPutChunkSizeBytes - buf.readableBytes();
+          toWrite = Math.min(channelReadBuf.readableBytes(), remainingSize);
+          slice = channelReadBuf.readRetainedSlice(toWrite);
+          slice.touch(loggingContext);
+          // buf already has some bytes
+          if (buf instanceof CompositeByteBuf) {
+            // Buf is already a CompositeByteBuf, then just add the slice from
+            ((CompositeByteBuf) buf).addComponent(true, slice);
+          } else {
+            int maxComponents = routerConfig.routerMaxPutChunkSizeBytes;
+            CompositeByteBuf composite = buf.isDirect() ? buf.alloc().compositeDirectBuffer(maxComponents)
+                : buf.alloc().compositeHeapBuffer(maxComponents);
+            composite.addComponents(true, buf, slice);
+            buf = composite;
+            buf.touch(loggingContext);
+          }
         }
+
+        // Update crc for the chunk data
+        if (routerConfig.routerVerifyCrcForPutRequests) {
+          chunkCrc32.update(slice.nioBuffer());
+        }
+
+        if (buf.readableBytes() == routerConfig.routerMaxPutChunkSizeBytes) {
+          if (chunkIndex == 0) {
+            // If first put chunk is full, but not yet prepared then mark it awaiting resolution instead of completing it.
+            // This chunk will be prepared as soon as either more bytes are read from the channel, or the chunk filling
+            // is complete. At that point we will have enough information to mark this blob as simple or composite blob.
+            state = ChunkState.AwaitingBlobTypeResolution;
+          } else {
+            onFillComplete(true);
+          }
+        }
+        return toWrite;
       }
-      return toWrite;
     }
 
     /**
