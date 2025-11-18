@@ -180,8 +180,9 @@ class PutOperation {
   // The set of slipped blob ids generated during the put operation.
   private Set<BlobId> slippedPutBlobIds = new HashSet<>();
 
-  // Lock to coordinate buffer access and release across threads
-  // Protects: setting operationCompleted, chunk.buf access, and buffer release operations
+  // Lock to coordinate operation state across threads
+  // Protects: setting operationCompleted flag, operationException, and related cleanup operations
+  // Note: Buffer access is now protected by ChunkBufferManager's internal lock
   private final Object BUFFER_LOCK = new Object();
 
   // Variables to keep track of netty chunks
@@ -1588,6 +1589,40 @@ class PutOperation {
     boolean isOperationComplete() {
       return operationComplete; // volatile read, no lock needed
     }
+
+    // ========================================
+    // TEST HELPER METHODS
+    // ========================================
+
+    /**
+     * Get direct access to buffer for testing.
+     * WARNING: For testing only! Bypasses normal safety checks.
+     * @return buffer reference (may be null)
+     */
+    ByteBuf getBufferForTest() {
+      return buffer;
+    }
+
+    /**
+     * Set buffer directly for testing.
+     * WARNING: For testing only! Bypasses normal safety checks.
+     * @param testBuffer buffer to set
+     */
+    void setBufferForTest(ByteBuf testBuffer) {
+      synchronized (LOCK) {
+        if (buffer != null) {
+          buffer.release();
+        }
+        buffer = testBuffer;
+        // Reset CRC when setting new buffer for test
+        if (config.routerVerifyCrcForPutRequests && buffer != null) {
+          crc32.reset();
+          for (ByteBuffer bb : buffer.nioBuffers()) {
+            crc32.update(bb);
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -1622,8 +1657,6 @@ class PutOperation {
     protected volatile ChunkState state;
     // Manages buffer lifecycle with thread-safety
     private final ChunkBufferManager bufferManager;
-    // the ByteBuffer that has the data for the current chunk.
-    protected volatile ByteBuf buf;
     // the ByteBuffer that has the encryptedPerBlobKey (encrypted using containerKey). Could be null if encryption is not required.
     protected ByteBuffer encryptedPerBlobKey;
     // the OperationTracker used to track the status of requests for the current chunk.
@@ -1647,7 +1680,6 @@ class PutOperation {
     // Whether this chunk is compressed.  Default is false for not compressed.
     // This value is set after compression has completed.  It is used to create PutRequest.
     private boolean isChunkCompressed;
-    private final Crc32 chunkCrc32 = new Crc32();
     private boolean isCrcVerified = false;
 
     /**
@@ -1690,33 +1722,46 @@ class PutOperation {
     }
 
     /**
-     * Release the buffer. MUST be called while holding BUFFER_LOCK.
-     * @deprecated Use bufferManager.releaseBuffer() instead
-     */
-    @Deprecated
-    private void releaseBufferUnderLock() {
-      bufferManager.releaseBuffer();
-      if (buf != null) {
-        logger.debug("{}: releasing the chunk data for chunk {}", loggingContext, chunkIndex);
-        if (routerConfig.routerVerifyCrcForPutRequests) {
-          logger.debug("{}: Releasing chunk {} data - current CRC: {}, size: {}, state: {}", loggingContext, chunkIndex,
-              chunkCrc32.getValue(), buf.readableBytes(), state);
-        }
-        ReferenceCountUtil.safeRelease(buf);
-        buf = null;
-        chunkCrc32.reset();
-        isCrcVerified = false;
-      }
-    }
-
-    /**
      * True is the data in this chunk is released.
      * @return
      */
     boolean isDataReleased() {
-      synchronized (BUFFER_LOCK) {
-        return buf == null;
-      }
+      return bufferManager.isReleased();
+    }
+
+    /**
+     * Get the current size of the buffer in bytes.
+     * Useful for testing and diagnostics.
+     * @return buffer size in bytes, or 0 if buffer is released
+     */
+    int getBufferSize() {
+      return bufferManager.getBufferSize();
+    }
+
+    /**
+     * Get a retained copy of the buffer for testing.
+     * Caller is responsible for releasing the returned buffer.
+     * @return retained duplicate of buffer, or null if buffer is released/complete
+     */
+    ByteBuf retainBufferForTest() {
+      return bufferManager.retainForNetwork();
+    }
+
+    /**
+     * Verify CRC for testing.
+     * @return true if CRC matches or verification disabled
+     */
+    boolean verifyCRCUnderLock() {
+      return bufferManager.verifyCRC();
+    }
+
+    /**
+     * Get buffer manager for testing.
+     * WARNING: For testing only!
+     * @return buffer manager instance
+     */
+    ChunkBufferManager getBufferManagerForTest() {
+      return bufferManager;
     }
 
     /**
@@ -2458,11 +2503,8 @@ class PutOperation {
           } else {
             ServerErrorCode putError = putResponse.getError();
             if (putError == ServerErrorCode.NoError) {
-              boolean crcValid;
-              // Verify CRC under BUFFER_LOCK because CRC read the buffer content.
-              synchronized (BUFFER_LOCK) {
-                crcValid = verifyCRCUnderLock();
-              }
+              // Verify CRC - bufferManager handles synchronization internally
+              boolean crcValid = bufferManager.verifyCRC();
               if (!crcValid) {
                 logger.error("{}: PutRequest with response correlationId {}, blob id {} has a mismatch in crc {} ",
                     loggingContext, correlationId, chunkBlobId, requestInfo.getReplicaId().getDataNodeId());
@@ -2507,37 +2549,6 @@ class PutOperation {
         onErrorResponse(requestInfo.getReplicaId(), putRequestFinalState);
       }
       checkAndMaybeComplete();
-    }
-
-    /**
-     * Verifies the CRC of the chunk buffer matches the CRC calculated during chunk filling.
-     * MUST be called while holding BUFFER_LOCK.
-     * @return {@code true} if CRC verification is disabled, not applicable, or if the CRC matches.
-     *         Also returns {@code true} if the operation is already complete (skipping verification
-     *         since the response won't affect the operation outcome).
-     */
-    boolean verifyCRCUnderLock() {
-      // If operation completed, skip verification since the response doesn't affect the outcome
-      if (!routerConfig.routerVerifyCrcForPutRequests || !isCrcVerificationAllowedForChunk() || isMetadataChunk()
-          || isCrcVerified || isOperationComplete()) {
-        return true;
-      }
-
-      long storedCrc = chunkCrc32.getValue();
-      Crc32 computedCrc32 = new Crc32();
-      for (ByteBuffer byteBuffer : buf.nioBuffers()) {
-        computedCrc32.update(byteBuffer);
-      }
-      long computedCrc = computedCrc32.getValue();
-      boolean matches = storedCrc == computedCrc;
-      if (!matches) {
-        logger.error(
-            "{}: CRC mismatch for chunk {} - Chunk details: state: {}, size: {}, compressed: {}, encrypted: {}",
-            loggingContext, chunkIndex, state, buf.readableBytes(), isChunkCompressed,
-            passedInBlobProperties.isEncrypted());
-      }
-      isCrcVerified = true;
-      return matches;
     }
 
     /**

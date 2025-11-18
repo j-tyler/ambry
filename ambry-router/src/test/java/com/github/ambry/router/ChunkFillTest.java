@@ -206,7 +206,7 @@ public class ChunkFillTest {
               || putChunk.getState() == PutOperation.ChunkState.Building);
           if (putChunk.getState() == PutOperation.ChunkState.Ready) {
             Assert.assertEquals("Chunk size should be the last chunk size", lastChunkSize,
-                putChunk.buf.readableBytes());
+                putChunk.getBufferSize());
             Assert.assertTrue("Chunk Filling should be complete at this time", op.isChunkFillingDone());
             fillingComplete = true;
           }
@@ -222,7 +222,7 @@ public class ChunkFillTest {
             // if not last chunk, then the chunk should be full and Ready.
             Assert.assertEquals("Chunk should be ready.", PutOperation.ChunkState.Ready, putChunk.getState());
           }
-          Assert.assertEquals("Chunk size should be maxChunkSize", chunkSize, putChunk.buf.readableBytes());
+          Assert.assertEquals("Chunk size should be maxChunkSize", chunkSize, putChunk.getBufferSize());
           if (chunkIndex > 0 || (firstPutChunk != null && firstPutChunk.getState() == PutOperation.ChunkState.Ready)) {
             firstPutChunk.clear();
             chunkIndex++;
@@ -313,7 +313,7 @@ public class ChunkFillTest {
           continue;
         }
         Assert.assertEquals("Chunk should be ready.", PutOperation.ChunkState.Ready, putChunk.getState());
-        ByteBuf buf = putChunk.buf.retainedDuplicate();
+        ByteBuf buf = putChunk.retainBufferForTest();
         totalSizeWritten += buf.readableBytes();
         compositeBuffers[putChunk.getChunkIndex()] = buf;
         if (testEncryption) {

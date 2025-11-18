@@ -455,9 +455,10 @@ public class PutOperationTest {
 
     // Modify the content
     PutOperation.PutChunk putChunk = op.getPutChunks().get(0);
-    putChunk.buf.clear();
+    ByteBuf buf = putChunk.getBufferManagerForTest().getBufferForTest();
+    buf.clear();
     random.nextBytes(content);
-    putChunk.buf.writeBytes(content);
+    buf.writeBytes(content);
 
     // Send all requests.
     for (int i = 0; i < requestInfos.size(); i++) {
@@ -934,10 +935,11 @@ public class PutOperationTest {
 
     // Mutate buffer (should not cause CRC error as CRC check is off)
     PutOperation.PutChunk putChunk = op.getPutChunks().get(0);
-    putChunk.buf.clear();
+    ByteBuf buf = putChunk.getBufferManagerForTest().getBufferForTest();
+    buf.clear();
     byte[] corrupted = new byte[chunkSize];
     random.nextBytes(corrupted);
-    putChunk.buf.writeBytes(corrupted);
+    buf.writeBytes(corrupted);
 
     // Even with corruption, operation should complete successfully
     for (RequestInfo requestInfo : requestInfos) {
@@ -1008,7 +1010,7 @@ public class PutOperationTest {
 
     // Simulate compression
     PutOperation.PutChunk putChunk = op.new PutChunk();
-    putChunk.buf = sourceByteBuf;
+    putChunk.getBufferManagerForTest().setBufferForTest(sourceByteBuf);
     MethodUtils.invokeMethod(putChunk, true, "compressChunk", false);
 
     // CRC should work for compressed chunk
@@ -1018,7 +1020,7 @@ public class PutOperationTest {
     Assert.assertTrue((boolean) FieldUtils.readField(putChunk, "isChunkCompressed", true));
 
     // Release the buf field.
-    ByteBuf buf = (ByteBuf) FieldUtils.readField(putChunk, "buf", true);
+    ByteBuf buf = putChunk.getBufferManagerForTest().getBufferForTest();
     buf.release();
   }
 
@@ -1143,7 +1145,7 @@ public class PutOperationTest {
         + "Test Message for testing purpose.  The Message is part of the testing message.").getBytes();
     ByteBuf sourceByteBuf = Unpooled.wrappedBuffer(sourceBuffer);
     PutOperation.PutChunk putChunk = op.new PutChunk();
-    putChunk.buf = sourceByteBuf;
+    putChunk.getBufferManagerForTest().setBufferForTest(sourceByteBuf);
 
     // Invoke the PutChunk.compressChunk() method.  The new buffer is stored in "buf" field.
     MethodUtils.invokeMethod(putChunk, true, "compressChunk", false);
@@ -1152,7 +1154,7 @@ public class PutOperationTest {
     Assert.assertTrue((boolean) FieldUtils.readField(putChunk, "isChunkCompressed", true));
 
     // Release the buf field.
-    ByteBuf buf = (ByteBuf) FieldUtils.readField(putChunk, "buf", true);
+    ByteBuf buf = putChunk.getBufferManagerForTest().getBufferForTest();
     buf.release();
   }
 
