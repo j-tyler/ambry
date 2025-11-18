@@ -35,8 +35,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,6 +52,9 @@ class PutManager {
   private static final Logger logger = LoggerFactory.getLogger(PutManager.class);
 
   private final Set<PutOperation> putOperations;
+  // Queue of operations that have completed/failed but may have Building chunks that need cleanup.
+  // ChunkFiller thread processes this queue to release any Building chunk buffers.
+  private final Queue<PutOperation> cleanupQueue = new ConcurrentLinkedQueue<>();
   private final NotificationSystem notificationSystem;
   private final KeyManagementService kms;
   private final CryptoService cryptoService;
@@ -300,6 +305,9 @@ class PutManager {
     } else {
       updateChunkingAndSizeMetricsOnSuccessfulPut(op);
     }
+    // Add to cleanup queue so ChunkFiller can release any Building chunks that may not have been processed yet.
+    // This prevents memory leaks when operations complete before ChunkFiller processes in-flight Building chunks.
+    cleanupQueue.offer(op);
     routerMetrics.operationDequeuingRate.mark();
     long operationLatencyMs = time.milliseconds() - op.getSubmissionTimeMs();
     if (op.isStitchOperation()) {
@@ -409,11 +417,17 @@ class PutManager {
       try {
         while (isOpen.get()) {
           chunkFillerThreadMaySleep = true;
+          // Process active operations
           for (PutOperation op : putOperations) {
             op.fillChunks();
             if (!op.isChunkFillingDone()) {
               chunkFillerThreadMaySleep = false;
             }
+          }
+          // Process cleanup queue - release any Building chunks from completed operations
+          PutOperation opToClean;
+          while ((opToClean = cleanupQueue.poll()) != null) {
+            opToClean.releaseUnprocessedChunks();
           }
           if (chunkFillerThreadMaySleep || forceChunkFillerThreadToSleep) {
             synchronized (chunkFillerSynchronizer) {

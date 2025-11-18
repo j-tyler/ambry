@@ -581,6 +581,27 @@ class PutOperation {
   }
 
   /**
+   * Release any unprocessed chunks (Building or AwaitingBlobTypeResolution) that haven't been transitioned to
+   * Ready/Complete/Encrypting states. This is called by the ChunkFiller thread after an operation completes
+   * to clean up chunks that were being filled when the operation was removed from the active operations set.
+   *
+   * This method is intentionally NOT synchronized - it's called exclusively by ChunkFiller thread which is the
+   * only thread that creates and accesses Building chunks, avoiding race conditions.
+   */
+  void releaseUnprocessedChunks() {
+    for (PutChunk chunk : putChunks) {
+      // Only release chunks in Building or AwaitingBlobTypeResolution states.
+      // These are states that only ChunkFiller manages, so no synchronization is needed.
+      // Skip Free (no content), Encrypting (encryption thread owns), Ready/Complete (already processed).
+      if (chunk.isBuilding() || chunk.state == ChunkState.AwaitingBlobTypeResolution) {
+        logger.debug("{}: Releasing unprocessed chunk {} in state {}", loggingContext, chunk.getChunkIndex(),
+            chunk.getState());
+        chunk.releaseBlobContent();
+      }
+    }
+  }
+
+  /**
    * For this operation, create and populate put requests for chunks (in the form of {@link RequestInfo}) to
    * send out.
    * @param requestRegistrationCallback the {@link RequestRegistrationCallback} to call for every request that gets
