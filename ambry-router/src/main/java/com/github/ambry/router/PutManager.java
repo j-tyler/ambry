@@ -311,6 +311,13 @@ class PutManager {
     // This is the ONLY cleanup path for normal operation completion (success or error).
     // By centralizing cleanup in ChunkFiller, we avoid race conditions and respect thread ownership.
     cleanupQueue.offer(op);
+    // Wake up ChunkFiller to process cleanup queue immediately
+    synchronized (chunkFillerSynchronizer) {
+      chunkFillerThreadMaySleep = false;
+      if (isChunkFillerThreadAsleep) {
+        chunkFillerSynchronizer.notify();
+      }
+    }
     routerMetrics.operationDequeuingRate.mark();
     long operationLatencyMs = time.milliseconds() - op.getSubmissionTimeMs();
     if (op.isStitchOperation()) {
@@ -431,6 +438,10 @@ class PutManager {
           PutOperation opToClean;
           while ((opToClean = cleanupQueue.poll()) != null) {
             opToClean.releaseAllChunks();
+          }
+          // Don't sleep if cleanup queue has items to process
+          if (!cleanupQueue.isEmpty()) {
+            chunkFillerThreadMaySleep = false;
           }
           if (chunkFillerThreadMaySleep || forceChunkFillerThreadToSleep) {
             synchronized (chunkFillerSynchronizer) {
