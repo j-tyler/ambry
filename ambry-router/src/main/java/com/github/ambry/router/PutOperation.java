@@ -761,7 +761,18 @@ class PutOperation {
         maybeResolveAwaitingChunk();
 
         if (lastChunk != null) {
-          if (chunkCounter != 0 && lastChunk.buf.readableBytes() == 0) {
+          boolean shouldDiscard = false;
+          synchronized (lastChunk.BUFFER_LOCK) {
+            // Principle 3: Check operationCompleted after acquiring lock
+            if (lastChunk.isOperationComplete()) {
+              logger.debug("{}: Chunk {} already complete, skipping fillChunks processing", loggingContext, lastChunk.chunkIndex);
+              continue;
+            }
+            // Principle 1: Read buf under lock
+            shouldDiscard = chunkCounter != 0 && lastChunk.buf.readableBytes() == 0;
+          }
+
+          if (shouldDiscard) {
             logger.trace("{}: The last buffer(s) received from chunkFillerChannel have no data, discarding them.",
                 loggingContext);
             lastChunk.releaseBlobContent();
@@ -1293,8 +1304,10 @@ class PutOperation {
      * True is the data in this chunk is released.
      * @return
      */
-    synchronized boolean isDataReleased() {
-      return buf == null;
+    boolean isDataReleased() {
+      synchronized (BUFFER_LOCK) {
+        return buf == null;
+      }
     }
 
     /**
@@ -1540,14 +1553,25 @@ class PutOperation {
       }
       encryptJobMetricsTracker.onJobResultProcessingStart();
       if (exception == null && !isOperationComplete()) {
-        if (!isMetadataChunk()) {
-          buf = result.getEncryptedBlobContent();
-          if (routerConfig.routerVerifyCrcForPutRequests) {
-            for (ByteBuffer byteBuffer : buf.nioBuffers()) {
-              chunkCrc32.update(byteBuffer);
+        synchronized (BUFFER_LOCK) {
+          // Principle 3: Check operationCompleted after acquiring lock
+          if (isOperationComplete()) {
+            if (result != null) {
+              result.release();
             }
-            logger.debug("{}: Chunk {} post-encryption CRC: {}, size: {}", loggingContext, chunkIndex,
-                chunkCrc32.getValue(), buf != null ? buf.readableBytes() : 0);
+            return;
+          }
+
+          // Principle 1: Access buf under lock
+          if (!isMetadataChunk()) {
+            buf = result.getEncryptedBlobContent();
+            if (routerConfig.routerVerifyCrcForPutRequests) {
+              for (ByteBuffer byteBuffer : buf.nioBuffers()) {
+                chunkCrc32.update(byteBuffer);
+              }
+              logger.debug("{}: Chunk {} post-encryption CRC: {}, size: {}", loggingContext, chunkIndex,
+                  chunkCrc32.getValue(), buf.readableBytes());
+            }
           }
         }
         encryptedPerBlobKey = result.getEncryptedKey();
@@ -1591,15 +1615,12 @@ class PutOperation {
      * Compress the buffer in "buf" field for data chunks.  It does not compress metadata chunks.
      * It also applies rules specified in config.
      * After compression, it replaces "buf" field and update isCompressed field in blob properties.
-     * Thread-safety: This accesses buf but is safe because:
-     * - Called from onFillComplete which has checked isOperationComplete()
-     * - At this point the chunk is in Building state with exclusive access
-     * - State transitions prevent concurrent modification
+     * MUST be called while holding BUFFER_LOCK.
      * @param outputDirectMemory Whether the compression output should be direct memory (True) or heap memory (false).
      *                           If the next step is encryption, it should use Heap (since encryption takes an array).
      *                           If the next step is output to Netty, it should use direct memory.
      */
-    private void compressChunk(boolean outputDirectMemory) {
+    private void compressChunkUnderLock(boolean outputDirectMemory) {
       // Do not compress metadata chunk or already compressed chunk.
       if (isMetadataChunk() || isChunkCompressed || !isBlobCompressible) {
         return;
@@ -1627,83 +1648,75 @@ class PutOperation {
     }
 
     /**
-     * Submits encrypt job for the given {@link PutChunk} and processes the callback for the same.
-     * Thread-safety: Accesses buf to create a retained duplicate, but this is safe because:
-     * 1. When called from onFillComplete (which is now outside BUFFER_LOCK), the chunk is in Building state
-     *    with exclusive access, and onFillComplete has already verified operation is not complete
-     * 2. When called from other paths, the chunk state transition ensures exclusive access
-     * If an exception occurs here and triggers setOperationExceptionAndComplete(), it will NOT cause nested
-     * lock acquisition since we're not holding BUFFER_LOCK.
-     */
-    private void encryptChunk() {
-      ByteBuf retainedCopy = null;
-      try {
-        logger.trace("{}: Chunk at index {} moves to {} state", loggingContext, chunkIndex, ChunkState.Encrypting);
-        state = ChunkState.Encrypting;
-        chunkEncryptReadyAtMs = time.milliseconds();
-        encryptJobMetricsTracker.onJobSubmission();
-        logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
-        // Note: This buf access is safe because:
-        // - We're called from onFillComplete which verified operation is not complete
-        // - Chunk is in Building state with exclusive ownership
-        // - If abort happens concurrently, buf won't be released until state transition
-        retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
-        cryptoJobHandler.submitJob(
-            new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
-                retainedCopy, ByteBuffer.wrap(chunkUserMetadata), kms.getRandomKey(),
-                cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
-      } catch (GeneralSecurityException e) {
-        if (retainedCopy != null) {
-          retainedCopy.release();
-        }
-        encryptJobMetricsTracker.incrementOperationError();
-        logger.trace("{}: Exception thrown while generating random key for chunk at index {}", loggingContext,
-            chunkIndex, e);
-        setOperationExceptionAndComplete(new RouterException(
-            "GeneralSecurityException thrown while generating random key for chunk at index " + chunkIndex, e,
-            RouterErrorCode.UnexpectedInternalError));
-      } finally {
-        // ownership transferred to EncryptJob or cleaned up on exception
-        retainedCopy = null;
-      }
-    }
-
-    /**
      * Do the actions required when the chunk has been completely built.
-     * Thread-safety: This method accesses buf to read its size and for compression/encryption.
-     * It's safe because either:
-     * 1. Called from fillFrom() after releasing BUFFER_LOCK, with chunkBlobSize pre-captured
-     * 2. Called from other single-threaded contexts with exclusive chunk ownership
+     * Thread-safety: Holds BUFFER_LOCK for all buf access operations. Releases lock before
+     * calling setOperationExceptionAndComplete to avoid nested lock acquisition.
      * @param updateMetric whether chunk fill completion metrics should be updated.
      */
     void onFillComplete(boolean updateMetric) {
-      // Early exit if operation was completed/aborted while we were transitioning
-      if (isOperationComplete()) {
-        logger.debug("{}: Operation already complete, skipping onFillComplete for chunk {}", loggingContext, chunkIndex);
-        return;
-      }
+      Exception encryptionException = null;
 
-      // chunkBlobSize should have been set by caller before releasing any locks
-      chunkFillCompleteAtMs = time.milliseconds();
-      if (updateMetric) {
-        routerMetrics.chunkFillTimeMs.update(time.milliseconds() - chunkFreeAtMs);
-      }
+      synchronized (BUFFER_LOCK) {
+        // Principle 3: Check operationCompleted after acquiring lock
+        if (isOperationComplete()) {
+          logger.debug("{}: Operation already complete, skipping onFillComplete for chunk {}", loggingContext, chunkIndex);
+          return;
+        }
 
-      if (routerConfig.routerVerifyCrcForPutRequests) {
-        logger.debug("{}: Chunk {} fill complete - final size: {}, CRC: {}", loggingContext, chunkIndex,
-            buf.readableBytes(), chunkCrc32.getValue());
-      }
+        // Principle 1: Read buf under lock
+        chunkBlobSize = buf.readableBytes();
+        chunkFillCompleteAtMs = time.milliseconds();
+        if (updateMetric) {
+          routerMetrics.chunkFillTimeMs.update(time.milliseconds() - chunkFreeAtMs);
+        }
 
-      // Attempt to apply compression on data chunk.
-      // If encryption is next, use Heap to store compression output since encryption takes heap buffer.
-      // If no encryption, use direct memory to store compression output since it sends to Netty.
-      compressChunk(!passedInBlobProperties.isEncrypted());
+        if (routerConfig.routerVerifyCrcForPutRequests) {
+          logger.debug("{}: Chunk {} fill complete - final size: {}, CRC: {}", loggingContext, chunkIndex,
+              buf.readableBytes(), chunkCrc32.getValue());
+        }
 
-      if (!passedInBlobProperties.isEncrypted()) {
-        prepareForSending();
-        chunkReadyAtMs = time.milliseconds();
-      } else {
-        encryptChunk();
+        // Compress under lock - modifies buf
+        compressChunkUnderLock(!passedInBlobProperties.isEncrypted());
+
+        if (!passedInBlobProperties.isEncrypted()) {
+          // No encryption needed - prepare for sending under lock
+          prepareForSending();
+          chunkReadyAtMs = time.milliseconds();
+        } else {
+          // Encryption path - do buffer operations under lock, but handle exceptions outside
+          logger.trace("{}: Chunk at index {} moves to {} state", loggingContext, chunkIndex, ChunkState.Encrypting);
+          state = ChunkState.Encrypting;
+          chunkEncryptReadyAtMs = time.milliseconds();
+          encryptJobMetricsTracker.onJobSubmission();
+          logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
+
+          // Principle 1: Access buf under lock
+          ByteBuf retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
+
+          try {
+            // Submit job under lock - this is a quick synchronous call that queues the job
+            cryptoJobHandler.submitJob(
+                new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
+                    retainedCopy, ByteBuffer.wrap(chunkUserMetadata), kms.getRandomKey(),
+                    cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
+          } catch (GeneralSecurityException e) {
+            // Exception during job submission (e.g., key generation failed)
+            if (retainedCopy != null) {
+              retainedCopy.release();
+            }
+            encryptionException = e;
+          }
+        }
+      }  // Release BUFFER_LOCK
+
+      // Principle 2: Handle exception outside lock to avoid nested lock acquisition
+      if (encryptionException != null) {
+        encryptJobMetricsTracker.incrementOperationError();
+        logger.trace("{}: Exception thrown while generating random key for chunk at index {}", loggingContext,
+            chunkIndex, encryptionException);
+        setOperationExceptionAndComplete(
+            new RouterException("GeneralSecurityException thrown while generating random key for chunk at index " + chunkIndex,
+                encryptionException, RouterErrorCode.UnexpectedInternalError));
       }
     }
 
@@ -1766,11 +1779,8 @@ class PutOperation {
             // is complete. At that point we will have enough information to mark this blob as simple or composite blob.
             state = ChunkState.AwaitingBlobTypeResolution;
           } else {
-            // Capture state under lock to use outside lock
+            // Set flag to call onFillComplete outside lock
             shouldCallOnFillComplete = true;
-            // Pre-capture the blob size while we still hold the lock and buf is valid
-            // onFillComplete() will use this value instead of reading from buf
-            chunkBlobSize = buf.readableBytes();
           }
         }
       }
@@ -1954,10 +1964,18 @@ class PutOperation {
      * @return the crated {@link PutRequest}.
      */
     protected PutRequest createPutRequest() {
-      return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
-          chunkBlobId, chunkBlobProperties, ByteBuffer.wrap(chunkUserMetadata), buf.retainedDuplicate(),
-          buf.readableBytes(), BlobType.DataBlob, encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null,
-          isChunkCompressed);
+      synchronized (BUFFER_LOCK) {
+        // Principle 3: Check after acquiring lock
+        if (isOperationComplete()) {
+          throw new IllegalStateException("Cannot create PutRequest for chunk " + chunkIndex + ", operation is complete");
+        }
+
+        // Principle 1: Read buf under lock
+        return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
+            chunkBlobId, chunkBlobProperties, ByteBuffer.wrap(chunkUserMetadata), buf.retainedDuplicate(),
+            buf.readableBytes(), BlobType.DataBlob, encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null,
+            isChunkCompressed);
+      }
     }
 
     /**
@@ -2455,7 +2473,17 @@ class PutOperation {
               "Unexpected metadata content version: " + routerConfig.routerMetadataContentVersion);
         }
         serialized.flip();
-        buf = Unpooled.wrappedBuffer(serialized);
+
+        synchronized (BUFFER_LOCK) {
+          // Principle 3: Check after acquiring lock
+          if (isOperationComplete()) {
+            logger.debug("{}: Operation complete, skipping metadata chunk assembly", loggingContext);
+            return;
+          }
+          // Principle 1: Write buf under lock
+          buf = Unpooled.wrappedBuffer(serialized);
+        }
+
         onFillComplete(false);
         checkReservedPartitionState();
       } else {
@@ -2481,10 +2509,18 @@ class PutOperation {
      */
     @Override
     protected PutRequest createPutRequest() {
-      return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
-          chunkBlobId, finalBlobProperties, ByteBuffer.wrap(chunkUserMetadata), buf.retainedDuplicate(),
-          buf.readableBytes(), BlobType.MetadataBlob,
-          encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null);
+      synchronized (BUFFER_LOCK) {
+        // Principle 3: Check after acquiring lock
+        if (isOperationComplete()) {
+          throw new IllegalStateException("Cannot create PutRequest for metadata chunk, operation is complete");
+        }
+
+        // Principle 1: Read buf under lock
+        return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
+            chunkBlobId, finalBlobProperties, ByteBuffer.wrap(chunkUserMetadata), buf.retainedDuplicate(),
+            buf.readableBytes(), BlobType.MetadataBlob,
+            encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null);
+      }
     }
 
     /**
