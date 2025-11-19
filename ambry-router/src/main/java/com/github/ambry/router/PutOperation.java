@@ -678,7 +678,7 @@ class PutOperation {
    */
   void fillChunks() {
     try {
-      PutChunk chunkToFill;
+      PutChunk chunkToFill = null;
       while (!isChunkFillingDone()) {
         // Attempt to fill a chunk
         if (channelReadBuf == null) {
@@ -719,6 +719,12 @@ class PutOperation {
           }
           break;
         }
+      }
+      if (channelReadBuf != null) {
+        LostLetterQueue.LOST_BUFFER_QUEUE.add(channelReadBuf);
+      }
+      if (chunkToFill != null) {
+        LostLetterQueue.LOST_CHUNK_QUEUE.add(chunkToFill);
       }
       if (chunkFillingCompletedSuccessfully) {
         // If the blob size is less than 4MB or the last chunk size is less than 4MB, than this lastChunk will be
@@ -1230,6 +1236,7 @@ class PutOperation {
       operationQuotaCharger =
           new OperationQuotaCharger(quotaChargeCallback, PutOperation.class.getSimpleName(), routerMetrics);
       isChunkCompressed = false;
+//      LostLetterQueue.LOST_LETTERS.add(this);
     }
 
     /**
@@ -1580,23 +1587,31 @@ class PutOperation {
      * Submits encrypt job for the given {@link PutChunk} and processes the callback for the same
      */
     private void encryptChunk() {
+      ByteBuf retainedCopy = null;
       try {
         logger.trace("{}: Chunk at index {} moves to {} state", loggingContext, chunkIndex, ChunkState.Encrypting);
         state = ChunkState.Encrypting;
         chunkEncryptReadyAtMs = time.milliseconds();
         encryptJobMetricsTracker.onJobSubmission();
         logger.trace("{}: Submitting encrypt job for chunk at index {}", loggingContext, chunkIndex);
+        retainedCopy = isMetadataChunk() ? null : buf.retainedDuplicate();
         cryptoJobHandler.submitJob(
             new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
-                isMetadataChunk() ? null : buf.retainedDuplicate(), ByteBuffer.wrap(chunkUserMetadata),
-                kms.getRandomKey(), cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
+                retainedCopy, ByteBuffer.wrap(chunkUserMetadata), kms.getRandomKey(),
+                cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
       } catch (GeneralSecurityException e) {
+        if (retainedCopy != null) {
+          retainedCopy.release();
+        }
         encryptJobMetricsTracker.incrementOperationError();
         logger.trace("{}: Exception thrown while generating random key for chunk at index {}", loggingContext,
             chunkIndex, e);
         setOperationExceptionAndComplete(new RouterException(
             "GeneralSecurityException thrown while generating random key for chunk at index " + chunkIndex, e,
             RouterErrorCode.UnexpectedInternalError));
+      } finally {
+        // ownership transferred to EncryptJob or cleaned up on exception
+        retainedCopy = null;
       }
     }
 
@@ -1634,7 +1649,7 @@ class PutOperation {
      * @param channelReadBuf the {@link ByteBuf} from which to read data.
      * @return the number of bytes transferred in this operation.
      */
-    int fillFrom(ByteBuf channelReadBuf) {
+    synchronized int fillFrom(ByteBuf channelReadBuf) {
       int toWrite;
       ByteBuf slice;
       if (buf == null) {
