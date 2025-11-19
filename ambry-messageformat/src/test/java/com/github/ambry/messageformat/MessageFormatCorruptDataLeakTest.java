@@ -31,7 +31,7 @@ import static org.junit.Assert.fail;
  * Tests ByteBuf leak detection and prevention in blob deserialization error paths.
  *
  * <p><b>Production Bug Being Tested:</b><br>
- * {@code MessageFormatRecord.Blob_Format_V1.deserializeBlobRecord} allocates a ByteBuf slice
+ * {@code MessageFormatRecord.Blob_Format_V1/V2/V3.deserializeBlobRecord} allocates a ByteBuf slice
  * via {@code Utils.readNettyByteBufFromCrcInputStream} but fails to release it when CRC
  * validation fails, causing a memory leak in the error path.</p>
  *
@@ -43,8 +43,9 @@ import static org.junit.Assert.fail;
  *
  * <p><b>Test Coverage:</b></p>
  * <ul>
- *   <li>{@link #testDeserializeBlobWithCorruptCrc()} - Error path (leak detection)</li>
- *   <li>{@link #testDeserializeBlobWithValidCrc()} - Success path (control test)</li>
+ *   <li>V1 Format: {@link #testDeserializeBlobWithCorruptCrc()}, {@link #testDeserializeBlobWithValidCrc()}</li>
+ *   <li>V2 Format: {@link #testDeserializeBlobV2WithCorruptCrc()}, {@link #testDeserializeBlobV2WithValidCrc()}</li>
+ *   <li>V3 Format: {@link #testDeserializeBlobV3WithCorruptCrc()}, {@link #testDeserializeBlobV3WithValidCrc()}</li>
  * </ul>
  *
  * <p><b>Design Rationale:</b><br>
@@ -206,6 +207,172 @@ public class MessageFormatCorruptDataLeakTest {
     BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
 
     assertEquals("BlobData should contain 512 bytes", 512, blobData.content().readableBytes());
+
+    List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
+    assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());
+
+    ByteBuf slice = capturedSlices.get(0);
+    assertTrue("Slice should have refCnt > 0 before release", slice.refCnt() > 0);
+
+    blobData.release();
+
+    int refCnt = slice.refCnt();
+    if (refCnt > 0) {
+      leakedBuffersToClean.add(slice);
+    }
+
+    assertEquals("Expected no leak: slice refCnt should be 0 after BlobData.release()", 0, refCnt);
+  }
+
+  /**
+   * Test V2 corrupt blob deserialization with CRC mismatch - verifies ByteBuf cleanup on error path.
+   *
+   * <p>V2 format adds blobType field: version(2) + blobType(2) + size(8) + content(n) + crc(8)</p>
+   */
+  @Test
+  public void testDeserializeBlobV2WithCorruptCrc() throws Exception {
+    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 2 + 8 + 512 + 8);
+    leakedBuffersToClean.add(inputBuf);
+
+    byte[] blobContent = new byte[512];
+    inputBuf.writeShort(MessageFormatRecord.Blob_Version_V2);
+    inputBuf.writeShort((short) BlobType.DataBlob.ordinal());
+    inputBuf.writeLong(512);
+    inputBuf.writeBytes(blobContent);
+
+    CRC32 crc = new CRC32();
+    crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
+    inputBuf.writeLong(crc.getValue() + 1);
+
+    CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
+
+    try {
+      MessageFormatRecord.deserializeBlob(capturingStream);
+      fail("Should have thrown MessageFormatException due to corrupt CRC");
+    } catch (MessageFormatException e) {
+      assertEquals(MessageFormatErrorCodes.DataCorrupt, e.getErrorCode());
+    }
+
+    List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
+    assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());
+
+    ByteBuf slice = capturedSlices.get(0);
+    int refCnt = slice.refCnt();
+
+    if (refCnt > 0) {
+      leakedBuffersToClean.add(slice);
+    }
+
+    assertEquals("ByteBuf slice must be released after CRC validation failure (V2 format)", 0, refCnt);
+  }
+
+  /**
+   * Test V2 valid blob deserialization - verifies no leak on success path (control test).
+   */
+  @Test
+  public void testDeserializeBlobV2WithValidCrc() throws Exception {
+    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 2 + 8 + 256 + 8);
+    leakedBuffersToClean.add(inputBuf);
+
+    byte[] blobContent = new byte[256];
+    inputBuf.writeShort(MessageFormatRecord.Blob_Version_V2);
+    inputBuf.writeShort((short) BlobType.DataBlob.ordinal());
+    inputBuf.writeLong(256);
+    inputBuf.writeBytes(blobContent);
+
+    CRC32 crc = new CRC32();
+    crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
+    inputBuf.writeLong(crc.getValue());
+
+    CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
+
+    BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
+
+    assertEquals("BlobData should contain 256 bytes", 256, blobData.content().readableBytes());
+
+    List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
+    assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());
+
+    ByteBuf slice = capturedSlices.get(0);
+    assertTrue("Slice should have refCnt > 0 before release", slice.refCnt() > 0);
+
+    blobData.release();
+
+    int refCnt = slice.refCnt();
+    if (refCnt > 0) {
+      leakedBuffersToClean.add(slice);
+    }
+
+    assertEquals("Expected no leak: slice refCnt should be 0 after BlobData.release()", 0, refCnt);
+  }
+
+  /**
+   * Test V3 corrupt blob deserialization with CRC mismatch - verifies ByteBuf cleanup on error path.
+   *
+   * <p>V3 format adds isCompressed field: version(2) + blobType(2) + isCompressed(1) + size(8) + content(n) + crc(8)</p>
+   */
+  @Test
+  public void testDeserializeBlobV3WithCorruptCrc() throws Exception {
+    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 2 + 1 + 8 + 512 + 8);
+    leakedBuffersToClean.add(inputBuf);
+
+    byte[] blobContent = new byte[512];
+    inputBuf.writeShort(MessageFormatRecord.Blob_Version_V3);
+    inputBuf.writeShort((short) BlobType.DataBlob.ordinal());
+    inputBuf.writeByte(0); // not compressed
+    inputBuf.writeLong(512);
+    inputBuf.writeBytes(blobContent);
+
+    CRC32 crc = new CRC32();
+    crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
+    inputBuf.writeLong(crc.getValue() + 1);
+
+    CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
+
+    try {
+      MessageFormatRecord.deserializeBlob(capturingStream);
+      fail("Should have thrown MessageFormatException due to corrupt CRC");
+    } catch (MessageFormatException e) {
+      assertEquals(MessageFormatErrorCodes.DataCorrupt, e.getErrorCode());
+    }
+
+    List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
+    assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());
+
+    ByteBuf slice = capturedSlices.get(0);
+    int refCnt = slice.refCnt();
+
+    if (refCnt > 0) {
+      leakedBuffersToClean.add(slice);
+    }
+
+    assertEquals("ByteBuf slice must be released after CRC validation failure (V3 format)", 0, refCnt);
+  }
+
+  /**
+   * Test V3 valid blob deserialization - verifies no leak on success path (control test).
+   */
+  @Test
+  public void testDeserializeBlobV3WithValidCrc() throws Exception {
+    ByteBuf inputBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(2 + 2 + 1 + 8 + 256 + 8);
+    leakedBuffersToClean.add(inputBuf);
+
+    byte[] blobContent = new byte[256];
+    inputBuf.writeShort(MessageFormatRecord.Blob_Version_V3);
+    inputBuf.writeShort((short) BlobType.DataBlob.ordinal());
+    inputBuf.writeByte(1); // compressed
+    inputBuf.writeLong(256);
+    inputBuf.writeBytes(blobContent);
+
+    CRC32 crc = new CRC32();
+    crc.update(inputBuf.nioBuffer(0, inputBuf.writerIndex()));
+    inputBuf.writeLong(crc.getValue());
+
+    CapturingInputStream capturingStream = new CapturingInputStream(inputBuf);
+
+    BlobData blobData = MessageFormatRecord.deserializeBlob(capturingStream);
+
+    assertEquals("BlobData should contain 256 bytes", 256, blobData.content().readableBytes());
 
     List<ByteBuf> capturedSlices = capturingStream.getCapturedSlices();
     assertEquals("Expected exactly one slice to be created", 1, capturedSlices.size());

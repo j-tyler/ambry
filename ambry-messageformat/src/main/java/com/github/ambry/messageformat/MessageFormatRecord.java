@@ -1665,6 +1665,56 @@ public class MessageFormatRecord {
    *  crc        - The crc of the blob record
    *
    */
+
+  /**
+   * Validates CRC and manages ByteBuf lifecycle for blob deserialization.
+   *
+   * <p>This helper method encapsulates the common pattern of CRC validation and ByteBuf resource
+   * management across all blob format versions. It uses try-finally with a success flag to ensure
+   * the ByteBuf is released only on error paths.</p>
+   *
+   * @param crcStream the CRC input stream to validate against
+   * @param dataStream the data input stream to read the stored CRC from
+   * @param byteBuf the ByteBuf to manage (will be released on error, kept on success)
+   * @param logger the logger to use for error messages
+   * @throws IOException if reading from the stream fails
+   * @throws MessageFormatException if CRC validation fails
+   */
+  private static void validateCrcAndManageByteBuf(CrcInputStream crcStream, DataInputStream dataStream,
+      ByteBuf byteBuf, Logger logger) throws IOException, MessageFormatException {
+    boolean success = false;
+    try {
+      long crc = crcStream.getValue();
+      long streamCrc = dataStream.readLong();
+      if (crc != streamCrc) {
+        logger.error("corrupt data while parsing blob content expectedcrc {} actualcrc {}", crc, streamCrc);
+        throw new MessageFormatException("corrupt data while parsing blob content",
+            MessageFormatErrorCodes.DataCorrupt);
+      }
+      success = true;
+    } finally {
+      if (!success) {
+        byteBuf.release();
+      }
+    }
+  }
+
+  /**
+   *  - - - - - - - - - - - - - - - - - - - - - -
+   * |         |           |            |            |
+   * | version |   size    |  content   |     Crc    |
+   * |(2 bytes)| (8 bytes) |  (n bytes) |  (8 bytes) |
+   * |         |           |            |            |
+   *  - - - - - - - - - - - - - - - - - - - - - - - -
+   *  version    - The version of the blob record
+   *
+   *  size       - The size of the blob content
+   *
+   *  content    - The actual content that represents the blob
+   *
+   *  crc        - The crc of the blob record
+   *
+   */
   public static class Blob_Format_V1 {
     public static final int Blob_Size_Field_In_Bytes = 8;
     private static Logger logger = LoggerFactory.getLogger(Blob_Format_V1.class);
@@ -1685,23 +1735,8 @@ public class MessageFormatRecord {
         throw new IOException("We only support data of max size == MAX_INT. Error while reading blob from store");
       }
       ByteBuf byteBuf = Utils.readNettyByteBufFromCrcInputStream(crcStream, (int) dataSize);
-      // Track success to ensure byteBuf is released only on error path (not when ownership transfers to BlobData)
-      boolean success = false;
-      try {
-        long crc = crcStream.getValue();
-        long streamCrc = dataStream.readLong();
-        if (crc != streamCrc) {
-          logger.error("corrupt data while parsing blob content expectedcrc {} actualcrc {}", crc, streamCrc);
-          throw new MessageFormatException("corrupt data while parsing blob content",
-              MessageFormatErrorCodes.DataCorrupt);
-        }
-        success = true;
-        return new BlobData(BlobType.DataBlob, dataSize, byteBuf);
-      } finally {
-        if (!success) {
-          byteBuf.release();
-        }
-      }
+      validateCrcAndManageByteBuf(crcStream, dataStream, byteBuf, logger);
+      return new BlobData(BlobType.DataBlob, dataSize, byteBuf);
     }
   }
 
@@ -1752,13 +1787,7 @@ public class MessageFormatRecord {
         throw new IOException("We only support data of max size == MAX_INT. Error while reading blob from store");
       }
       ByteBuf byteBuf = Utils.readNettyByteBufFromCrcInputStream(crcStream, (int) dataSize);
-      long crc = crcStream.getValue();
-      long streamCrc = dataStream.readLong();
-      if (crc != streamCrc) {
-        logger.error("corrupt data while parsing blob content expectedcrc {} actualcrc {}", crc, streamCrc);
-        throw new MessageFormatException("corrupt data while parsing blob content",
-            MessageFormatErrorCodes.DataCorrupt);
-      }
+      validateCrcAndManageByteBuf(crcStream, dataStream, byteBuf, logger);
       return new BlobData(blobContentType, dataSize, byteBuf);
     }
   }
@@ -1829,14 +1858,7 @@ public class MessageFormatRecord {
         logger.error("Failed to read ByteBuf from crc input stream with size: {}", dataSize);
         throw e;
       }
-      long crc = crcStream.getValue();
-      long streamCrc = dataStream.readLong();
-      if (crc != streamCrc) {
-        logger.error("corrupt data while parsing blob content expectedcrc {} actualcrc {}", crc, streamCrc);
-        throw new MessageFormatException("corrupt data while parsing blob content",
-            MessageFormatErrorCodes.DataCorrupt);
-      }
-
+      validateCrcAndManageByteBuf(crcStream, dataStream, byteBuf, logger);
       return new BlobData(blobContentType, dataSize, byteBuf, isCompressed);
     }
   }
