@@ -1833,7 +1833,6 @@ public class MessageFormatRecord {
       long crc = crcStream.getValue();
       long streamCrc = dataStream.readLong();
       if (crc != streamCrc) {
-        byteBuf.release();
         logger.error("Corrupt data while parsing blob content. Expected crc {} Actual crc {}", crc, streamCrc);
         throw new MessageFormatException("Corrupt data while parsing blob content.",
             MessageFormatErrorCodes.DataCorrupt);
