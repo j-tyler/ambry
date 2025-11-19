@@ -15,7 +15,6 @@ package com.github.ambry.router;
 
 import com.github.ambry.account.Account;
 import com.github.ambry.account.AccountService;
-import com.github.ambry.account.Container;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.ClusterMapUtils;
 import com.github.ambry.commons.ByteBufferAsyncWritableChannel;
@@ -31,6 +30,7 @@ import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
 import com.google.common.collect.Lists;
+import io.netty.buffer.ByteBuf;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -430,6 +430,19 @@ class PutManager {
         routerMetrics.chunkFillerUnexpectedErrorCount.inc();
         if (isOpen.compareAndSet(true, false)) {
           completePendingOperations();
+        }
+      }
+      while (!LostLetterQueue.LOST_BUFFER_QUEUE.isEmpty()) {
+        ByteBuf buf = LostLetterQueue.LOST_BUFFER_QUEUE.poll();
+        if (buf.refCnt() > 0) {
+          buf.release();
+        }
+      }
+      while (!LostLetterQueue.LOST_CHUNK_QUEUE.isEmpty()) {
+        PutOperation.PutChunk chunk = LostLetterQueue.LOST_CHUNK_QUEUE.poll();
+        if (!chunk.isDataReleased()) {
+          // never throws, here to show and prove
+          throw new RuntimeException("not released");
         }
       }
     }

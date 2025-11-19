@@ -678,7 +678,7 @@ class PutOperation {
    */
   void fillChunks() {
     try {
-      PutChunk chunkToFill;
+      PutChunk chunkToFill = null;
       while (!isChunkFillingDone()) {
         // Attempt to fill a chunk
         if (channelReadBuf == null) {
@@ -719,6 +719,12 @@ class PutOperation {
           }
           break;
         }
+      }
+      if (channelReadBuf != null) {
+        LostLetterQueue.LOST_BUFFER_QUEUE.add(channelReadBuf);
+      }
+      if (chunkToFill != null) {
+        LostLetterQueue.LOST_CHUNK_QUEUE.add(chunkToFill);
       }
       if (chunkFillingCompletedSuccessfully) {
         // If the blob size is less than 4MB or the last chunk size is less than 4MB, than this lastChunk will be
@@ -1230,6 +1236,7 @@ class PutOperation {
       operationQuotaCharger =
           new OperationQuotaCharger(quotaChargeCallback, PutOperation.class.getSimpleName(), routerMetrics);
       isChunkCompressed = false;
+//      LostLetterQueue.LOST_LETTERS.add(this);
     }
 
     /**
