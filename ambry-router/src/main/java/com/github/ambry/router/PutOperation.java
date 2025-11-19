@@ -558,6 +558,13 @@ class PutOperation {
    * other thread to release the data.
    */
   private synchronized void releaseDataForAllChunks() {
+    // Release channelReadBuf if it's held between fillChunks() iterations
+    if (channelReadBuf != null) {
+      logger.info("{}: Releasing channelReadBuf during cleanup", loggingContext);
+      ReferenceCountUtil.safeRelease(channelReadBuf);
+      channelReadBuf = null;
+    }
+
     for (PutChunk chunk : putChunks) {
       if (!(chunk.isFree() || chunk.isEncrypting())) {
         logger.info("{}: Clear unfinished chunk {} {} since operation is completed", loggingContext,
@@ -593,6 +600,14 @@ class PutOperation {
    * This method is intentionally NOT synchronized - it's called exclusively by ChunkFiller thread.
    */
   void releaseAllChunks() {
+    // Release channelReadBuf if it's held between fillChunks() iterations
+    // This can happen if operation completes after getNextByteBuf() but before the buffer is used
+    if (channelReadBuf != null) {
+      logger.debug("{}: Releasing channelReadBuf during cleanup", loggingContext);
+      ReferenceCountUtil.safeRelease(channelReadBuf);
+      channelReadBuf = null;
+    }
+
     for (PutChunk chunk : putChunks) {
       // Release all chunks except:
       // - Free: No buffer allocated, nothing to release
