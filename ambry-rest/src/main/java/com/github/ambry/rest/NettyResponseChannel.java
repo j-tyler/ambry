@@ -155,7 +155,9 @@ class NettyResponseChannel implements RestResponseChannel {
   @Override
   public Future<Long> write(ByteBuffer src, Callback<Long> callback) {
     FutureResult<Long> futureResult = new FutureResult<>();
-    write(Unpooled.wrappedBuffer(src), new Callback<Long>() {
+    // Create wrapper ByteBuf - we own it and must release it
+    ByteBuf wrapper = Unpooled.wrappedBuffer(src);
+    writeInternal(wrapper, new Callback<Long>() {
       @Override
       public void onCompletion(Long result, Exception exception) {
         long r = result == null ? src.position() : result.longValue();
@@ -165,12 +167,26 @@ class NettyResponseChannel implements RestResponseChannel {
           callback.onCompletion(result, exception);
         }
       }
-    });
+    }, true);  // ownsBuffer=true: we created the wrapper, we must release it
     return futureResult;
   }
 
   @Override
   public Future<Long> write(ByteBuf src, Callback<Long> callback) {
+    // Caller provided ByteBuf - they own it, we must NOT release it
+    return writeInternal(src, callback, false);
+  }
+
+  /**
+   * Internal write method that handles ByteBuf writes with ownership tracking.
+   * @param src the data to write.
+   * @param callback the {@link Callback} to invoke when the write completes.
+   * @param ownsBuffer whether NettyResponseChannel owns the buffer and must release it when done.
+   *                   True for buffers created internally (e.g., wrappers from {@link #write(ByteBuffer)}).
+   *                   False for buffers provided by callers (e.g., from {@link #write(ByteBuf)}).
+   * @return a {@link Future} that will contain the result of the write operation.
+   */
+  private Future<Long> writeInternal(ByteBuf src, Callback<Long> callback, boolean ownsBuffer) {
     long writeProcessingStartTime = System.currentTimeMillis();
     if (!responseMetadataWriteInitiated.get()) {
       maybeWriteResponseMetadata(responseMetadata, new ResponseMetadataWriteListener());
@@ -184,6 +200,10 @@ class NettyResponseChannel implements RestResponseChannel {
         logger.debug("Scheduling a chunk cleanup on channel {} because response channel is closed.", ctx.channel());
         writeFuture.addListener(new CleanupCallback(new ClosedChannelException()));
       }
+      // Following ByteBufferAsyncWritableChannel pattern: if we own the buffer and can't use it, release it now
+      if (ownsBuffer) {
+        src.release();
+      }
       FutureResult<Long> future = new FutureResult<Long>();
       future.done(0L, new ClosedChannelException());
       if (callback != null) {
@@ -191,7 +211,7 @@ class NettyResponseChannel implements RestResponseChannel {
       }
       return future;
     }
-    Chunk chunk = new Chunk(src, callback);
+    Chunk chunk = new Chunk(src, callback, ownsBuffer);
     logger.debug("Netty Response Chunk size: {}", src.readableBytes());
     chunksToWrite.add(chunk);
     if (HttpUtil.isContentLengthSet(finalResponseMetadata) && totalBytesReceived.get() > HttpUtil.getContentLength(
@@ -883,6 +903,13 @@ class NettyResponseChannel implements RestResponseChannel {
      */
     final ByteBuf buffer;
     /**
+     * Whether NettyResponseChannel owns this buffer and must release it.
+     * <p/>
+     * True for buffers created internally (e.g., wrappers from {@link #write(ByteBuffer)}).
+     * False for buffers provided by callers (e.g., from {@link #write(ByteBuf)}).
+     */
+    final boolean ownsBuffer;
+    /**
      * The number of bytes that will need to be written.
      */
     final long bytesToBeWritten;
@@ -906,9 +933,11 @@ class NettyResponseChannel implements RestResponseChannel {
      * Creates a chunk.
      * @param buffer the {@link ByteBuf} that forms the data of this chunk.
      * @param callback the {@link Callback} to invoke when {@link #writeCompleteThreshold} is reached.
+     * @param ownsBuffer whether NettyResponseChannel owns the buffer and must release it.
      */
-    Chunk(ByteBuf buffer, Callback<Long> callback) {
+    Chunk(ByteBuf buffer, Callback<Long> callback, boolean ownsBuffer) {
       this.buffer = buffer;
+      this.ownsBuffer = ownsBuffer;
       bytesToBeWritten = buffer.readableBytes();
       this.callback = callback;
       writeCompleteThreshold = totalBytesReceived.addAndGet(bytesToBeWritten);
@@ -949,6 +978,12 @@ class NettyResponseChannel implements RestResponseChannel {
       future.done(bytesWritten, exception);
       if (callback != null) {
         callback.onCompletion(bytesWritten, exception);
+      }
+      // Release the buffer if we own it (e.g., wrapper created from write(ByteBuffer))
+      // Following the pattern from ByteBufferAsyncWritableChannel: whoever creates/owns
+      // a ByteBuf is responsible for releasing it.
+      if (ownsBuffer) {
+        buffer.release();
       }
       long chunkResolutionProcessingTime = System.currentTimeMillis() - chunkWriteFinishTime;
       long chunkWriteTime = chunkWriteFinishTime - chunkWriteStartTime;
