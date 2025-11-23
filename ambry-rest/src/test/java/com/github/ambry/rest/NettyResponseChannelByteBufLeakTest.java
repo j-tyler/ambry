@@ -38,21 +38,26 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 /**
- * Tests for ByteBuf memory leak in NettyResponseChannel.
+ * Tests for ByteBuf memory management in NettyResponseChannel.
  *
- * NettyResponseChannel.write(ByteBuffer) creates a memory leak by wrapping the input ByteBuffer
- * in a Netty ByteBuf wrapper without releasing it. The callback has no reference to it.
- * According to Netty's reference counting contract, whoever creates or retains a ByteBuf is
- * responsible for releasing it. Since NettyResponseChannel creates the wrapper internally,
- * it must release it. The original code never calls wrapper.release() in resolveChunk(),
- * causing every call to write(ByteBuffer) to leak native memory.
+ * These tests verify that NettyResponseChannel correctly manages ByteBuf reference counts
+ * according to Netty's reference counting contract: whoever creates or retains a ByteBuf
+ * is responsible for releasing it.
  *
- * This test suite verifies two distinct ownership models:
- * 1. write(ByteBuffer): NettyResponseChannel creates and owns the wrapper → must release it
- * 2. write(ByteBuf): Caller owns the ByteBuf → NettyResponseChannel must NOT release it
+ * WHY THESE TESTS ARE CRITICAL:
+ * NettyResponseChannel has two write methods with different ownership semantics:
+ *
+ * 1. write(ByteBuffer): NettyResponseChannel wraps the ByteBuffer in a ByteBuf internally.
+ *    Since NettyResponseChannel creates this wrapper, it must release it. Failure to do so
+ *    causes a native memory leak on every call.
+ *
+ * 2. write(ByteBuf): The caller provides their own ByteBuf and retains ownership.
+ *    NettyResponseChannel must NOT release it, or it will cause double-free errors when
+ *    the caller tries to release their own ByteBuf.
  *
  * Both tests use reflection to replace ByteBufs with TrackingByteBuf wrappers that monitor
- * whether release() was called, allowing us to verify correct ownership behavior.
+ * whether release() was called, allowing us to verify correct ownership behavior. These are
+ * regression tests to ensure the memory management contract is never violated.
  */
 public class NettyResponseChannelByteBufLeakTest {
   private static final long CALLBACK_TIMEOUT_MS = 5000;
@@ -86,19 +91,22 @@ public class NettyResponseChannelByteBufLeakTest {
   /**
    * Verifies that write(ByteBuffer) properly releases internal wrapper ByteBufs.
    *
-   * THE BUG:
+   * WHAT THIS TEST VERIFIES:
    * write(ByteBuffer) calls Unpooled.wrappedBuffer() which creates a ByteBuf with refCnt=1.
-   * This wrapper is stored in a Chunk, but resolveChunk() never calls release(), causing
-   * a memory leak of native memory.
+   * Since NettyResponseChannel creates this wrapper internally, it is responsible for releasing
+   * it when the chunk is processed. This test verifies that resolveChunk() calls release()
+   * on the wrapper, bringing its refCnt to 0.
+   *
+   * WHY THIS MATTERS:
+   * If the wrapper is not released, every call to write(ByteBuffer) leaks native memory.
+   * Netty allocates ByteBufs from pooled direct memory, so leaked buffers cause the pool
+   * to grow unbounded until OOM. This test ensures the wrapper lifecycle is correct.
    *
    * TEST APPROACH:
    * Since we can't control what wrapper write(ByteBuffer) creates, we use reflection to
    * extract it after creation, then replace it with a TrackingByteBuf that monitors whether
-   * release() gets called during normal processing.
-   *
-   * EXPECTED BEHAVIOR:
-   * Before fix: release() is NOT called → wrapper leaks (refCnt stays 1) → TEST FAILS
-   * After fix: release() IS called in resolveChunk() → refCnt becomes 0 → TEST PASSES
+   * release() gets called during normal chunk processing. This verifies the production code
+   * correctly releases the wrapper.
    */
   @Test
   public void testWriteByteBufferReleasesWrapper() throws Exception {
@@ -141,29 +149,31 @@ public class NettyResponseChannelByteBufLeakTest {
       content.release();
     }
 
-    // VERIFY THE FIX: resolveChunk() should have called release() on the wrapper
+    // VERIFY: resolveChunk() must call release() on the wrapper it created
     assertTrue("Wrapper ByteBuf release() should have been called", trackingWrapper.wasReleased());
     assertEquals("Wrapper ByteBuf should have refCnt=0 after release", 0, trackingWrapper.refCnt());
   }
 
   /**
-   * Verifies that write(ByteBuf) does NOT release the caller's ByteBuf.
+   * Verifies that write(ByteBuf) respects caller ownership and does NOT release the ByteBuf.
    *
-   * THE CONTRACT:
-   * According to AsyncWritableChannel ownership semantics, when a caller passes a ByteBuf
-   * to write(ByteBuf), the caller retains ownership and is responsible for releasing it.
-   * NettyResponseChannel should NOT release ByteBufs passed to write(ByteBuf).
+   * WHAT THIS TEST VERIFIES:
+   * When a caller passes a ByteBuf to write(ByteBuf), the caller retains ownership and is
+   * responsible for releasing it. NettyResponseChannel stores the ByteBuf directly in a Chunk
+   * without creating a wrapper. This test verifies that NettyResponseChannel does NOT call
+   * release() on the caller's ByteBuf during chunk processing.
+   *
+   * WHY THIS MATTERS:
+   * If NettyResponseChannel incorrectly releases the caller's ByteBuf, it causes double-free
+   * errors when the caller tries to release their own ByteBuf (refCnt goes negative, triggering
+   * IllegalReferenceCountException). The caller expects to maintain full lifecycle control of
+   * ByteBufs they pass to write(ByteBuf). This test ensures the ownership contract is respected.
    *
    * TEST APPROACH:
    * Pass a caller-owned ByteBuf to write(ByteBuf), then use reflection to replace it with
    * a TrackingByteBuf that monitors whether NettyResponseChannel incorrectly calls release()
-   * on the caller's ByteBuf during chunk processing.
-   *
-   * EXPECTED BEHAVIOR:
-   * NettyResponseChannel should NOT call release() on the caller's ByteBuf.
-   * The caller remains responsible for releasing it after the write completes.
-   * This test verifies correct ownership semantics - write(ByteBuf) should NOT leak
-   * because it should NOT touch the caller's reference count.
+   * during chunk processing. The test then demonstrates correct ownership by having the caller
+   * release the ByteBuf themselves.
    */
   @Test
   public void testWriteByteBufDoesNotReleaseCaller() throws Exception {
@@ -210,7 +220,7 @@ public class NettyResponseChannelByteBufLeakTest {
       content.release();
     }
 
-    // VERIFY THE CONTRACT: NettyResponseChannel should NOT call release() on caller's ByteBuf
+    // VERIFY: NettyResponseChannel must NOT call release() on caller's ByteBuf
     // The caller retains ownership and must release it themselves
     assertFalse("Caller's ByteBuf release() should NOT have been called by NettyResponseChannel",
         trackingWrapper.wasReleased());
