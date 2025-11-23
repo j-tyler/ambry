@@ -29,8 +29,6 @@ import io.netty.handler.stream.ChunkedWriteHandler;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Properties;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -59,8 +57,6 @@ import static org.junit.Assert.*;
  * throughout the response lifecycle.
  */
 public class NettyResponseChannelByteBufLeakTest {
-  private static final long CALLBACK_TIMEOUT_MS = 5000;
-
   private EmbeddedChannel channel;
   private NettyMetrics nettyMetrics;
   private NettyConfig nettyConfig;
@@ -238,22 +234,13 @@ public class NettyResponseChannelByteBufLeakTest {
   // Helper classes
 
   /**
-   * Test callback implementation that allows waiting for completion.
+   * Minimal callback implementation for write operations.
+   * EmbeddedChannel processes operations synchronously, so no need to wait for completion.
    */
   private static class TestCallback implements Callback<Long> {
-    volatile Long result = null;
-    volatile Exception exception = null;
-    private final CountDownLatch latch = new CountDownLatch(1);
-
     @Override
     public void onCompletion(Long result, Exception exception) {
-      this.result = result;
-      this.exception = exception;
-      latch.countDown();
-    }
-
-    boolean awaitCompletion(long timeoutMs) throws InterruptedException {
-      return latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+      // No-op: EmbeddedChannel processes synchronously
     }
   }
 
