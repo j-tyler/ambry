@@ -47,8 +47,12 @@ import static org.junit.Assert.*;
  * it must release it. The original code never calls wrapper.release() in resolveChunk(),
  * causing every call to write(ByteBuffer) to leak native memory.
  *
- * This test uses reflection to replace the internal wrapper ByteBuf with a TrackingByteBuf
- * that tracks whether release() was called, proving the bug exists before the fix.
+ * This test suite verifies two distinct ownership models:
+ * 1. write(ByteBuffer): NettyResponseChannel creates and owns the wrapper → must release it
+ * 2. write(ByteBuf): Caller owns the ByteBuf → NettyResponseChannel must NOT release it
+ *
+ * Both tests use reflection to replace ByteBufs with TrackingByteBuf wrappers that monitor
+ * whether release() was called, allowing us to verify correct ownership behavior.
  */
 public class NettyResponseChannelByteBufLeakTest {
   private static final long CALLBACK_TIMEOUT_MS = 5000;
@@ -82,132 +86,136 @@ public class NettyResponseChannelByteBufLeakTest {
   /**
    * Verifies that write(ByteBuffer) properly releases internal wrapper ByteBufs.
    *
-   * Bug: write(ByteBuffer) calls Unpooled.wrappedBuffer() which creates a ByteBuf
-   * with refCnt=1. This wrapper is stored in a Chunk, but resolveChunk() never
-   * calls release(), causing a memory leak.
+   * THE BUG:
+   * write(ByteBuffer) calls Unpooled.wrappedBuffer() which creates a ByteBuf with refCnt=1.
+   * This wrapper is stored in a Chunk, but resolveChunk() never calls release(), causing
+   * a memory leak of native memory.
    *
-   * Test strategy:
-   * 1. Call write(ByteBuffer) to create internal wrapper via Unpooled.wrappedBuffer()
-   * 2. Use reflection to extract the wrapper ByteBuf from the Chunk
-   * 3. Use reflection to replace it with a TrackingByteBuf that tracks release() calls
-   * 4. Trigger chunk processing through normal flow (onResponseComplete)
-   * 5. Assert that release() was called on the wrapper
+   * TEST APPROACH:
+   * Since we can't control what wrapper write(ByteBuffer) creates, we use reflection to
+   * extract it after creation, then replace it with a TrackingByteBuf that monitors whether
+   * release() gets called during normal processing.
    *
-   * Before fix: Assertion FAILS - release() was NOT called (leaked)
-   * After fix: Assertion PASSES - release() WAS called (released in resolveChunk)
+   * EXPECTED BEHAVIOR:
+   * Before fix: release() is NOT called → wrapper leaks (refCnt stays 1) → TEST FAILS
+   * After fix: release() IS called in resolveChunk() → refCnt becomes 0 → TEST PASSES
    */
   @Test
   public void testWriteByteBufferReleasesWrapper() throws Exception {
-    ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
+    // Set up NettyResponseChannel with real pipeline context
+    ChunkedWriteHandler chunkedWriteHandler = channel.pipeline().get(ChunkedWriteHandler.class);
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().context(handler), nettyMetrics, performanceConfig, nettyConfig);
+        channel.pipeline().context(chunkedWriteHandler), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
 
-    // Create ByteBuffer to write
-    String data = "test data";
-    ByteBuffer byteBuffer = ByteBuffer.wrap(data.getBytes(StandardCharsets.UTF_8));
+    // Call write(ByteBuffer) - this is the production code path that creates the wrapper
+    String testData = "test data";
+    ByteBuffer byteBuffer = ByteBuffer.wrap(testData.getBytes(StandardCharsets.UTF_8));
 
     TestCallback callback = new TestCallback();
     responseChannel.write(byteBuffer, callback);
 
-    // Get the wrapper ByteBuf that was created by write() using reflection
-    ByteBuf originalWrapper = getWrapperFromChannel(responseChannel);
-    assertNotNull("Wrapper should exist in chunksToWrite", originalWrapper);
+    // Use reflection to extract the wrapper ByteBuf that write() created internally
+    ByteBuf internalWrapper = getWrapperFromChannel(responseChannel);
+    assertNotNull("Wrapper should exist in chunksToWrite", internalWrapper);
 
-    // Replace it with our tracking wrapper
-    TrackingByteBuf trackingWrapper = new TrackingByteBuf(originalWrapper);
+    // Replace the internal wrapper with our tracking wrapper to monitor release() calls
+    // WHY: We can't intercept the wrapper creation, so we swap it after the fact
+    TrackingByteBuf trackingWrapper = new TrackingByteBuf(internalWrapper);
     replaceWrapperInChunk(responseChannel, trackingWrapper);
 
-    // Trigger processing
+    // Execute normal response processing flow
     responseChannel.onResponseComplete(null);
     assertTrue("Callback should complete", callback.awaitCompletion(CALLBACK_TIMEOUT_MS));
+    assertNull("Callback should complete successfully without exception", callback.exception);
 
-    // Read and release HttpContent
+    // Simulate Netty's normal pipeline: read and release the HttpContent
+    // WHY: This triggers resolveChunk() which should release the wrapper
     HttpResponse response = channel.readOutbound();
     assertNotNull("Should have response", response);
 
-    Object outbound;
-    while ((outbound = channel.readOutbound()) != null) {
-      if (outbound instanceof HttpContent) {
-        ((HttpContent) outbound).release();
-      }
+    HttpContent content;
+    while ((content = channel.readOutbound()) != null) {
+      content.release();
     }
 
-    // CRITICAL ASSERTION: release() should have been called on the wrapper
-    // Before fix: release() was NOT called (leak)
-    // After fix: release() WAS called
+    // VERIFY THE FIX: resolveChunk() should have called release() on the wrapper
     assertTrue("Wrapper ByteBuf release() should have been called", trackingWrapper.wasReleased());
     assertEquals("Wrapper ByteBuf should have refCnt=0 after release", 0, trackingWrapper.refCnt());
   }
 
   /**
-   * Verifies that write(ByteBuf) does NOT release the ByteBuf.
+   * Verifies that write(ByteBuf) does NOT release the caller's ByteBuf.
    *
-   * According to AsyncWritableChannel contract, when a caller passes a ByteBuf
-   * to write(ByteBuf), the caller retains ownership and is responsible for
-   * releasing it. NettyResponseChannel should NOT release ByteBufs passed to
-   * write(ByteBuf).
+   * THE CONTRACT:
+   * According to AsyncWritableChannel ownership semantics, when a caller passes a ByteBuf
+   * to write(ByteBuf), the caller retains ownership and is responsible for releasing it.
+   * NettyResponseChannel should NOT release ByteBufs passed to write(ByteBuf).
    *
-   * Test strategy:
-   * 1. Create a ByteBuf with refCnt=1
-   * 2. Call write(ByteBuf) directly (not write(ByteBuffer))
-   * 3. Get reference to this ByteBuf from the Chunk using reflection
-   * 4. Replace it with TrackingByteBuf to monitor release() calls
-   * 5. Trigger chunk processing
-   * 6. Assert that release() was NOT called (caller still owns it)
+   * TEST APPROACH:
+   * Pass a caller-owned ByteBuf to write(ByteBuf), then use reflection to replace it with
+   * a TrackingByteBuf that monitors whether NettyResponseChannel incorrectly calls release()
+   * on the caller's ByteBuf during chunk processing.
    *
-   * This test verifies the correct behavior - write(ByteBuf) should NOT leak
-   * because it should NOT release the caller's ByteBuf.
+   * EXPECTED BEHAVIOR:
+   * NettyResponseChannel should NOT call release() on the caller's ByteBuf.
+   * The caller remains responsible for releasing it after the write completes.
+   * This test verifies correct ownership semantics - write(ByteBuf) should NOT leak
+   * because it should NOT touch the caller's reference count.
    */
   @Test
   public void testWriteByteBufDoesNotReleaseCaller() throws Exception {
-    ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
+    // Set up NettyResponseChannel with real pipeline context
+    ChunkedWriteHandler chunkedWriteHandler = channel.pipeline().get(ChunkedWriteHandler.class);
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().context(handler), nettyMetrics, performanceConfig, nettyConfig);
+        channel.pipeline().context(chunkedWriteHandler), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
 
-    // Create a ByteBuf (caller owns this)
-    String data = "test data";
-    ByteBuf callerByteBuf = io.netty.buffer.Unpooled.wrappedBuffer(data.getBytes(StandardCharsets.UTF_8));
+    // Create a ByteBuf - the caller owns this and is responsible for releasing it
+    String testData = "test data";
+    ByteBuf callerByteBuf = io.netty.buffer.Unpooled.wrappedBuffer(testData.getBytes(StandardCharsets.UTF_8));
     assertEquals("Caller ByteBuf should start with refCnt=1", 1, callerByteBuf.refCnt());
 
+    // Call write(ByteBuf) - this is the production code path where caller passes their own ByteBuf
     TestCallback callback = new TestCallback();
     responseChannel.write(callerByteBuf, callback);
 
-    // Get the ByteBuf from the Chunk - should be the same one we passed
+    // Verify the Chunk contains the same ByteBuf we passed (not a wrapper)
+    // WHY: write(ByteBuf) should store the caller's ByteBuf directly, unlike write(ByteBuffer)
     ByteBuf chunkByteBuf = getWrapperFromChannel(responseChannel);
     assertNotNull("ByteBuf should exist in chunksToWrite", chunkByteBuf);
     assertSame("Chunk should contain the same ByteBuf we passed", callerByteBuf, chunkByteBuf);
 
     // Replace with tracking wrapper to monitor release() calls
+    // WHY: We need to detect if NettyResponseChannel incorrectly calls release() on the caller's ByteBuf
     TrackingByteBuf trackingWrapper = new TrackingByteBuf(callerByteBuf);
     replaceWrapperInChunk(responseChannel, trackingWrapper);
 
-    // Trigger processing
+    // Execute normal response processing flow
     responseChannel.onResponseComplete(null);
     assertTrue("Callback should complete", callback.awaitCompletion(CALLBACK_TIMEOUT_MS));
+    assertNull("Callback should complete successfully without exception", callback.exception);
 
-    // Read and release HttpContent
+    // Simulate Netty's normal pipeline: read and release the HttpContent
+    // WHY: This triggers chunk processing which should NOT release the caller's ByteBuf
     HttpResponse response = channel.readOutbound();
     assertNotNull("Should have response", response);
 
-    Object outbound;
-    while ((outbound = channel.readOutbound()) != null) {
-      if (outbound instanceof HttpContent) {
-        ((HttpContent) outbound).release();
-      }
+    HttpContent content;
+    while ((content = channel.readOutbound()) != null) {
+      content.release();
     }
 
-    // CRITICAL ASSERTION: release() should NOT have been called on caller's ByteBuf
-    // The caller is responsible for releasing it, not NettyResponseChannel
+    // VERIFY THE CONTRACT: NettyResponseChannel should NOT call release() on caller's ByteBuf
+    // The caller retains ownership and must release it themselves
     assertFalse("Caller's ByteBuf release() should NOT have been called by NettyResponseChannel",
         trackingWrapper.wasReleased());
 
-    // Clean up - caller releases their own ByteBuf
+    // Clean up - caller releases their own ByteBuf (demonstrating correct ownership)
     callerByteBuf.release();
     assertEquals("Caller ByteBuf should be released by caller", 0, callerByteBuf.refCnt());
   }
@@ -216,8 +224,9 @@ public class NettyResponseChannelByteBufLeakTest {
 
   /**
    * ByteBuf wrapper that tracks whether release() was called.
-   * This allows us to verify that the wrapper created by write(ByteBuffer)
-   * is properly released by resolveChunk().
+   * Used to verify correct ByteBuf ownership and release behavior in both test scenarios:
+   * - write(ByteBuffer): verifies the internal wrapper IS released
+   * - write(ByteBuf): verifies the caller's ByteBuf is NOT released
    */
   private static class TrackingByteBuf extends DelegateByteBuf {
     private volatile boolean released = false;
