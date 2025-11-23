@@ -19,12 +19,25 @@ import com.github.ambry.config.NettyConfig;
 import com.github.ambry.config.PerformanceConfig;
 import com.github.ambry.config.VerifiableProperties;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.ChannelProgressivePromise;
+import io.netty.channel.ChannelPromise;
+import io.netty.channel.EventLoop;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.http.HttpContent;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.stream.ChunkedWriteHandler;
+import io.netty.util.Attribute;
+import io.netty.util.AttributeKey;
+import io.netty.util.concurrent.EventExecutor;
 import java.lang.reflect.Field;
+import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Properties;
@@ -79,10 +92,6 @@ public class NettyResponseChannelByteBufLeakTest {
     // Create channel with ChunkedWriteHandler
     ChunkedWriteHandler chunkedWriteHandler = new ChunkedWriteHandler();
     channel = new EmbeddedChannel(chunkedWriteHandler);
-
-    // Ensure channel is fully registered and active
-    channel.pipeline().fireChannelRegistered();
-    channel.pipeline().fireChannelActive();
   }
 
   @After
@@ -114,10 +123,9 @@ public class NettyResponseChannelByteBufLeakTest {
    */
   @Test
   public void testWriteByteBufferReleasesWrapper() throws Exception {
-    // Set up NettyResponseChannel with real pipeline context
-    ChunkedWriteHandler chunkedWriteHandler = channel.pipeline().get(ChunkedWriteHandler.class);
+    // Set up NettyResponseChannel with mock context that returns active channel
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().context(chunkedWriteHandler), nettyMetrics, performanceConfig, nettyConfig);
+        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
@@ -181,10 +189,9 @@ public class NettyResponseChannelByteBufLeakTest {
    */
   @Test
   public void testWriteByteBufDoesNotReleaseCaller() throws Exception {
-    // Set up NettyResponseChannel with real pipeline context
-    ChunkedWriteHandler chunkedWriteHandler = channel.pipeline().get(ChunkedWriteHandler.class);
+    // Set up NettyResponseChannel with mock context that returns active channel
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        channel.pipeline().context(chunkedWriteHandler), nettyMetrics, performanceConfig, nettyConfig);
+        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
@@ -340,4 +347,101 @@ public class NettyResponseChannelByteBufLeakTest {
     bufferField.set(chunk, newWrapper);
   }
 
+  /**
+   * Mock ChannelHandlerContext that wraps an EmbeddedChannel.
+   * This ensures ctx.channel().isActive() returns true, which is required for
+   * maybeWriteResponseMetadata() to set finalResponseMetadata.
+   */
+  private static class MockChannelHandlerContext implements ChannelHandlerContext {
+    private final EmbeddedChannel embeddedChannel;
+
+    MockChannelHandlerContext(EmbeddedChannel embeddedChannel) {
+      this.embeddedChannel = embeddedChannel;
+    }
+
+    @Override
+    public Channel channel() {
+      return embeddedChannel;
+    }
+
+    @Override
+    public EventExecutor executor() {
+      return embeddedChannel.eventLoop();
+    }
+
+    @Override
+    public ChannelHandlerContext fireChannelRead(Object msg) {
+      return this;
+    }
+
+    @Override
+    public ChannelHandlerContext fireChannelReadComplete() {
+      return this;
+    }
+
+    @Override
+    public ChannelFuture write(Object msg) {
+      return embeddedChannel.write(msg);
+    }
+
+    @Override
+    public ChannelFuture write(Object msg, ChannelPromise promise) {
+      return embeddedChannel.write(msg, promise);
+    }
+
+    @Override
+    public ChannelFuture writeAndFlush(Object msg) {
+      return embeddedChannel.writeAndFlush(msg);
+    }
+
+    @Override
+    public ChannelFuture writeAndFlush(Object msg, ChannelPromise promise) {
+      return embeddedChannel.writeAndFlush(msg, promise);
+    }
+
+    @Override
+    public ChannelPromise newPromise() {
+      return embeddedChannel.newPromise();
+    }
+
+    @Override
+    public ChannelProgressivePromise newProgressivePromise() {
+      return embeddedChannel.newProgressivePromise();
+    }
+
+    @Override
+    public ChannelPipeline pipeline() {
+      return embeddedChannel.pipeline();
+    }
+
+    // Remaining methods return null or no-op - only implement what NettyResponseChannel needs
+    @Override public String name() { return null; }
+    @Override public ChannelHandler handler() { return null; }
+    @Override public boolean isRemoved() { return false; }
+    @Override public ChannelHandlerContext fireChannelRegistered() { return this; }
+    @Override public ChannelHandlerContext fireChannelUnregistered() { return this; }
+    @Override public ChannelHandlerContext fireChannelActive() { return this; }
+    @Override public ChannelHandlerContext fireChannelInactive() { return this; }
+    @Override public ChannelHandlerContext fireExceptionCaught(Throwable cause) { return this; }
+    @Override public ChannelHandlerContext fireUserEventTriggered(Object evt) { return this; }
+    @Override public ChannelHandlerContext fireChannelWritabilityChanged() { return this; }
+    @Override public ChannelFuture bind(SocketAddress localAddress) { return null; }
+    @Override public ChannelFuture connect(SocketAddress remoteAddress) { return null; }
+    @Override public ChannelFuture connect(SocketAddress remoteAddress, SocketAddress localAddress) { return null; }
+    @Override public ChannelFuture disconnect() { return null; }
+    @Override public ChannelFuture close() { return null; }
+    @Override public ChannelFuture deregister() { return null; }
+    @Override public ChannelFuture bind(SocketAddress localAddress, ChannelPromise promise) { return null; }
+    @Override public ChannelFuture connect(SocketAddress remoteAddress, ChannelPromise promise) { return null; }
+    @Override public ChannelFuture connect(SocketAddress remoteAddress, SocketAddress localAddress, ChannelPromise promise) { return null; }
+    @Override public ChannelFuture disconnect(ChannelPromise promise) { return null; }
+    @Override public ChannelFuture close(ChannelPromise promise) { return null; }
+    @Override public ChannelFuture deregister(ChannelPromise promise) { return null; }
+    @Override public ChannelHandlerContext read() { return this; }
+    @Override public ChannelHandlerContext flush() { embeddedChannel.flush(); return this; }
+    @Override public ChannelPromise voidPromise() { return embeddedChannel.voidPromise(); }
+    @Override public ByteBufAllocator alloc() { return embeddedChannel.alloc(); }
+    @Override public <T> Attribute<T> attr(AttributeKey<T> key) { return embeddedChannel.attr(key); }
+    @Override public <T> boolean hasAttr(AttributeKey<T> key) { return embeddedChannel.hasAttr(key); }
+  }
 }
