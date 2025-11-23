@@ -19,6 +19,8 @@ import com.github.ambry.config.NettyConfig;
 import com.github.ambry.config.PerformanceConfig;
 import com.github.ambry.config.VerifiableProperties;
 import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.http.HttpContent;
 import io.netty.handler.codec.http.HttpHeaderNames;
@@ -66,6 +68,7 @@ public class NettyResponseChannelByteBufLeakTest {
   private NettyMetrics nettyMetrics;
   private NettyConfig nettyConfig;
   private PerformanceConfig performanceConfig;
+  private TestContextCapture contextCapture;
 
   @Before
   public void setUp() {
@@ -76,9 +79,10 @@ public class NettyResponseChannelByteBufLeakTest {
     nettyConfig = new NettyConfig(verifiableProperties);
     performanceConfig = new PerformanceConfig(verifiableProperties);
 
-    // Create channel with ChunkedWriteHandler
+    // Create channel with handler that captures active context
+    contextCapture = new TestContextCapture();
     ChunkedWriteHandler chunkedWriteHandler = new ChunkedWriteHandler();
-    channel = new EmbeddedChannel(chunkedWriteHandler);
+    channel = new EmbeddedChannel(chunkedWriteHandler, contextCapture);
   }
 
   @After
@@ -110,9 +114,9 @@ public class NettyResponseChannelByteBufLeakTest {
    */
   @Test
   public void testWriteByteBufferReleasesWrapper() throws Exception {
-    // Set up NettyResponseChannel with mock context that returns active channel
+    // Set up NettyResponseChannel with real active context from pipeline
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
@@ -176,9 +180,9 @@ public class NettyResponseChannelByteBufLeakTest {
    */
   @Test
   public void testWriteByteBufDoesNotReleaseCaller() throws Exception {
-    // Set up NettyResponseChannel with mock context that returns active channel
+    // Set up NettyResponseChannel with real active context from pipeline
     NettyResponseChannel responseChannel = new NettyResponseChannel(
-        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
 
     responseChannel.setStatus(ResponseStatus.Ok);
     responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
@@ -332,5 +336,19 @@ public class NettyResponseChannelByteBufLeakTest {
     Field bufferField = chunkClass.getDeclaredField("buffer");
     bufferField.setAccessible(true);
     bufferField.set(chunk, newWrapper);
+  }
+
+  /**
+   * Handler that captures the ChannelHandlerContext when channelActive is called.
+   * This ensures we have a context from an actually active channel.
+   */
+  private static class TestContextCapture extends ChannelInboundHandlerAdapter {
+    ChannelHandlerContext ctx;
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) {
+      this.ctx = ctx;
+      ctx.fireChannelActive();
+    }
   }
 }
