@@ -125,6 +125,10 @@ public class NettyResponseChannelByteBufLeakTest {
     TestCallback callback = new TestCallback();
     responseChannel.write(byteBuffer, callback);
 
+    // Process any pending tasks to ensure the metadata write completes
+    channel.runPendingTasks();
+    channel.flush();
+
     // Use reflection to extract the wrapper ByteBuf that write() created internally
     ByteBuf internalWrapper = getWrapperFromChannel(responseChannel);
     assertNotNull("Wrapper should exist in chunksToWrite", internalWrapper);
@@ -193,6 +197,10 @@ public class NettyResponseChannelByteBufLeakTest {
     // Call write(ByteBuf) - this is the production code path where caller passes their own ByteBuf
     TestCallback callback = new TestCallback();
     responseChannel.write(callerByteBuf, callback);
+
+    // Process any pending tasks to ensure the metadata write completes
+    channel.runPendingTasks();
+    channel.flush();
 
     // Verify the Chunk contains the same ByteBuf we passed (not a wrapper)
     // WHY: write(ByteBuf) should store the caller's ByteBuf directly, unlike write(ByteBuffer)
