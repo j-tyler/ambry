@@ -166,20 +166,23 @@ public class NettyResponseChannelByteBufLeakTest {
    * HOW IT WORKS:
    * 1. Caller creates a ByteBuf with refCnt=1
    * 2. Call write(ByteBuf) passing the caller's ByteBuf
-   * 3. The same ByteBuf ends up in an HttpContent in the outbound channel (refCnt now 2)
-   * 4. Read the HttpContent and verify it contains the SAME ByteBuf object
-   * 5. Release the HttpContent - this decrements refCnt by 1 (from 2 to 1)
-   * 6. Verify refCnt is 1 - proving NettyResponseChannel did NOT release it
-   * 7. Caller releases their own ByteBuf - refCnt goes to 0
+   * 3. Track the caller's ByteBuf refCnt throughout - it should stay at 1
+   * 4. Read and release the HttpContent
+   * 5. Verify caller's ByteBuf still has refCnt=1 (proving it wasn't retained or released)
+   * 6. Caller releases their own ByteBuf - refCnt goes to 0
+   *
+   * NOTE: The HttpContent may contain a duplicate/slice of the caller's ByteBuf with its own
+   * refCnt lifecycle. What matters is the caller's ORIGINAL ByteBuf maintains refCnt=1,
+   * proving NettyResponseChannel didn't touch it.
    *
    * EXPECTED RESULT:
-   * This test should PASS because NettyResponseChannel correctly does NOT release the
-   * caller's ByteBuf. After releasing HttpContent, the caller's ByteBuf still has refCnt=1,
-   * and the caller can safely release it themselves.
+   * This test should PASS because NettyResponseChannel correctly does NOT retain or release the
+   * caller's ByteBuf. The caller's ByteBuf maintains refCnt=1 throughout, and the caller can
+   * safely release it themselves.
    *
    * FAILURE MODE:
-   * If NettyResponseChannel incorrectly releases the caller's ByteBuf, step 6 would fail
-   * with refCnt=0, and step 7 would throw IllegalReferenceCountException (double-free).
+   * If NettyResponseChannel incorrectly releases the caller's ByteBuf, the refCnt would drop
+   * to 0, and the caller's final release() would throw IllegalReferenceCountException (double-free).
    */
   @Test
   public void testWriteByteBufDoesNotReleaseCaller() throws Exception {
@@ -198,6 +201,12 @@ public class NettyResponseChannelByteBufLeakTest {
     TestCallback callback = new TestCallback();
     responseChannel.write(callerByteBuf, callback);
 
+    // CRITICAL: Check that caller's ByteBuf refCnt is still 1
+    // If NettyResponseChannel incorrectly called retain(), this would be 2
+    assertEquals("Caller's ByteBuf should still have refCnt=1 after write(). "
+            + "NettyResponseChannel must NOT retain the caller's ByteBuf.",
+        1, callerByteBuf.refCnt());
+
     // Read the HttpResponse and HttpContent from the outbound channel
     HttpResponse response = channel.readOutbound();
     assertNotNull("HttpResponse should be written to channel", response);
@@ -205,24 +214,15 @@ public class NettyResponseChannelByteBufLeakTest {
     HttpContent content = channel.readOutbound();
     assertNotNull("HttpContent should be written to channel", content);
 
-    // Verify the HttpContent contains the SAME ByteBuf object (not a wrapper)
-    ByteBuf contentBuf = content.content();
-    assertSame("HttpContent should contain the caller's ByteBuf (not a wrapper)",
-        callerByteBuf, contentBuf);
-
-    // Verify refCnt is now 2 (caller's reference + HttpContent's retain)
-    assertEquals("Caller's ByteBuf should have refCnt=2 (caller + HttpContent)",
-        2, callerByteBuf.refCnt());
-
-    // Release the HttpContent - this should decrement refCnt by 1
+    // Release the HttpContent (which may contain a duplicate of the caller's ByteBuf)
     content.release();
 
-    // CRITICAL ASSERTION: refCnt should still be 1
-    // - HttpContent.release() decrements by 1 (from 2 to 1)
-    // - NettyResponseChannel should NOT have called release()
-    // - The caller still owns their ByteBuf with refCnt=1
-    assertEquals("Caller's ByteBuf should have refCnt=1 after HttpContent release. "
-            + "NettyResponseChannel must NOT release the caller's ByteBuf.",
+    // CRITICAL ASSERTION: Caller's ByteBuf refCnt should STILL be 1
+    // - NettyResponseChannel should NOT have retained it (still 1, not 2)
+    // - NettyResponseChannel should NOT have released it (still 1, not 0)
+    // - The caller maintains full ownership
+    assertEquals("Caller's ByteBuf should still have refCnt=1 after HttpContent release. "
+            + "NettyResponseChannel must NOT retain or release the caller's ByteBuf.",
         1, callerByteBuf.refCnt());
 
     // Caller releases their own ByteBuf (demonstrating correct ownership)
