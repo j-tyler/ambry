@@ -405,6 +405,324 @@ public class NettyResponseChannelByteBufLeakTest {
   }
 
   /**
+   * EXPERIMENT 12: Check queue SIZE instead of peeking
+   * Strategy: Maybe peek() returns null but queue has items?
+   */
+  @Test
+  public void experiment12_CheckQueueSize() throws Exception {
+    System.out.println("\nEXPERIMENT 12: Check queue size");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    Field chunksToWriteField = NettyResponseChannel.class.getDeclaredField("chunksToWrite");
+    chunksToWriteField.setAccessible(true);
+    Queue<?> chunksToWrite = (Queue<?>) chunksToWriteField.get(responseChannel);
+
+    System.out.println("  chunksToWrite.size(): " + chunksToWrite.size());
+    System.out.println("  chunksToWrite.isEmpty(): " + chunksToWrite.isEmpty());
+    System.out.println("  chunksToWrite.peek(): " + chunksToWrite.peek());
+  }
+
+  /**
+   * EXPERIMENT 13: Check chunksAwaitingCallback queue
+   * Strategy: Maybe chunks are moved to a different queue
+   */
+  @Test
+  public void experiment13_CheckAwaitingCallbackQueue() throws Exception {
+    System.out.println("\nEXPERIMENT 13: Check chunksAwaitingCallback queue");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    Field chunksToWriteField = NettyResponseChannel.class.getDeclaredField("chunksToWrite");
+    chunksToWriteField.setAccessible(true);
+    Queue<?> chunksToWrite = (Queue<?>) chunksToWriteField.get(responseChannel);
+
+    Field chunksAwaitingCallbackField = NettyResponseChannel.class.getDeclaredField("chunksAwaitingCallback");
+    chunksAwaitingCallbackField.setAccessible(true);
+    Queue<?> chunksAwaitingCallback = (Queue<?>) chunksAwaitingCallbackField.get(responseChannel);
+
+    System.out.println("  chunksToWrite.size(): " + chunksToWrite.size());
+    System.out.println("  chunksAwaitingCallback.size(): " + chunksAwaitingCallback.size());
+    System.out.println("  chunksAwaitingCallback.peek(): " + chunksAwaitingCallback.peek());
+  }
+
+  /**
+   * EXPERIMENT 14: Check if data appears in outbound channel
+   * Strategy: Maybe chunk is processed and written to channel immediately
+   */
+  @Test
+  public void experiment14_CheckOutboundChannel() throws Exception {
+    System.out.println("\nEXPERIMENT 14: Check outbound channel");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    Object outbound1 = channel.readOutbound();
+    Object outbound2 = channel.readOutbound();
+    Object outbound3 = channel.readOutbound();
+
+    System.out.println("  First outbound: " + outbound1);
+    System.out.println("  Second outbound: " + outbound2);
+    System.out.println("  Third outbound: " + outbound3);
+
+    if (outbound1 != null && outbound1 instanceof ByteBuf) {
+      ((ByteBuf) outbound1).release();
+    }
+    if (outbound2 != null && outbound2 instanceof ByteBuf) {
+      ((ByteBuf) outbound2).release();
+    }
+  }
+
+  /**
+   * EXPERIMENT 15: Check queue immediately in write callback
+   * Strategy: Check state synchronously during the write operation
+   */
+  @Test
+  public void experiment15_CheckDuringCallback() throws Exception {
+    System.out.println("\nEXPERIMENT 15: Check during write callback");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+
+    CountDownLatch latch = new CountDownLatch(1);
+    Callback<Long> callback = new Callback<Long>() {
+      @Override
+      public void onCompletion(Long result, Exception exception) {
+        try {
+          Field chunksToWriteField = NettyResponseChannel.class.getDeclaredField("chunksToWrite");
+          chunksToWriteField.setAccessible(true);
+          Queue<?> chunksToWrite = (Queue<?>) chunksToWriteField.get(responseChannel);
+          System.out.println("  Inside callback - chunksToWrite.size(): " + chunksToWrite.size());
+        } catch (Exception e) {
+          e.printStackTrace();
+        }
+        latch.countDown();
+      }
+    };
+
+    responseChannel.write(byteBuffer, callback);
+
+    // Check before callback
+    Field chunksToWriteField = NettyResponseChannel.class.getDeclaredField("chunksToWrite");
+    chunksToWriteField.setAccessible(true);
+    Queue<?> chunksToWrite = (Queue<?>) chunksToWriteField.get(responseChannel);
+    System.out.println("  Before callback - chunksToWrite.size(): " + chunksToWrite.size());
+
+    latch.await(5, TimeUnit.SECONDS);
+  }
+
+  /**
+   * EXPERIMENT 16: Check chunkedWriteHandler state
+   * Strategy: See if ChunkedWriteHandler has the chunk
+   */
+  @Test
+  public void experiment16_CheckChunkedWriteHandler() throws Exception {
+    System.out.println("\nEXPERIMENT 16: Check ChunkedWriteHandler");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
+    System.out.println("  Handler before write: " + handler);
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    System.out.println("  Handler after write: " + handler);
+
+    // Try to trigger handler
+    channel.runPendingTasks();
+
+    System.out.println("  Handler after runPendingTasks: " + handler);
+  }
+
+  /**
+   * EXPERIMENT 17: Check if isOpen() returns false
+   * Strategy: Maybe channel is not considered "open" by NettyResponseChannel
+   */
+  @Test
+  public void experiment17_CheckIsOpen() throws Exception {
+    System.out.println("\nEXPERIMENT 17: Check isOpen()");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    System.out.println("  Before write:");
+    System.out.println("    responseChannel.isOpen(): " + responseChannel.isOpen());
+
+    Field responseCompleteCalledField = NettyResponseChannel.class.getDeclaredField("responseCompleteCalled");
+    responseCompleteCalledField.setAccessible(true);
+    Object responseCompleteCalled = responseCompleteCalledField.get(responseChannel);
+    System.out.println("    responseCompleteCalled: " + responseCompleteCalled);
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    System.out.println("  After write:");
+    System.out.println("    responseChannel.isOpen(): " + responseChannel.isOpen());
+    System.out.println("    responseCompleteCalled: " + responseCompleteCalledField.get(responseChannel));
+  }
+
+  /**
+   * EXPERIMENT 18: Check queue at different points in write flow
+   * Strategy: Use reflection to check queue size at each step
+   */
+  @Test
+  public void experiment18_MultipleQueueChecks() throws Exception {
+    System.out.println("\nEXPERIMENT 18: Multiple queue size checks");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    Field chunksToWriteField = NettyResponseChannel.class.getDeclaredField("chunksToWrite");
+    chunksToWriteField.setAccessible(true);
+    Queue<?> chunksToWrite = (Queue<?>) chunksToWriteField.get(responseChannel);
+
+    System.out.println("  Initial: " + chunksToWrite.size());
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    System.out.println("  After setStatus: " + chunksToWrite.size());
+
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+    System.out.println("  After setHeader: " + chunksToWrite.size());
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    System.out.println("  Before write: " + chunksToWrite.size());
+
+    responseChannel.write(byteBuffer, callback);
+    System.out.println("  Immediately after write: " + chunksToWrite.size());
+
+    Thread.sleep(10);
+    System.out.println("  After 10ms: " + chunksToWrite.size());
+
+    channel.runPendingTasks();
+    System.out.println("  After runPendingTasks: " + chunksToWrite.size());
+  }
+
+  /**
+   * EXPERIMENT 19: Check if finalResponseMetadata is FullHttpResponse
+   * Strategy: See what type finalResponseMetadata actually is
+   */
+  @Test
+  public void experiment19_CheckResponseType() throws Exception {
+    System.out.println("\nEXPERIMENT 19: Check response type");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    Field finalResponseMetadataField = NettyResponseChannel.class.getDeclaredField("finalResponseMetadata");
+    finalResponseMetadataField.setAccessible(true);
+    Object finalResponseMetadata = finalResponseMetadataField.get(responseChannel);
+
+    System.out.println("  finalResponseMetadata class: " + finalResponseMetadata.getClass().getName());
+    System.out.println("  Is FullHttpResponse? " + (finalResponseMetadata instanceof io.netty.handler.codec.http.FullHttpResponse));
+    System.out.println("  Is HttpResponse? " + (finalResponseMetadata instanceof io.netty.handler.codec.http.HttpResponse));
+  }
+
+  /**
+   * EXPERIMENT 20: Write WITHOUT setting headers to see different code path
+   * Strategy: Skip transfer-encoding:chunked header
+   */
+  @Test
+  public void experiment20_WriteWithoutChunkedHeader() throws Exception {
+    System.out.println("\nEXPERIMENT 20: Write without chunked header");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    // DON'T set transfer-encoding header
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    Field chunksToWriteField = NettyResponseChannel.class.getDeclaredField("chunksToWrite");
+    chunksToWriteField.setAccessible(true);
+    Queue<?> chunksToWrite = (Queue<?>) chunksToWriteField.get(responseChannel);
+
+    System.out.println("  chunksToWrite.size(): " + chunksToWrite.size());
+    System.out.println("  chunksToWrite.peek(): " + chunksToWrite.peek());
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+  }
+
+  /**
+   * EXPERIMENT 21: Call write multiple times
+   * Strategy: See if multiple writes accumulate in queue
+   */
+  @Test
+  public void experiment21_MultipleWrites() throws Exception {
+    System.out.println("\nEXPERIMENT 21: Multiple writes");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    Field chunksToWriteField = NettyResponseChannel.class.getDeclaredField("chunksToWrite");
+    chunksToWriteField.setAccessible(true);
+    Queue<?> chunksToWrite = (Queue<?>) chunksToWriteField.get(responseChannel);
+
+    System.out.println("  Before writes: " + chunksToWrite.size());
+
+    responseChannel.write(ByteBuffer.wrap("test1".getBytes()), new TestCallback());
+    System.out.println("  After write 1: " + chunksToWrite.size());
+
+    responseChannel.write(ByteBuffer.wrap("test2".getBytes()), new TestCallback());
+    System.out.println("  After write 2: " + chunksToWrite.size());
+
+    responseChannel.write(ByteBuffer.wrap("test3".getBytes()), new TestCallback());
+    System.out.println("  After write 3: " + chunksToWrite.size());
+  }
+
+  /**
    * Original test - keeping for comparison
    */
   @Test
