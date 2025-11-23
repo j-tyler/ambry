@@ -93,24 +93,319 @@ public class NettyResponseChannelByteBufLeakTest {
   }
 
   /**
-   * Verifies that write(ByteBuffer) properly releases internal wrapper ByteBufs.
-   *
-   * WHAT THIS TEST VERIFIES:
-   * write(ByteBuffer) calls Unpooled.wrappedBuffer() which creates a ByteBuf with refCnt=1.
-   * Since NettyResponseChannel creates this wrapper internally, it is responsible for releasing
-   * it when the chunk is processed. This test verifies that resolveChunk() calls release()
-   * on the wrapper, bringing its refCnt to 0.
-   *
-   * WHY THIS MATTERS:
-   * If the wrapper is not released, every call to write(ByteBuffer) leaks native memory.
-   * Netty allocates ByteBufs from pooled direct memory, so leaked buffers cause the pool
-   * to grow unbounded until OOM. This test ensures the wrapper lifecycle is correct.
-   *
-   * TEST APPROACH:
-   * Since we can't control what wrapper write(ByteBuffer) creates, we use reflection to
-   * extract it after creation, then replace it with a TrackingByteBuf that monitors whether
-   * release() gets called during normal chunk processing. This verifies the production code
-   * correctly releases the wrapper.
+   * EXPERIMENT 1: Use TestContextCapture from channelActive callback
+   * Strategy: Handler captures context when channelActive fires during EmbeddedChannel construction
+   */
+  @Test
+  public void experiment01_TestContextCapture() throws Exception {
+    System.out.println("EXPERIMENT 1: TestContextCapture from channelActive");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+    System.out.println("  Context: " + contextCapture.ctx);
+    System.out.println("  Context.channel().isActive(): " + (contextCapture.ctx != null ? contextCapture.ctx.channel().isActive() : "null ctx"));
+  }
+
+  /**
+   * EXPERIMENT 2: Use MockChannelHandlerContext wrapping EmbeddedChannel
+   * Strategy: Use the existing mock class that just returns the channel
+   */
+  @Test
+  public void experiment02_MockChannelHandlerContext() throws Exception {
+    System.out.println("\nEXPERIMENT 2: MockChannelHandlerContext");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        new MockChannelHandlerContext(channel), nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+    System.out.println("  Channel.isActive(): " + channel.isActive());
+  }
+
+  /**
+   * EXPERIMENT 3: Get context from pipeline after channel construction
+   * Strategy: Use channel.pipeline().context(ChunkedWriteHandler.class)
+   */
+  @Test
+  public void experiment03_PipelineContext() throws Exception {
+    System.out.println("\nEXPERIMENT 3: Pipeline context");
+
+    ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
+    ChannelHandlerContext ctx = channel.pipeline().context(handler);
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+    System.out.println("  Context: " + ctx);
+    System.out.println("  Context.channel().isActive(): " + ctx.channel().isActive());
+  }
+
+  /**
+   * EXPERIMENT 4: Fire channelActive explicitly before getting context
+   * Strategy: Manually fire channelActive, then get pipeline context
+   */
+  @Test
+  public void experiment04_ExplicitFireChannelActive() throws Exception {
+    System.out.println("\nEXPERIMENT 4: Explicitly fire channelActive before getting context");
+
+    // Fire channelActive explicitly
+    channel.pipeline().fireChannelActive();
+
+    ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
+    ChannelHandlerContext ctx = channel.pipeline().context(handler);
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+    System.out.println("  Context.channel().isActive(): " + ctx.channel().isActive());
+  }
+
+  /**
+   * EXPERIMENT 5: Use context from TestContextCapture but check AFTER write
+   * Strategy: Maybe the chunk appears after some pipeline processing
+   */
+  @Test
+  public void experiment05_CheckAfterRunPendingTasks() throws Exception {
+    System.out.println("\nEXPERIMENT 5: Check after runPendingTasks");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    // Try running pending tasks
+    channel.runPendingTasks();
+    channel.flush();
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+  }
+
+  /**
+   * EXPERIMENT 6: Create new channel WITHOUT TestContextCapture, use MockChannelHandlerContext
+   * Strategy: Maybe TestContextCapture is interfering
+   */
+  @Test
+  public void experiment06_NoTestContextCapture() throws Exception {
+    System.out.println("\nEXPERIMENT 6: New channel without TestContextCapture");
+
+    ChunkedWriteHandler chunkedWriteHandler = new ChunkedWriteHandler();
+    EmbeddedChannel testChannel = new EmbeddedChannel(chunkedWriteHandler);
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        new MockChannelHandlerContext(testChannel), nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+    System.out.println("  Channel.isActive(): " + testChannel.isActive());
+    System.out.println("  Channel.isOpen(): " + testChannel.isOpen());
+    System.out.println("  Channel.isRegistered(): " + testChannel.isRegistered());
+
+    testChannel.close();
+  }
+
+  /**
+   * EXPERIMENT 7: Check finalResponseMetadata field directly
+   * Strategy: See if finalResponseMetadata is actually set
+   */
+  @Test
+  public void experiment07_CheckFinalResponseMetadata() throws Exception {
+    System.out.println("\nEXPERIMENT 7: Check finalResponseMetadata field");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    // Check finalResponseMetadata before write
+    Field finalResponseMetadataField = NettyResponseChannel.class.getDeclaredField("finalResponseMetadata");
+    finalResponseMetadataField.setAccessible(true);
+    Object beforeWrite = finalResponseMetadataField.get(responseChannel);
+    System.out.println("  finalResponseMetadata BEFORE write: " + beforeWrite);
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    // Check finalResponseMetadata after write
+    Object afterWrite = finalResponseMetadataField.get(responseChannel);
+    System.out.println("  finalResponseMetadata AFTER write: " + afterWrite);
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+  }
+
+  /**
+   * EXPERIMENT 8: Check responseMetadataWriteInitiated flag
+   * Strategy: See if the metadata write was attempted
+   */
+  @Test
+  public void experiment08_CheckWriteInitiatedFlag() throws Exception {
+    System.out.println("\nEXPERIMENT 8: Check responseMetadataWriteInitiated");
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        contextCapture.ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    Field writeInitiatedField = NettyResponseChannel.class.getDeclaredField("responseMetadataWriteInitiated");
+    writeInitiatedField.setAccessible(true);
+    Object beforeWrite = writeInitiatedField.get(responseChannel);
+    System.out.println("  responseMetadataWriteInitiated BEFORE write: " + beforeWrite);
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    Object afterWrite = writeInitiatedField.get(responseChannel);
+    System.out.println("  responseMetadataWriteInitiated AFTER write: " + afterWrite);
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+  }
+
+  /**
+   * EXPERIMENT 9: Use context from ChunkedWriteHandler's context method
+   * Strategy: Get context directly from the handler instance
+   */
+  @Test
+  public void experiment09_HandlerContext() throws Exception {
+    System.out.println("\nEXPERIMENT 9: Context from handler.context()");
+
+    ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
+    // ChunkedWriteHandler might have a way to get its context
+    ChannelHandlerContext ctx = channel.pipeline().context(handler);
+
+    System.out.println("  Handler: " + handler);
+    System.out.println("  Context: " + ctx);
+    System.out.println("  Context != null: " + (ctx != null));
+    if (ctx != null) {
+      System.out.println("  Context.channel(): " + ctx.channel());
+      System.out.println("  Context.channel().isActive(): " + ctx.channel().isActive());
+    }
+
+    NettyResponseChannel responseChannel = new NettyResponseChannel(
+        ctx, nettyMetrics, performanceConfig, nettyConfig);
+
+    responseChannel.setStatus(ResponseStatus.Ok);
+    responseChannel.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+
+    ByteBuffer byteBuffer = ByteBuffer.wrap("test".getBytes(StandardCharsets.UTF_8));
+    TestCallback callback = new TestCallback();
+    responseChannel.write(byteBuffer, callback);
+
+    ByteBuf result = getWrapperFromChannel(responseChannel);
+    System.out.println("  Result: " + (result != null ? "SUCCESS - chunk found" : "FAILURE - chunk is null"));
+  }
+
+  /**
+   * EXPERIMENT 10: Compare contextCapture.ctx vs pipeline context
+   * Strategy: See if they're the same object or different
+   */
+  @Test
+  public void experiment10_CompareContexts() throws Exception {
+    System.out.println("\nEXPERIMENT 10: Compare different context sources");
+
+    ChunkedWriteHandler handler = channel.pipeline().get(ChunkedWriteHandler.class);
+    ChannelHandlerContext pipelineCtx = channel.pipeline().context(handler);
+    ChannelHandlerContext capturedCtx = contextCapture.ctx;
+
+    System.out.println("  Pipeline context: " + pipelineCtx);
+    System.out.println("  Captured context: " + capturedCtx);
+    System.out.println("  Same object? " + (pipelineCtx == capturedCtx));
+    System.out.println("  Pipeline ctx.channel().isActive(): " + (pipelineCtx != null ? pipelineCtx.channel().isActive() : "null"));
+    System.out.println("  Captured ctx.channel().isActive(): " + (capturedCtx != null ? capturedCtx.channel().isActive() : "null"));
+
+    // Try both
+    System.out.println("\n  Trying with captured context:");
+    NettyResponseChannel responseChannel1 = new NettyResponseChannel(
+        capturedCtx, nettyMetrics, performanceConfig, nettyConfig);
+    responseChannel1.setStatus(ResponseStatus.Ok);
+    responseChannel1.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+    ByteBuffer byteBuffer1 = ByteBuffer.wrap("test1".getBytes(StandardCharsets.UTF_8));
+    responseChannel1.write(byteBuffer1, new TestCallback());
+    ByteBuf result1 = getWrapperFromChannel(responseChannel1);
+    System.out.println("    Result: " + (result1 != null ? "SUCCESS" : "FAILURE"));
+
+    System.out.println("\n  Trying with pipeline context:");
+    NettyResponseChannel responseChannel2 = new NettyResponseChannel(
+        pipelineCtx, nettyMetrics, performanceConfig, nettyConfig);
+    responseChannel2.setStatus(ResponseStatus.Ok);
+    responseChannel2.setHeader(HttpHeaderNames.TRANSFER_ENCODING.toString(), "chunked");
+    ByteBuffer byteBuffer2 = ByteBuffer.wrap("test2".getBytes(StandardCharsets.UTF_8));
+    responseChannel2.write(byteBuffer2, new TestCallback());
+    ByteBuf result2 = getWrapperFromChannel(responseChannel2);
+    System.out.println("    Result: " + (result2 != null ? "SUCCESS" : "FAILURE"));
+  }
+
+  /**
+   * EXPERIMENT 11: Check if channel.isActive() vs ctx.channel().isActive() differ
+   * Strategy: Maybe EmbeddedChannel itself reports active differently
+   */
+  @Test
+  public void experiment11_ChannelActiveStates() throws Exception {
+    System.out.println("\nEXPERIMENT 11: Compare channel active states");
+
+    System.out.println("  channel.isActive(): " + channel.isActive());
+    System.out.println("  channel.isOpen(): " + channel.isOpen());
+    System.out.println("  channel.isRegistered(): " + channel.isRegistered());
+    System.out.println("  contextCapture.ctx.channel().isActive(): " +
+        (contextCapture.ctx != null ? contextCapture.ctx.channel().isActive() : "null ctx"));
+    System.out.println("  Are they the same channel? " +
+        (contextCapture.ctx != null ? (contextCapture.ctx.channel() == channel) : "null ctx"));
+  }
+
+  /**
+   * Original test - keeping for comparison
    */
   @Test
   public void testWriteByteBufferReleasesWrapper() throws Exception {
