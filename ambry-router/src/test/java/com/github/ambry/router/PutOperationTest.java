@@ -18,6 +18,7 @@ import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.clustermap.MockPartitionId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ByteBufReadableStreamChannel;
+import com.github.ambry.commons.ByteBufferAsyncWritableChannel;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.LoggingNotificationSystem;
 import com.github.ambry.config.RouterConfig;
@@ -436,6 +437,135 @@ public class PutOperationTest {
     } finally {
       mockServer.resetServerErrors();
     }
+  }
+
+  /**
+   * Verifies channelReadBuf remains valid after the channel callback releases the original buffer.
+   * This tests the fix for a use-after-free race condition in PutOperation.fillChunks().
+   */
+  @Test
+  public void testChannelReadBufRemainsValidAfterChannelClose() throws Exception {
+    // Use max.in.mem.put.chunks=1 so fillChunks() exits with data remaining in channelReadBuf
+    Properties properties = createBasicRouterProperties();
+    properties.setProperty("router.max.in.mem.put.chunks", "1");
+    RouterConfig testRouterConfig = createRouterConfigFromProperties(properties);
+
+    BlobProperties blobProperties =
+        new BlobProperties(-1, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
+            Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
+    byte[] userMetadata = new byte[10];
+
+    // Buffer larger than one chunk leaves data in channelReadBuf after first fillChunks()
+    int bufferSize = chunkSize * 2;
+    ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(bufferSize);
+    byte[] content = new byte[bufferSize];
+    random.nextBytes(content);
+    byteBuf.writeBytes(content);
+    ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(byteBuf);
+
+    FutureResult<String> future = new FutureResult<>();
+    MockNetworkClient mockNetworkClient = new MockNetworkClient();
+    List<RequestInfo> requestInfos = new ArrayList<>();
+    requestRegistrationCallback.setRequestsToSend(requestInfos);
+
+    PutOperation op = PutOperation.forUpload(testRouterConfig, routerMetrics, mockClusterMap,
+        new LoggingNotificationSystem(), new InMemAccountService(true, false), userMetadata,
+        channel, PutBlobOptions.DEFAULT, future, null,
+        new RouterCallback(mockNetworkClient, new ArrayList<>()), null, null, null, null, time,
+        blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
+
+    op.startOperation();
+    op.fillChunks();
+
+    // Get channelReadBuf via reflection - it should still have remaining data
+    ByteBuf channelReadBuf = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
+    assertNotNull("channelReadBuf should have the buffer", channelReadBuf);
+    assertTrue("channelReadBuf should have remaining bytes", channelReadBuf.readableBytes() > 0);
+
+    // Poll and handle responses to complete the first chunk
+    op.poll(requestRegistrationCallback);
+    for (RequestInfo requestInfo : requestInfos) {
+      ResponseInfo responseInfo = getResponseInfo(requestInfo);
+      PutResponse putResponse = responseInfo.getError() == null
+          ? PutResponse.readFrom(new NettyByteBufDataInputStream(responseInfo.content()))
+          : null;
+      op.handleResponse(responseInfo, putResponse);
+      requestInfo.getRequest().release();
+      responseInfo.release();
+    }
+
+    // Close chunkFillerChannel - this fires the callback which releases the original buffer
+    ByteBufferAsyncWritableChannel chunkFillerChannel =
+        (ByteBufferAsyncWritableChannel) FieldUtils.readField(op, "chunkFillerChannel", true);
+    chunkFillerChannel.close();
+
+    // Verify buffer is still valid after channel close (the fix retains it in channelReadBuf)
+    ByteBuf bufAfterClose = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
+    assertNotNull("channelReadBuf should still hold a reference", bufAfterClose);
+    assertTrue("Buffer should still be valid (refCnt > 0) after channel close", bufAfterClose.refCnt() > 0);
+    assertTrue("Buffer should have readable bytes", bufAfterClose.readableBytes() > 0);
+
+    op.cleanupChunks();
+  }
+
+  /**
+   * End-to-end test verifying a multi-chunk put completes without errors or memory leaks
+   * when using max.in.mem.put.chunks=1 (exercises the channelReadBuf code path).
+   */
+  @Test
+  public void testMultiChunkPutWithSingleInMemChunk() throws Exception {
+    // Use max.in.mem.put.chunks=1 to exercise the channelReadBuf retention logic
+    Properties properties = createBasicRouterProperties();
+    properties.setProperty("router.max.in.mem.put.chunks", "1");
+    RouterConfig testRouterConfig = createRouterConfigFromProperties(properties);
+
+    BlobProperties blobProperties =
+        new BlobProperties(-1, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
+            Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
+    byte[] userMetadata = new byte[10];
+
+    int bufferSize = chunkSize * 2;
+    ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(bufferSize);
+    byte[] content = new byte[bufferSize];
+    random.nextBytes(content);
+    byteBuf.writeBytes(content);
+    ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(byteBuf);
+
+    FutureResult<String> future = new FutureResult<>();
+    MockNetworkClient mockNetworkClient = new MockNetworkClient();
+    List<RequestInfo> requestInfos = new ArrayList<>();
+    requestRegistrationCallback.setRequestsToSend(requestInfos);
+
+    PutOperation op = PutOperation.forUpload(testRouterConfig, routerMetrics, mockClusterMap,
+        new LoggingNotificationSystem(), new InMemAccountService(true, false), userMetadata,
+        channel, PutBlobOptions.DEFAULT, future, null,
+        new RouterCallback(mockNetworkClient, new ArrayList<>()), null, null, null, null, time,
+        blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
+
+    op.startOperation();
+
+    // Process all chunks until operation is complete
+    while (!op.isOperationComplete()) {
+      op.fillChunks();
+      requestInfos.clear();
+      op.poll(requestRegistrationCallback);
+
+      for (RequestInfo requestInfo : requestInfos) {
+        ResponseInfo responseInfo = getResponseInfo(requestInfo);
+        PutResponse putResponse = responseInfo.getError() == null
+            ? PutResponse.readFrom(new NettyByteBufDataInputStream(responseInfo.content()))
+            : null;
+        op.handleResponse(responseInfo, putResponse);
+        requestInfo.getRequest().release();
+        responseInfo.release();
+      }
+    }
+
+    assertTrue("Operation should be complete", op.isOperationComplete());
+    assertNull("Operation should have no exception: " + op.getOperationException(), op.getOperationException());
+
+    // Verify no memory leaks
+    assertEquals("Original buffer should be fully released", 0, byteBuf.refCnt());
   }
 
   @Test
