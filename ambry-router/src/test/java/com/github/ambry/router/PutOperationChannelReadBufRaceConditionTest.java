@@ -1,5 +1,5 @@
 /**
- * Copyright 2024 LinkedIn Corp. All rights reserved.
+ * Copyright 2025 LinkedIn Corp. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.PutResponse;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaTestUtils;
-import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.NettyByteBufDataInputStream;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
@@ -225,10 +224,8 @@ public class PutOperationChannelReadBufRaceConditionTest {
     int readable = bufAfterClose.readableBytes();
     assertTrue("Buffer should have readable bytes", readable > 0);
 
-    // Clean up - release the buffer that PutOperation retained (after fix is applied)
-    if (bufAfterClose.refCnt() > 0) {
-      bufAfterClose.release();
-    }
+    // Clean up using the production code path.
+    op.cleanupChunks();
   }
 
   /**

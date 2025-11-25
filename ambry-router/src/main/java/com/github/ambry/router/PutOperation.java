@@ -575,10 +575,13 @@ class PutOperation {
   /**
    * Clean up the chunks to release any data buffer. This should be invoked when terminating the operation with
    * an exception.
+   * <p>
+   * This method also closes the chunkFillerChannel to fire any pending callbacks, ensuring the original
+   * buffer from the ReadableStreamChannel is properly released.
    */
   public void cleanupChunks() {
     releaseDataForAllChunks();
-    // Release channelReadBuf if it's still holding a retained reference
+    // Release channelReadBuf if it's still holding a retained reference.
     if (channelReadBuf != null) {
       channelReadBuf.release();
       channelReadBuf = null;
@@ -693,7 +696,7 @@ class PutOperation {
           channelReadBuf = chunkFillerChannel.getNextByteBuf(0);
           if (channelReadBuf != null) {
             // Retain the buffer to protect against the channel callback releasing it
-            // while we still hold a reference in channelReadBuf
+            // while we still hold a reference in channelReadBuf.
             channelReadBuf.retain();
           }
         }
@@ -721,7 +724,7 @@ class PutOperation {
             }
             if (!channelReadBuf.isReadable()) {
               chunkFillerChannel.resolveOldestChunk(null);
-              channelReadBuf.release();  // Release the reference we retained
+              channelReadBuf.release();  // Release the reference we retained when storing in channelReadBuf.
               channelReadBuf = null;
             }
           }
