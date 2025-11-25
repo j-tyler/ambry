@@ -47,7 +47,6 @@ import org.junit.Before;
 import org.junit.Test;
 
 import static org.junit.Assert.*;
-import static org.mockito.Mockito.*;
 
 
 /**
@@ -300,19 +299,18 @@ public class PutOperationChannelReadBufRaceConditionTest {
   }
 
   /**
-   * Test that proves the callback re-entrancy bug in cleanupChunks().
+   * Test that verifies a server error (RouterException) is not overwritten by ClosedChannelException
+   * during cleanupChunks().
    *
    * When a server error occurs and cleanupChunks() is called:
-   * 1. cleanupChunks() closes chunkFillerChannel
-   * 2. Closing the channel fires the callback from startReadingFromChannel()
-   * 3. The callback calls routerCallback.onPollReady() again (re-entrant!)
-   * 4. The callback calls chunkFillerChannel.close() again (redundant!)
+   * 1. Operation fails with RouterException (e.g., AmbryUnavailable due to server error)
+   * 2. cleanupChunks() closes chunkFillerChannel
+   * 3. Closing the channel fires the callback from startReadingFromChannel() with ClosedChannelException
+   * 4. The callback's setOperationExceptionAndComplete(ClosedChannelException) must NOT overwrite
+   *    the original RouterException
    *
-   * This test uses Mockito spies to verify that the callback causes re-entrant calls.
-   *
-   * EXPECTED: This test should FAIL because:
-   * - routerCallback.onPollReady() is called more than expected (re-entrancy from callback)
-   * - chunkFillerChannel.close() is called more than once
+   * EXPECTED: This test should FAIL before the fix because ClosedChannelException overwrites
+   * the RouterException (since non-RouterExceptions use operationException.set() unconditionally).
    */
   @Test
   public void testCleanupChunksDoesNotOverwriteOriginalException() throws Exception {
@@ -344,13 +342,10 @@ public class PutOperationChannelReadBufRaceConditionTest {
       List<RequestInfo> requestInfos = new ArrayList<>();
       requestRegistrationCallback.setRequestsToSend(requestInfos);
 
-      // Create a spy on RouterCallback to track onPollReady() calls
-      RouterCallback routerCallback = spy(new RouterCallback(mockNetworkClient, new ArrayList<>()));
-
       PutOperation op = PutOperation.forUpload(routerConfig, routerMetrics, mockClusterMap,
           new LoggingNotificationSystem(), new InMemAccountService(true, false), userMetadata,
           channel, PutBlobOptions.DEFAULT, future, null,
-          routerCallback, null, null, null, null, time,
+          new RouterCallback(mockNetworkClient, new ArrayList<>()), null, null, null, null, time,
           blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
 
       op.startOperation();
@@ -377,41 +372,36 @@ public class PutOperationChannelReadBufRaceConditionTest {
 
       // Operation should be complete with an error
       assertTrue("Operation should be complete", op.isOperationComplete());
-      assertNotNull("Operation should have an exception", op.getOperationException());
+      Exception exceptionBeforeCleanup = op.getOperationException();
+      assertNotNull("Operation should have an exception", exceptionBeforeCleanup);
 
-      // Record onPollReady() call count before cleanupChunks()
-      int onPollReadyCountBefore = mockingDetails(routerCallback).getInvocations().stream()
-          .filter(inv -> inv.getMethod().getName().equals("onPollReady"))
-          .mapToInt(inv -> 1)
-          .sum();
-
-      // Get the chunkFillerChannel and wrap it with a spy to track close() calls
-      ByteBufferAsyncWritableChannel chunkFillerChannel =
-          (ByteBufferAsyncWritableChannel) FieldUtils.readField(op, "chunkFillerChannel", true);
-      ByteBufferAsyncWritableChannel spyChannel = spy(chunkFillerChannel);
-      FieldUtils.writeField(op, "chunkFillerChannel", spyChannel, true);
+      // The exception should be a RouterException due to the server error
+      assertTrue("Exception before cleanup should be RouterException, but was: "
+              + exceptionBeforeCleanup.getClass().getName(),
+          exceptionBeforeCleanup instanceof RouterException);
 
       // Now call cleanupChunks() - this is what PutManager.onComplete() does
+      // This closes chunkFillerChannel, which fires the callback with ClosedChannelException
       op.cleanupChunks();
 
-      // Record onPollReady() call count after cleanupChunks()
-      int onPollReadyCountAfter = mockingDetails(routerCallback).getInvocations().stream()
-          .filter(inv -> inv.getMethod().getName().equals("onPollReady"))
-          .mapToInt(inv -> 1)
-          .sum();
+      // THE BUG: The original RouterException should be preserved, not overwritten
+      // by ClosedChannelException from the callback.
+      Exception exceptionAfterCleanup = op.getOperationException();
+      assertNotNull("Operation should still have an exception after cleanup", exceptionAfterCleanup);
 
-      // THE BUG VERIFICATION:
-      // cleanupChunks() should NOT trigger additional onPollReady() calls.
-      // But due to re-entrancy, the callback fires and calls onPollReady() again.
-      int additionalOnPollReadyCalls = onPollReadyCountAfter - onPollReadyCountBefore;
-      assertEquals("cleanupChunks() should not trigger additional onPollReady() calls. "
-              + "This indicates the callback is being re-entrantly invoked. "
-              + "onPollReady was called " + additionalOnPollReadyCalls + " extra time(s).",
-          0, additionalOnPollReadyCalls);
+      // Verify exception was NOT overwritten by ClosedChannelException
+      assertFalse("Exception should NOT be ClosedChannelException after cleanup. "
+              + "The callback overwrote the original RouterException!",
+          exceptionAfterCleanup instanceof java.nio.channels.ClosedChannelException);
 
-      // Verify chunkFillerChannel.close() was only called once (by cleanupChunks itself)
-      // The callback should NOT call close() again.
-      verify(spyChannel, times(1)).close();
+      // Verify it's still a RouterException
+      assertTrue("Exception after cleanup should still be RouterException, but was: "
+              + exceptionAfterCleanup.getClass().getName(),
+          exceptionAfterCleanup instanceof RouterException);
+
+      // Verify it's the same exception instance
+      assertSame("Exception should be the exact same instance after cleanup",
+          exceptionBeforeCleanup, exceptionAfterCleanup);
 
     } finally {
       // Reset MockServer state
