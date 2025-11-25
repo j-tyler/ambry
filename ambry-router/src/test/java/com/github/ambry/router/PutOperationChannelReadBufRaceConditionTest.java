@@ -26,6 +26,7 @@ import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.PutResponse;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaTestUtils;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.NettyByteBufDataInputStream;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
@@ -46,6 +47,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import static org.junit.Assert.*;
+import static org.mockito.Mockito.*;
 
 
 /**
@@ -295,5 +297,125 @@ public class PutOperationChannelReadBufRaceConditionTest {
     // Verify no memory leaks - the original buffer should have been fully released
     assertEquals("Original buffer should be fully released (refCnt = 0)",
         0, nettyBuffer.refCnt());
+  }
+
+  /**
+   * Test that proves the callback re-entrancy bug in cleanupChunks().
+   *
+   * When a server error occurs and cleanupChunks() is called:
+   * 1. cleanupChunks() closes chunkFillerChannel
+   * 2. Closing the channel fires the callback from startReadingFromChannel()
+   * 3. The callback calls routerCallback.onPollReady() again (re-entrant!)
+   * 4. The callback calls chunkFillerChannel.close() again (redundant!)
+   *
+   * This test uses Mockito spies to verify that the callback causes re-entrant calls.
+   *
+   * EXPECTED: This test should FAIL because:
+   * - routerCallback.onPollReady() is called more than expected (re-entrancy from callback)
+   * - chunkFillerChannel.close() is called more than once
+   */
+  @Test
+  public void testCleanupChunksDoesNotOverwriteOriginalException() throws Exception {
+    // Configure MockServer to return an error for all requests
+    mockServer.setServerErrorForAllRequests(ServerErrorCode.Unknown_Error);
+
+    try {
+      // Create blob properties
+      BlobProperties blobProperties = new BlobProperties(-1, "serviceId", "memberId", "contentType",
+          false, Utils.Infinite_Time, Utils.getRandomShort(TestUtils.RANDOM),
+          Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
+      byte[] userMetadata = new byte[10];
+
+      // Create a buffer LARGER than one chunk so that the callback does NOT fire
+      // during fillChunks(). The callback only fires when the buffer is fully consumed
+      // (resolveOldestChunk is called when !channelReadBuf.isReadable()).
+      // With 2x chunkSize and max.in.mem.put.chunks=1, only half the buffer is consumed,
+      // so the callback remains pending until cleanupChunks() closes the channel.
+      int bufferSize = chunkSize * 2;
+      ByteBuf nettyBuffer = PooledByteBufAllocator.DEFAULT.directBuffer(bufferSize);
+      byte[] testData = new byte[bufferSize];
+      random.nextBytes(testData);
+      nettyBuffer.writeBytes(testData);
+
+      ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(nettyBuffer);
+
+      FutureResult<String> future = new FutureResult<>();
+      MockNetworkClient mockNetworkClient = new MockNetworkClient();
+      List<RequestInfo> requestInfos = new ArrayList<>();
+      requestRegistrationCallback.setRequestsToSend(requestInfos);
+
+      // Create a spy on RouterCallback to track onPollReady() calls
+      RouterCallback routerCallback = spy(new RouterCallback(mockNetworkClient, new ArrayList<>()));
+
+      PutOperation op = PutOperation.forUpload(routerConfig, routerMetrics, mockClusterMap,
+          new LoggingNotificationSystem(), new InMemAccountService(true, false), userMetadata,
+          channel, PutBlobOptions.DEFAULT, future, null,
+          routerCallback, null, null, null, null, time,
+          blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
+
+      op.startOperation();
+
+      // Process until operation fails
+      int maxIterations = 100;
+      int iterations = 0;
+      while (!op.isOperationComplete() && iterations++ < maxIterations) {
+        op.fillChunks();
+        requestInfos.clear();
+        op.poll(requestRegistrationCallback);
+
+        // Handle all responses - server will return errors
+        for (RequestInfo requestInfo : requestInfos) {
+          ResponseInfo responseInfo = getResponseInfo(requestInfo);
+          PutResponse putResponse = responseInfo.getError() == null
+              ? PutResponse.readFrom(new NettyByteBufDataInputStream(responseInfo.content()))
+              : null;
+          op.handleResponse(responseInfo, putResponse);
+          requestInfo.getRequest().release();
+          responseInfo.release();
+        }
+      }
+
+      // Operation should be complete with an error
+      assertTrue("Operation should be complete", op.isOperationComplete());
+      assertNotNull("Operation should have an exception", op.getOperationException());
+
+      // Record onPollReady() call count before cleanupChunks()
+      int onPollReadyCountBefore = mockingDetails(routerCallback).getInvocations().stream()
+          .filter(inv -> inv.getMethod().getName().equals("onPollReady"))
+          .mapToInt(inv -> 1)
+          .sum();
+
+      // Get the chunkFillerChannel and wrap it with a spy to track close() calls
+      ByteBufferAsyncWritableChannel chunkFillerChannel =
+          (ByteBufferAsyncWritableChannel) FieldUtils.readField(op, "chunkFillerChannel", true);
+      ByteBufferAsyncWritableChannel spyChannel = spy(chunkFillerChannel);
+      FieldUtils.writeField(op, "chunkFillerChannel", spyChannel, true);
+
+      // Now call cleanupChunks() - this is what PutManager.onComplete() does
+      op.cleanupChunks();
+
+      // Record onPollReady() call count after cleanupChunks()
+      int onPollReadyCountAfter = mockingDetails(routerCallback).getInvocations().stream()
+          .filter(inv -> inv.getMethod().getName().equals("onPollReady"))
+          .mapToInt(inv -> 1)
+          .sum();
+
+      // THE BUG VERIFICATION:
+      // cleanupChunks() should NOT trigger additional onPollReady() calls.
+      // But due to re-entrancy, the callback fires and calls onPollReady() again.
+      int additionalOnPollReadyCalls = onPollReadyCountAfter - onPollReadyCountBefore;
+      assertEquals("cleanupChunks() should not trigger additional onPollReady() calls. "
+              + "This indicates the callback is being re-entrantly invoked. "
+              + "onPollReady was called " + additionalOnPollReadyCalls + " extra time(s).",
+          0, additionalOnPollReadyCalls);
+
+      // Verify chunkFillerChannel.close() was only called once (by cleanupChunks itself)
+      // The callback should NOT call close() again.
+      verify(spyChannel, times(1)).close();
+
+    } finally {
+      // Reset MockServer state
+      mockServer.setServerErrorForAllRequests(ServerErrorCode.NoError);
+    }
   }
 }
