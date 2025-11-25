@@ -434,9 +434,14 @@ class PutOperation {
     // the chunk filling process for this PutOperation is finished.
     channel.readInto(chunkFillerChannel, (result, exception) -> {
       if (exception != null) {
-        logger.info("{}: ChannelRead has exception, will terminate the operation", loggingContext, exception);
-        setOperationExceptionAndComplete(exception);
-        routerCallback.onPollReady();
+        // Only set exception if one isn't already set. This prevents overwriting a meaningful
+        // error (e.g., RouterException from server error) with ClosedChannelException when
+        // cleanupChunks() closes the channel.
+        if (operationException.get() == null) {
+          logger.info("{}: ChannelRead has exception, will terminate the operation", loggingContext, exception);
+          setOperationExceptionAndComplete(exception);
+          routerCallback.onPollReady();
+        }
       } else {
         blobSize = result;
         chunkFillingCompletedSuccessfully = true;
