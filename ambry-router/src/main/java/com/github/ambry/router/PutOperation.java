@@ -434,9 +434,7 @@ class PutOperation {
     // the chunk filling process for this PutOperation is finished.
     channel.readInto(chunkFillerChannel, (result, exception) -> {
       if (exception != null) {
-        // Only set exception if one isn't already set. This prevents overwriting a meaningful
-        // error (e.g., RouterException from server error) with ClosedChannelException when
-        // cleanupChunks() closes the channel.
+        // Skip if already failed to avoid noisy logs and redundant onPollReady calls.
         if (operationException.get() == null) {
           logger.info("{}: ChannelRead has exception, will terminate the operation", loggingContext, exception);
           setOperationExceptionAndComplete(exception);
@@ -1123,13 +1121,16 @@ class PutOperation {
    * Second, if operationException exists, compare ErrorCodes of exception and existing operation Exception depending
    * on precedence level. An ErrorCode with a smaller precedence level overrides an ErrorCode with a larger precedence
    * level. Update the operationException if necessary.
-   * @param exception the {@link RouterException} to possibly set.
+   * @param exception the {@link Exception} to possibly set.
    */
   void setOperationExceptionAndComplete(Exception exception) {
     if (exception instanceof RouterException) {
       RouterUtils.replaceOperationException(operationException, (RouterException) exception, this::getPrecedenceLevel);
     } else {
-      operationException.set(exception);
+      // Only set non-RouterException if no exception already exists. This prevents overwriting
+      // meaningful errors (e.g., RouterException from server error) with low-level exceptions
+      // (e.g., ClosedChannelException from channel cleanup).
+      operationException.compareAndSet(null, exception);
     }
     setOperationCompleted();
   }
