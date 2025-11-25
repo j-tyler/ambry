@@ -583,6 +583,9 @@ class PutOperation {
       channelReadBuf.release();
       channelReadBuf = null;
     }
+    // Close the chunkFillerChannel to fire any remaining callbacks in chunksAwaitingResolution.
+    // This ensures the original buffer (owned by the callback) is released and not leaked.
+    chunkFillerChannel.close();
   }
 
   /**
