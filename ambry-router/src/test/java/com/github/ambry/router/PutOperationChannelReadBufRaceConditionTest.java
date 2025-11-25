@@ -26,7 +26,6 @@ import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.PutResponse;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaTestUtils;
-import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.NettyByteBufDataInputStream;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
@@ -265,92 +264,5 @@ public class PutOperationChannelReadBufRaceConditionTest {
     // Verify no memory leaks - the original buffer should have been fully released
     assertEquals("Original buffer should be fully released (refCnt = 0)",
         0, nettyBuffer.refCnt());
-  }
-
-  /**
-   * Test that verifies a server error (RouterException) is not overwritten by ClosedChannelException
-   * during cleanupChunks().
-   *
-   * Scenario:
-   * 1. Operation fails with RouterException due to server error
-   * 2. cleanupChunks() closes chunkFillerChannel, firing callback with ClosedChannelException
-   * 3. The callback must NOT overwrite the original RouterException
-   */
-  @Test
-  public void testCleanupChunksDoesNotOverwriteOriginalException() throws Exception {
-    // Configure MockServer to return an error for all requests
-    mockServer.setServerErrorForAllRequests(ServerErrorCode.Unknown_Error);
-
-    try {
-      // Create blob properties
-      BlobProperties blobProperties = new BlobProperties(-1, "serviceId", "memberId", "contentType",
-          false, Utils.Infinite_Time, Utils.getRandomShort(TestUtils.RANDOM),
-          Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
-      byte[] userMetadata = new byte[10];
-
-      // Buffer larger than one chunk ensures callback remains pending until cleanupChunks()
-      int bufferSize = chunkSize * 2;
-      ByteBuf nettyBuffer = PooledByteBufAllocator.DEFAULT.directBuffer(bufferSize);
-      byte[] testData = new byte[bufferSize];
-      random.nextBytes(testData);
-      nettyBuffer.writeBytes(testData);
-
-      ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(nettyBuffer);
-
-      FutureResult<String> future = new FutureResult<>();
-      MockNetworkClient mockNetworkClient = new MockNetworkClient();
-      List<RequestInfo> requestInfos = new ArrayList<>();
-      requestRegistrationCallback.setRequestsToSend(requestInfos);
-
-      PutOperation op = PutOperation.forUpload(routerConfig, routerMetrics, mockClusterMap,
-          new LoggingNotificationSystem(), new InMemAccountService(true, false), userMetadata,
-          channel, PutBlobOptions.DEFAULT, future, null,
-          new RouterCallback(mockNetworkClient, new ArrayList<>()), null, null, null, null, time,
-          blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
-
-      op.startOperation();
-
-      // Process until operation fails
-      int maxIterations = 100;
-      int iterations = 0;
-      while (!op.isOperationComplete() && iterations++ < maxIterations) {
-        op.fillChunks();
-        requestInfos.clear();
-        op.poll(requestRegistrationCallback);
-
-        // Handle all responses - server will return errors
-        for (RequestInfo requestInfo : requestInfos) {
-          ResponseInfo responseInfo = getResponseInfo(requestInfo);
-          PutResponse putResponse = responseInfo.getError() == null
-              ? PutResponse.readFrom(new NettyByteBufDataInputStream(responseInfo.content()))
-              : null;
-          op.handleResponse(responseInfo, putResponse);
-          requestInfo.getRequest().release();
-          responseInfo.release();
-        }
-      }
-
-      // Operation should be complete with an error
-      assertTrue("Operation should be complete", op.isOperationComplete());
-      Exception exceptionBeforeCleanup = op.getOperationException();
-      assertNotNull("Operation should have an exception", exceptionBeforeCleanup);
-
-      // The exception should be a RouterException due to the server error
-      assertTrue("Exception before cleanup should be RouterException, but was: "
-              + exceptionBeforeCleanup.getClass().getName(),
-          exceptionBeforeCleanup instanceof RouterException);
-
-      // cleanupChunks() closes chunkFillerChannel, firing callback with ClosedChannelException
-      op.cleanupChunks();
-
-      // Verify the original RouterException was preserved (not overwritten by ClosedChannelException)
-      Exception exceptionAfterCleanup = op.getOperationException();
-      assertSame("Exception should be preserved after cleanup",
-          exceptionBeforeCleanup, exceptionAfterCleanup);
-
-    } finally {
-      // Reset MockServer state
-      mockServer.setServerErrorForAllRequests(ServerErrorCode.NoError);
-    }
   }
 }
