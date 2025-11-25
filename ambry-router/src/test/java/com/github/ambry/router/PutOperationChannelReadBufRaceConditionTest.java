@@ -189,7 +189,7 @@ public class PutOperationChannelReadBufRaceConditionTest {
 
     // Get the PutChunk and release its buffer - this simulates what happens when the chunk
     // data is sent to the server and the buffer is no longer needed
-    PutOperation.PutChunk putChunk = op.getPutChunks().peek();
+    PutOperation.PutChunk putChunk = op.getPutChunks().get(0);
     assertNotNull("Should have a PutChunk", putChunk);
     ByteBuf chunkBuf = putChunk.buf;
     assertNotNull("PutChunk should have a buffer", chunkBuf);
@@ -291,7 +291,7 @@ public class PutOperationChannelReadBufRaceConditionTest {
     assertTrue("channelReadBuf should have remaining bytes", channelReadBuf.readableBytes() > 0);
 
     // Get the PutChunk - the slice is stored in its buf field
-    PutOperation.PutChunk putChunk = op.getPutChunks().peek();
+    PutOperation.PutChunk putChunk = op.getPutChunks().get(0);
     assertNotNull("Should have a PutChunk", putChunk);
     ByteBuf chunkBuf = putChunk.buf;
     assertNotNull("PutChunk should have a buffer", chunkBuf);
