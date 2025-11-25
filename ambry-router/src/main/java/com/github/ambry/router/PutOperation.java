@@ -578,6 +578,11 @@ class PutOperation {
    */
   public void cleanupChunks() {
     releaseDataForAllChunks();
+    // Release channelReadBuf if it's still holding a retained reference
+    if (channelReadBuf != null) {
+      channelReadBuf.release();
+      channelReadBuf = null;
+    }
   }
 
   /**
@@ -683,6 +688,11 @@ class PutOperation {
         // Attempt to fill a chunk
         if (channelReadBuf == null) {
           channelReadBuf = chunkFillerChannel.getNextByteBuf(0);
+          if (channelReadBuf != null) {
+            // Retain the buffer to protect against the channel callback releasing it
+            // while we still hold a reference in channelReadBuf
+            channelReadBuf.retain();
+          }
         }
         if (channelReadBuf != null) {
           if (channelReadBuf.readableBytes() > 0 && isChunkAwaitingResolution()) {
@@ -708,6 +718,7 @@ class PutOperation {
             }
             if (!channelReadBuf.isReadable()) {
               chunkFillerChannel.resolveOldestChunk(null);
+              channelReadBuf.release();  // Release the reference we retained
               channelReadBuf = null;
             }
           }
