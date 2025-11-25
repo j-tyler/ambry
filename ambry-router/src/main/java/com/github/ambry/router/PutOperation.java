@@ -584,7 +584,7 @@ class PutOperation {
    */
   public void cleanupChunks() {
     releaseDataForAllChunks();
-    // Release channelReadBuf if it's still holding a retained reference.
+    // Release the extra reference we retained when storing in channelReadBuf.
     if (channelReadBuf != null) {
       channelReadBuf.release();
       channelReadBuf = null;
@@ -1116,20 +1116,19 @@ class PutOperation {
   }
 
   /**
-   * Set the exception associated with this operation.
-   * First, if current operationException is null, directly set operationException as exception;
-   * Second, if operationException exists, compare ErrorCodes of exception and existing operation Exception depending
-   * on precedence level. An ErrorCode with a smaller precedence level overrides an ErrorCode with a larger precedence
-   * level. Update the operationException if necessary.
+   * Set the exception associated with this operation and mark it complete.
+   * <p>
+   * For {@link RouterException}: uses precedence-based replacement where lower precedence
+   * levels override higher ones.
+   * <p>
+   * For other exceptions: only sets if no exception already exists (prevents overwriting
+   * meaningful errors with low-level exceptions like ClosedChannelException).
    * @param exception the {@link Exception} to possibly set.
    */
   void setOperationExceptionAndComplete(Exception exception) {
     if (exception instanceof RouterException) {
       RouterUtils.replaceOperationException(operationException, (RouterException) exception, this::getPrecedenceLevel);
     } else {
-      // Only set non-RouterException if no exception already exists. This prevents overwriting
-      // meaningful errors (e.g., RouterException from server error) with low-level exceptions
-      // (e.g., ClosedChannelException from channel cleanup).
       operationException.compareAndSet(null, exception);
     }
     setOperationCompleted();
