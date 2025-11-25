@@ -101,11 +101,9 @@ public class PutOperationChannelReadBufRaceConditionTest {
   }
 
   /**
-   * Test that reproduces the race condition where channelReadBuf becomes a dangling reference
-   * after the channel closes while fillChunks() holds a buffer reference.
+   * Test that verifies channelReadBuf remains valid after the channel closes.
    *
-   * This test uses the real PutOperation code and simulates the exact scenario that causes
-   * the SIGSEGV in production:
+   * This test simulates the scenario that causes SIGSEGV in production:
    *
    * 1. Create a PutOperation and start it
    * 2. Write a buffer (larger than chunk size) to the chunkFillerChannel with a callback that releases it
@@ -113,14 +111,13 @@ public class PutOperationChannelReadBufRaceConditionTest {
    *    (because only 1 in-memory chunk is available)
    * 4. Release the putChunk's buffer (simulating chunk completion, like when data is sent to server)
    * 5. Close the channel (which fires the release callback)
-   * 6. The channelReadBuf now points to a freed buffer
-   * 7. Accessing channelReadBuf should throw IllegalReferenceCountException
+   * 6. Verify channelReadBuf is still valid and can be safely accessed
    *
-   * Before the fix: This test FAILS because channelReadBuf points to freed memory
-   * After the fix: This test PASSES because the buffer is properly retained
+   * Before the fix: This test FAILS because channelReadBuf points to freed memory (refCnt = 0)
+   * After the fix: This test PASSES because the buffer is properly retained (refCnt > 0)
    */
   @Test
-  public void testChannelReadBufDanglingReferenceAfterChannelClose() throws Exception {
+  public void testChannelReadBufRemainsValidAfterChannelClose() throws Exception {
     // Create blob properties
     BlobProperties blobProperties = new BlobProperties(-1, "serviceId", "memberId", "contentType",
         false, Utils.Infinite_Time, Utils.getRandomShort(TestUtils.RANDOM),
@@ -205,49 +202,42 @@ public class PutOperationChannelReadBufRaceConditionTest {
     // Verify the callback was fired
     assertTrue("Callback should have been fired by close()", callbackFired.get());
 
-    // THE BUG: channelReadBuf is now a dangling reference!
-    // The callback has released the buffer, but channelReadBuf still points to it
-    ByteBuf danglingRef = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
-    assertNotNull("channelReadBuf still holds reference to freed buffer", danglingRef);
+    // Get the reference to channelReadBuf after channel close
+    ByteBuf bufAfterClose = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
+    assertNotNull("channelReadBuf should still hold a reference", bufAfterClose);
 
-    // Before the fix: refCnt is 0, buffer is freed
-    // After the fix: refCnt should be > 0, buffer is still valid
-    assertEquals("Buffer refCnt should be 0 after callback released it (BEFORE FIX)", 0, danglingRef.refCnt());
+    // THE FIX VERIFICATION:
+    // After the fix, the buffer should still be valid (refCnt > 0) because
+    // PutOperation should retain the buffer when it stores it in channelReadBuf.
+    // Before the fix, refCnt is 0 and this assertion FAILS.
+    assertTrue("Buffer should still be valid (refCnt > 0) after channel close. "
+            + "Current refCnt=" + bufAfterClose.refCnt() + ". "
+            + "If refCnt is 0, the use-after-free bug is present.",
+        bufAfterClose.refCnt() > 0);
 
-    // This is the crash point - accessing a freed buffer
-    // In production with native memory, this would cause SIGSEGV
-    try {
-      // This is what fillFrom() does before calling Crc32.update()
-      int readable = danglingRef.readableBytes();
+    // The buffer should be safely accessible without throwing IllegalReferenceCountException
+    // Before the fix, this would throw IllegalReferenceCountException (or SIGSEGV in production)
+    int readable = bufAfterClose.readableBytes();
+    assertTrue("Buffer should have readable bytes", readable > 0);
 
-      // If we get here, we're reading from freed memory (undefined behavior)
-      // The nioBuffer() call returns a ByteBuffer pointing to freed native memory
-      ByteBuffer nioBuffer = danglingRef.nioBuffer();
-
-      fail("Should have thrown IllegalReferenceCountException, but accessed freed buffer instead. "
-          + "readable=" + readable + ", nioBuffer.remaining=" + nioBuffer.remaining());
-
-    } catch (IllegalReferenceCountException e) {
-      // This is the expected behavior in debug mode - Netty catches the invalid access
-      // In production without debug checks, this would be a SIGSEGV instead
-      assertTrue("Should indicate refCnt is 0", e.getMessage().contains("0"));
+    // Clean up - release the buffer we retained (after fix is applied)
+    if (bufAfterClose.refCnt() > 0) {
+      bufAfterClose.release();
     }
   }
 
   /**
-   * Test that simulates the exact race condition that happens in production:
-   * 1. fillChunks() gets a buffer into channelReadBuf
-   * 2. The buffer is partially consumed (channelReadBuf still has data)
-   * 3. The chunk data is "sent" and the slice is released
-   * 4. Channel closes (connection timeout, upload complete, etc.)
-   * 5. Callback fires and releases the buffer
-   * 6. channelReadBuf now points to freed memory -> SIGSEGV
+   * Test that verifies the buffer can be safely used after channel close in a realistic scenario.
    *
-   * This simulates a more realistic scenario where the chunk has been built
-   * and sent, then the connection terminates unexpectedly.
+   * This simulates a production scenario where the chunk has been built and sent,
+   * then the connection terminates unexpectedly. The buffer in channelReadBuf should
+   * still be valid for any subsequent operations.
+   *
+   * Before the fix: This test FAILS because channelReadBuf points to freed memory
+   * After the fix: This test PASSES because the buffer is properly retained
    */
   @Test
-  public void testRaceConditionSimulatingRealScenario() throws Exception {
+  public void testBufferSafetyInRealisticScenario() throws Exception {
     BlobProperties blobProperties = new BlobProperties(-1, "serviceId", "memberId", "contentType",
         false, Utils.Infinite_Time, Utils.getRandomShort(TestUtils.RANDOM),
         Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
@@ -300,30 +290,31 @@ public class PutOperationChannelReadBufRaceConditionTest {
     // This is what happens when readInto() completes on the NetworkSend
     chunkBuf.release();
 
-    // At this point:
-    // - channelReadBuf has refCnt = 1 (only from ChunkData)
-    // - The slice has been released
-
     // Now simulate channel close - this fires the callback which releases the buffer
     chunkFillerChannel.close();
 
     assertTrue("Callback should have fired", callbackFired.get());
 
-    // THE BUG: channelReadBuf is now a dangling reference!
-    ByteBuf danglingRef = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
-    assertNotNull("channelReadBuf still holds reference", danglingRef);
-    assertEquals("Buffer should be freed (refCnt = 0)", 0, danglingRef.refCnt());
+    // Get the reference to channelReadBuf after channel close
+    ByteBuf bufAfterClose = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
+    assertNotNull("channelReadBuf should still hold a reference", bufAfterClose);
 
-    // In production, the next call to fillChunks() would try to use this freed buffer
-    // and cause a SIGSEGV when Crc32.update() reads from native memory
-    try {
-      // This simulates what would happen in the next fillChunks() iteration
-      // channelReadBuf.readableBytes() or channelReadBuf.nioBuffer() would access freed memory
-      danglingRef.readableBytes();
-      fail("Should have thrown IllegalReferenceCountException");
-    } catch (IllegalReferenceCountException e) {
-      // Expected in debug mode - Netty catches the invalid access
-      // In production without debug checks, this would be SIGSEGV
+    // THE FIX VERIFICATION:
+    // The buffer should still be valid and accessible.
+    // Before the fix, refCnt is 0 and this assertion FAILS.
+    assertTrue("Buffer should still be valid (refCnt > 0) after channel close. "
+            + "Current refCnt=" + bufAfterClose.refCnt() + ". "
+            + "If refCnt is 0, the use-after-free bug is present.",
+        bufAfterClose.refCnt() > 0);
+
+    // Verify the buffer can be safely read - this is what fillChunks() would do
+    // Before the fix, this throws IllegalReferenceCountException (or SIGSEGV in production)
+    int readable = bufAfterClose.readableBytes();
+    assertTrue("Buffer should have readable bytes", readable > 0);
+
+    // Clean up
+    if (bufAfterClose.refCnt() > 0) {
+      bufAfterClose.release();
     }
   }
 
