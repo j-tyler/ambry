@@ -34,7 +34,6 @@ import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
-import io.netty.buffer.Unpooled;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -117,19 +116,10 @@ public class PutOperationChannelReadBufRaceConditionTest {
   }
 
   /**
-   * Test that verifies channelReadBuf remains valid after the first chunk completes
-   * and the channel closes.
+   * Verifies channelReadBuf remains valid after the channel callback releases the original buffer.
    *
-   * This test uses actual production code paths with MockServer:
-   * - ByteBufReadableStreamChannel.readInto() writes buffer to chunkFillerChannel
-   * - PutOperation.fillChunks() processes the buffer
-   * - Requests are polled and sent to MockServer
-   * - Responses are handled, completing the first chunk (which releases its buffer)
-   * - Channel is closed (which fires the callback releasing the original buffer)
-   * - Verify channelReadBuf is still valid and accessible
-   *
-   * Before the fix: This test FAILS because channelReadBuf points to freed memory (refCnt = 0)
-   * After the fix: This test PASSES because the buffer is properly retained (refCnt > 0)
+   * The fix retains the buffer in channelReadBuf, preventing use-after-free when the channel
+   * closes and fires its callback (which releases the original buffer).
    */
   @Test
   public void testChannelReadBufRemainsValidAfterChunkCompletesAndChannelCloses() throws Exception {
@@ -139,18 +129,13 @@ public class PutOperationChannelReadBufRaceConditionTest {
         Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
     byte[] userMetadata = new byte[10];
 
-    // Create a buffer LARGER than chunk size - this ensures fillChunks() will only
-    // consume part of the buffer, leaving the rest in channelReadBuf
-    // (since we only have 1 in-memory chunk configured)
+    // Buffer larger than one chunk leaves data in channelReadBuf after first fillChunks()
     int bufferSize = chunkSize * 2;
     ByteBuf nettyBuffer = PooledByteBufAllocator.DEFAULT.directBuffer(bufferSize);
     byte[] testData = new byte[bufferSize];
     random.nextBytes(testData);
     nettyBuffer.writeBytes(testData);
 
-    // Use ByteBufReadableStreamChannel - the actual production class that:
-    // 1. Writes the buffer to the channel in readInto()
-    // 2. Registers a callback that calls buf.release() when the chunk is resolved
     ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(nettyBuffer);
 
     FutureResult<String> future = new FutureResult<>();
@@ -158,19 +143,15 @@ public class PutOperationChannelReadBufRaceConditionTest {
     List<RequestInfo> requestInfos = new ArrayList<>();
     requestRegistrationCallback.setRequestsToSend(requestInfos);
 
-    // Create the PutOperation
     PutOperation op = PutOperation.forUpload(routerConfig, routerMetrics, mockClusterMap,
         new LoggingNotificationSystem(), new InMemAccountService(true, false), userMetadata,
         channel, PutBlobOptions.DEFAULT, future, null,
         new RouterCallback(mockNetworkClient, new ArrayList<>()), null, null, null, null, time,
         blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
 
-    // Start the operation - this calls channel.readInto(chunkFillerChannel, callback)
     op.startOperation();
 
-    // Call fillChunks() to process the buffer
-    // Since buffer is 2x chunk size and we only have 1 in-memory chunk,
-    // only the first chunkSize bytes will be consumed
+    // Only the first chunk worth of data will be consumed (max.in.mem.put.chunks=1)
     op.fillChunks();
 
     // Get channelReadBuf via reflection - it should still have remaining data
@@ -215,29 +196,17 @@ public class PutOperationChannelReadBufRaceConditionTest {
     // After the fix, the buffer should still be valid (refCnt > 0) because
     // PutOperation should retain the buffer when it stores it in channelReadBuf.
     // Before the fix, refCnt is 0 and this assertion FAILS.
-    assertTrue("Buffer should still be valid (refCnt > 0) after channel close. "
-            + "Current refCnt=" + bufAfterClose.refCnt() + ". "
-            + "If refCnt is 0, the use-after-free bug is present.",
+    assertTrue("Buffer should still be valid (refCnt > 0) after channel close",
         bufAfterClose.refCnt() > 0);
 
-    // The buffer should be safely accessible without throwing IllegalReferenceCountException
-    // Before the fix, this would throw IllegalReferenceCountException (or SIGSEGV in production)
-    int readable = bufAfterClose.readableBytes();
-    assertTrue("Buffer should have readable bytes", readable > 0);
+    // Verify buffer is accessible (would throw IllegalReferenceCountException before fix)
+    assertTrue("Buffer should have readable bytes", bufAfterClose.readableBytes() > 0);
 
-    // Clean up using the production code path.
     op.cleanupChunks();
   }
 
   /**
-   * End-to-end test that completes the entire put operation successfully.
-   *
-   * This test verifies that with the fix, a multi-chunk put operation completes
-   * without errors and without memory leaks, even when the buffer lifecycle
-   * involves the previously buggy code path.
-   *
-   * Before the fix: This test may FAIL due to IllegalReferenceCountException or SIGSEGV
-   * After the fix: This test PASSES - operation completes with no errors and no leaks
+   * End-to-end test verifying a multi-chunk put completes without errors or memory leaks.
    */
   @Test
   public void testMultiChunkPutCompletesSuccessfully() throws Exception {
@@ -302,15 +271,10 @@ public class PutOperationChannelReadBufRaceConditionTest {
    * Test that verifies a server error (RouterException) is not overwritten by ClosedChannelException
    * during cleanupChunks().
    *
-   * When a server error occurs and cleanupChunks() is called:
-   * 1. Operation fails with RouterException (e.g., AmbryUnavailable due to server error)
-   * 2. cleanupChunks() closes chunkFillerChannel
-   * 3. Closing the channel fires the callback from startReadingFromChannel() with ClosedChannelException
-   * 4. The callback's setOperationExceptionAndComplete(ClosedChannelException) must NOT overwrite
-   *    the original RouterException
-   *
-   * EXPECTED: This test should FAIL before the fix because ClosedChannelException overwrites
-   * the RouterException (since non-RouterExceptions use operationException.set() unconditionally).
+   * Scenario:
+   * 1. Operation fails with RouterException due to server error
+   * 2. cleanupChunks() closes chunkFillerChannel, firing callback with ClosedChannelException
+   * 3. The callback must NOT overwrite the original RouterException
    */
   @Test
   public void testCleanupChunksDoesNotOverwriteOriginalException() throws Exception {
@@ -324,11 +288,7 @@ public class PutOperationChannelReadBufRaceConditionTest {
           Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
       byte[] userMetadata = new byte[10];
 
-      // Create a buffer LARGER than one chunk so that the callback does NOT fire
-      // during fillChunks(). The callback only fires when the buffer is fully consumed
-      // (resolveOldestChunk is called when !channelReadBuf.isReadable()).
-      // With 2x chunkSize and max.in.mem.put.chunks=1, only half the buffer is consumed,
-      // so the callback remains pending until cleanupChunks() closes the channel.
+      // Buffer larger than one chunk ensures callback remains pending until cleanupChunks()
       int bufferSize = chunkSize * 2;
       ByteBuf nettyBuffer = PooledByteBufAllocator.DEFAULT.directBuffer(bufferSize);
       byte[] testData = new byte[bufferSize];
@@ -380,27 +340,12 @@ public class PutOperationChannelReadBufRaceConditionTest {
               + exceptionBeforeCleanup.getClass().getName(),
           exceptionBeforeCleanup instanceof RouterException);
 
-      // Now call cleanupChunks() - this is what PutManager.onComplete() does
-      // This closes chunkFillerChannel, which fires the callback with ClosedChannelException
+      // cleanupChunks() closes chunkFillerChannel, firing callback with ClosedChannelException
       op.cleanupChunks();
 
-      // THE BUG: The original RouterException should be preserved, not overwritten
-      // by ClosedChannelException from the callback.
+      // Verify the original RouterException was preserved (not overwritten by ClosedChannelException)
       Exception exceptionAfterCleanup = op.getOperationException();
-      assertNotNull("Operation should still have an exception after cleanup", exceptionAfterCleanup);
-
-      // Verify exception was NOT overwritten by ClosedChannelException
-      assertFalse("Exception should NOT be ClosedChannelException after cleanup. "
-              + "The callback overwrote the original RouterException!",
-          exceptionAfterCleanup instanceof java.nio.channels.ClosedChannelException);
-
-      // Verify it's still a RouterException
-      assertTrue("Exception after cleanup should still be RouterException, but was: "
-              + exceptionAfterCleanup.getClass().getName(),
-          exceptionAfterCleanup instanceof RouterException);
-
-      // Verify it's the same exception instance
-      assertSame("Exception should be the exact same instance after cleanup",
+      assertSame("Exception should be preserved after cleanup",
           exceptionBeforeCleanup, exceptionAfterCleanup);
 
     } finally {
