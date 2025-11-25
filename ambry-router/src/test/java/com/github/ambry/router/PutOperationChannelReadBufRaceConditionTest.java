@@ -21,17 +21,26 @@ import com.github.ambry.commons.LoggingNotificationSystem;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
+import com.github.ambry.network.RequestInfo;
+import com.github.ambry.network.ResponseInfo;
+import com.github.ambry.protocol.PutResponse;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaTestUtils;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.MockTime;
+import com.github.ambry.utils.NettyByteBufDataInputStream;
 import com.github.ambry.utils.NettyByteBufLeakHelper;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Random;
+import java.util.TreeMap;
 import org.apache.commons.lang3.reflect.FieldUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -63,9 +72,14 @@ public class PutOperationChannelReadBufRaceConditionTest {
   private final MockClusterMap mockClusterMap = new MockClusterMap();
   private final NonBlockingRouterMetrics routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, null);
   private final MockTime time = new MockTime();
+  private final MockServer mockServer = new MockServer(mockClusterMap, "");
+  private final Map<Integer, PutOperation> correlationIdToPutOperation = new TreeMap<>();
+  private final RequestRegistrationCallback<PutOperation> requestRegistrationCallback =
+      new RequestRegistrationCallback<>(correlationIdToPutOperation);
   private final QuotaChargeCallback quotaChargeCallback = QuotaTestUtils.createTestQuotaChargeCallback();
   private final Random random = new Random();
   private final int chunkSize = 4096;
+  private final int requestParallelism = 3;
   private final NettyByteBufLeakHelper nettyByteBufLeakHelper = new NettyByteBufLeakHelper();
 
   private RouterConfig routerConfig;
@@ -76,7 +90,7 @@ public class PutOperationChannelReadBufRaceConditionTest {
     properties.setProperty("router.hostname", "localhost");
     properties.setProperty("router.datacenter.name", "DC1");
     properties.setProperty("router.max.put.chunk.size.bytes", Integer.toString(chunkSize));
-    properties.setProperty("router.put.request.parallelism", "3");
+    properties.setProperty("router.put.request.parallelism", Integer.toString(requestParallelism));
     properties.setProperty("router.put.success.target", "1");
     // Use only 1 in-memory chunk so that fillChunks() exits when the chunk is full
     // but channelReadBuf still has data
@@ -96,48 +110,53 @@ public class PutOperationChannelReadBufRaceConditionTest {
   }
 
   /**
-   * Test that verifies channelReadBuf remains valid after the channel closes.
+   * Get a response from MockServer for a request.
+   */
+  private ResponseInfo getResponseInfo(RequestInfo requestInfo) throws Exception {
+    return new ResponseInfo(requestInfo, null, mockServer.send(requestInfo.getRequest()).content());
+  }
+
+  /**
+   * Test that verifies channelReadBuf remains valid after the first chunk completes
+   * and the channel closes.
    *
-   * This test uses actual production code paths:
+   * This test uses actual production code paths with MockServer:
    * - ByteBufReadableStreamChannel.readInto() writes buffer to chunkFillerChannel
-   * - The callback registered by readInto() releases the buffer when fired
    * - PutOperation.fillChunks() processes the buffer
-   *
-   * The scenario:
-   * 1. Create a PutOperation with ByteBufReadableStreamChannel (buffer > chunk size)
-   * 2. startOperation() calls readInto() which writes buffer with release callback
-   * 3. fillChunks() consumes part of buffer, stores remainder in channelReadBuf
-   * 4. Release putChunk.buf (simulates chunk data sent over network)
-   * 5. Close chunkFillerChannel - fires the readInto callback which releases buffer
-   * 6. Verify channelReadBuf is still valid and accessible
+   * - Requests are polled and sent to MockServer
+   * - Responses are handled, completing the first chunk (which releases its buffer)
+   * - Channel is closed (which fires the callback releasing the original buffer)
+   * - Verify channelReadBuf is still valid and accessible
    *
    * Before the fix: This test FAILS because channelReadBuf points to freed memory (refCnt = 0)
    * After the fix: This test PASSES because the buffer is properly retained (refCnt > 0)
    */
   @Test
-  public void testChannelReadBufRemainsValidAfterChannelClose() throws Exception {
+  public void testChannelReadBufRemainsValidAfterChunkCompletesAndChannelCloses() throws Exception {
     // Create blob properties
     BlobProperties blobProperties = new BlobProperties(-1, "serviceId", "memberId", "contentType",
         false, Utils.Infinite_Time, Utils.getRandomShort(TestUtils.RANDOM),
         Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
     byte[] userMetadata = new byte[10];
 
-    // Create a buffer LARGER than chunk size using pooled allocator (like production)
-    // This ensures fillChunks() will only consume part of the buffer, leaving the rest
-    // in channelReadBuf (since we only have 1 in-memory chunk configured)
+    // Create a buffer LARGER than chunk size - this ensures fillChunks() will only
+    // consume part of the buffer, leaving the rest in channelReadBuf
+    // (since we only have 1 in-memory chunk configured)
     int bufferSize = chunkSize * 2;
     ByteBuf nettyBuffer = PooledByteBufAllocator.DEFAULT.directBuffer(bufferSize);
     byte[] testData = new byte[bufferSize];
     random.nextBytes(testData);
     nettyBuffer.writeBytes(testData);
 
-    // Use ByteBufReadableStreamChannel - this is the actual production class that:
+    // Use ByteBufReadableStreamChannel - the actual production class that:
     // 1. Writes the buffer to the channel in readInto()
     // 2. Registers a callback that calls buf.release() when the chunk is resolved
     ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(nettyBuffer);
 
     FutureResult<String> future = new FutureResult<>();
     MockNetworkClient mockNetworkClient = new MockNetworkClient();
+    List<RequestInfo> requestInfos = new ArrayList<>();
+    requestRegistrationCallback.setRequestsToSend(requestInfos);
 
     // Create the PutOperation
     PutOperation op = PutOperation.forUpload(routerConfig, routerMetrics, mockClusterMap,
@@ -147,34 +166,43 @@ public class PutOperationChannelReadBufRaceConditionTest {
         blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
 
     // Start the operation - this calls channel.readInto(chunkFillerChannel, callback)
-    // which writes nettyBuffer to chunkFillerChannel with a callback that releases it
     op.startOperation();
 
     // Call fillChunks() to process the buffer
     // Since buffer is 2x chunk size and we only have 1 in-memory chunk,
-    // only the first chunkSize bytes will be consumed via fillFrom()
-    // The remaining bytes stay in channelReadBuf
+    // only the first chunkSize bytes will be consumed
     op.fillChunks();
 
     // Get channelReadBuf via reflection - it should still have remaining data
     ByteBuf channelReadBuf = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
     assertNotNull("channelReadBuf should have the buffer", channelReadBuf);
-    assertTrue("channelReadBuf should have remaining bytes", channelReadBuf.readableBytes() > 0);
+    assertTrue("channelReadBuf should have remaining bytes after first fillChunks",
+        channelReadBuf.readableBytes() > 0);
 
-    // Get the PutChunk - its buf field holds a retained slice created by fillFrom()
-    PutOperation.PutChunk putChunk = op.getPutChunks().get(0);
-    assertNotNull("Should have a PutChunk", putChunk);
-    ByteBuf chunkBuf = putChunk.buf;
-    assertNotNull("PutChunk should have a buffer (retained slice)", chunkBuf);
+    // Poll to get requests for the first chunk
+    op.poll(requestRegistrationCallback);
+    assertEquals("Should have requests for the first chunk",
+        requestParallelism, requestInfos.size());
 
-    // Release the chunk buffer - this is what happens when chunk data is sent over
-    // the network and the NetworkSend completes. This releases the retained slice's
-    // reference to the underlying buffer.
-    chunkBuf.release();
+    // Send requests to MockServer and handle responses - this completes the first chunk
+    // When the chunk completes, its buffer (the retained slice) is released
+    for (RequestInfo requestInfo : requestInfos) {
+      ResponseInfo responseInfo = getResponseInfo(requestInfo);
+      PutResponse putResponse = responseInfo.getError() == null
+          ? PutResponse.readFrom(new NettyByteBufDataInputStream(responseInfo.content()))
+          : null;
+      op.handleResponse(responseInfo, putResponse);
+      requestInfo.getRequest().release();
+      responseInfo.release();
+    }
 
-    // Get chunkFillerChannel and close it - this triggers resolveAllRemainingChunks()
-    // which fires the callback that ByteBufReadableStreamChannel registered.
-    // That callback calls buf.release() on the original buffer.
+    // At this point:
+    // - First chunk has completed, its retained slice has been released
+    // - channelReadBuf still has remaining data
+    // - The buffer's refCnt depends on whether PutOperation retained it
+
+    // Now close the chunkFillerChannel - this fires the ByteBufReadableStreamChannel
+    // callback which releases the original buffer
     ByteBufferAsyncWritableChannel chunkFillerChannel =
         (ByteBufferAsyncWritableChannel) FieldUtils.readField(op, "chunkFillerChannel", true);
     chunkFillerChannel.close();
@@ -204,33 +232,37 @@ public class PutOperationChannelReadBufRaceConditionTest {
   }
 
   /**
-   * Test that verifies the buffer can be safely used after channel close in a realistic scenario.
+   * End-to-end test that completes the entire put operation successfully.
    *
-   * Same as above but structured slightly differently to ensure coverage.
+   * This test verifies that with the fix, a multi-chunk put operation completes
+   * without errors and without memory leaks, even when the buffer lifecycle
+   * involves the previously buggy code path.
    *
-   * Before the fix: This test FAILS because channelReadBuf points to freed memory
-   * After the fix: This test PASSES because the buffer is properly retained
+   * Before the fix: This test may FAIL due to IllegalReferenceCountException or SIGSEGV
+   * After the fix: This test PASSES - operation completes with no errors and no leaks
    */
   @Test
-  public void testBufferSafetyInRealisticScenario() throws Exception {
+  public void testMultiChunkPutCompletesSuccessfully() throws Exception {
+    // Create blob properties
     BlobProperties blobProperties = new BlobProperties(-1, "serviceId", "memberId", "contentType",
         false, Utils.Infinite_Time, Utils.getRandomShort(TestUtils.RANDOM),
         Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
     byte[] userMetadata = new byte[10];
 
-    // Create buffer larger than chunk size
-    int bufferSize = chunkSize * 2;
-    ByteBuf buffer = PooledByteBufAllocator.DEFAULT.directBuffer(bufferSize);
-    byte[] data = new byte[bufferSize];
-    random.nextBytes(data);
-    buffer.writeBytes(data);
+    // Create a buffer for 2 data chunks - this will exercise the channelReadBuf code path
+    int numChunks = 2;
+    int bufferSize = chunkSize * numChunks;
+    ByteBuf nettyBuffer = PooledByteBufAllocator.DEFAULT.directBuffer(bufferSize);
+    byte[] testData = new byte[bufferSize];
+    random.nextBytes(testData);
+    nettyBuffer.writeBytes(testData);
 
-    // Use actual ByteBufReadableStreamChannel - its readInto() registers a callback
-    // that releases the buffer when the write is resolved
-    ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(buffer);
+    ByteBufReadableStreamChannel channel = new ByteBufReadableStreamChannel(nettyBuffer);
 
     FutureResult<String> future = new FutureResult<>();
     MockNetworkClient mockNetworkClient = new MockNetworkClient();
+    List<RequestInfo> requestInfos = new ArrayList<>();
+    requestRegistrationCallback.setRequestsToSend(requestInfos);
 
     PutOperation op = PutOperation.forUpload(routerConfig, routerMetrics, mockClusterMap,
         new LoggingNotificationSystem(), new InMemAccountService(true, false), userMetadata,
@@ -238,48 +270,33 @@ public class PutOperationChannelReadBufRaceConditionTest {
         new RouterCallback(mockNetworkClient, new ArrayList<>()), null, null, null, null, time,
         blobProperties, MockClusterMap.DEFAULT_PARTITION_CLASS, quotaChargeCallback, compressionService);
 
-    // startOperation() calls channel.readInto() which writes buffer to chunkFillerChannel
     op.startOperation();
 
-    // fillChunks() processes the first chunk, leaving remaining data in channelReadBuf
-    op.fillChunks();
+    // Process all chunks until operation is complete
+    while (!op.isOperationComplete()) {
+      op.fillChunks();
+      requestInfos.clear();
+      op.poll(requestRegistrationCallback);
 
-    ByteBuf channelReadBuf = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
-    assertNotNull("channelReadBuf should have remaining buffer data", channelReadBuf);
-    assertTrue("channelReadBuf should have remaining bytes", channelReadBuf.readableBytes() > 0);
-
-    // Get the PutChunk and release its buffer (simulates network send completion)
-    PutOperation.PutChunk putChunk = op.getPutChunks().get(0);
-    assertNotNull("Should have a PutChunk", putChunk);
-    ByteBuf chunkBuf = putChunk.buf;
-    assertNotNull("PutChunk should have a buffer", chunkBuf);
-    chunkBuf.release();
-
-    // Close chunkFillerChannel - fires the ByteBufReadableStreamChannel callback
-    ByteBufferAsyncWritableChannel chunkFillerChannel =
-        (ByteBufferAsyncWritableChannel) FieldUtils.readField(op, "chunkFillerChannel", true);
-    chunkFillerChannel.close();
-
-    // Get the reference to channelReadBuf after channel close
-    ByteBuf bufAfterClose = (ByteBuf) FieldUtils.readField(op, "channelReadBuf", true);
-    assertNotNull("channelReadBuf should still hold a reference", bufAfterClose);
-
-    // THE FIX VERIFICATION:
-    // The buffer should still be valid and accessible.
-    // Before the fix, refCnt is 0 and this assertion FAILS.
-    assertTrue("Buffer should still be valid (refCnt > 0) after channel close. "
-            + "Current refCnt=" + bufAfterClose.refCnt() + ". "
-            + "If refCnt is 0, the use-after-free bug is present.",
-        bufAfterClose.refCnt() > 0);
-
-    // Verify the buffer can be safely read - this is what fillChunks() would do
-    // Before the fix, this throws IllegalReferenceCountException (or SIGSEGV in production)
-    int readable = bufAfterClose.readableBytes();
-    assertTrue("Buffer should have readable bytes", readable > 0);
-
-    // Clean up
-    if (bufAfterClose.refCnt() > 0) {
-      bufAfterClose.release();
+      // Handle all responses
+      for (RequestInfo requestInfo : requestInfos) {
+        ResponseInfo responseInfo = getResponseInfo(requestInfo);
+        PutResponse putResponse = responseInfo.getError() == null
+            ? PutResponse.readFrom(new NettyByteBufDataInputStream(responseInfo.content()))
+            : null;
+        op.handleResponse(responseInfo, putResponse);
+        requestInfo.getRequest().release();
+        responseInfo.release();
+      }
     }
+
+    // Verify operation completed successfully
+    assertTrue("Operation should be complete", op.isOperationComplete());
+    assertNull("Operation should have no exception: " + op.getOperationException(),
+        op.getOperationException());
+
+    // Verify no memory leaks - the original buffer should have been fully released
+    assertEquals("Original buffer should be fully released (refCnt = 0)",
+        0, nettyBuffer.refCnt());
   }
 }
