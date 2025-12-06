@@ -365,19 +365,27 @@ long expirationTimeMs = (expStr == null || expStr.isEmpty() || "-1".equals(expSt
 
 ## 6. Filtering Strategy
 
-### 6.1 State and Deletion Filtering
+### 6.1 Constraint: No Per-Object Metadata Calls
 
-**MySQL Filters**:
-```sql
-blob_state = 1  -- READY only
-AND (deleted_ts IS NULL OR deleted_ts > UTC_TIMESTAMP())
-```
+**Problem**: S3 `ListObjectsV2` does not return user metadata. Retrieving metadata requires a `HeadObject` call per object.
 
-**S3 Limitation**: `ListObjectsV2` cannot filter by metadata.
+**Rejected Approach**: Calling HeadObject for each listed object to filter by `blob_state`, `deleted_ts`, and `expiration_ms`. For a page of 1000 objects, this would require 1000+ API calls, resulting in unacceptable latency.
 
-**Decision**: Client-side filtering (Option B from requirements).
+**Decision**: Use `ListObjectsV2` only. Accept that S3 list cannot filter by metadata.
 
-### 6.2 Implementation
+### 6.2 Behavioral Differences from MySQL
+
+Because S3 list cannot filter by metadata, the following differences exist:
+
+| Scenario | MySQL Behavior | S3 Behavior |
+|----------|---------------|-------------|
+| IN_PROGRESS blobs | Excluded from list | **Included in list** |
+| Soft-deleted blobs | Excluded from list | **Included in list** |
+| Expired blobs (TTL passed) | Excluded from list | **Included in list** |
+
+**Client Impact**: Clients may see objects in list results that they cannot access. Subsequent `GET` or `DELETE` calls for these objects will fail with appropriate errors.
+
+### 6.3 Implementation
 
 ```java
 public CompletableFuture<Page<NamedBlobRecord>> list(
@@ -386,66 +394,19 @@ public CompletableFuture<Page<NamedBlobRecord>> list(
 
     return CompletableFuture.supplyAsync(() -> {
         String s3Prefix = buildS3Prefix(accountName, containerName, blobNamePrefix);
-        List<NamedBlobRecord> results = new ArrayList<>();
-        String currentToken = pageToken;
 
-        // May need multiple S3 requests if many objects are filtered out
-        while (results.size() < maxKeys) {
-            ListObjectsV2Response response = fetchS3Page(s3Prefix, currentToken, maxKeys * 2);
+        ListObjectsV2Response response = s3Client.listObjectsV2(
+            ListObjectsV2Request.builder()
+                .bucket(bucket)
+                .prefix(s3Prefix)
+                .startAfter(pageToken != null ? s3Prefix + pageToken : null)
+                .maxKeys(maxKeys + 1)
+                .build());
 
-            for (S3Object s3Obj : response.contents()) {
-                // Must call HeadObject to get metadata for filtering
-                HeadObjectResponse head = s3Client.headObject(
-                    HeadObjectRequest.builder()
-                        .bucket(bucket)
-                        .key(s3Obj.key())
-                        .build());
+        List<NamedBlobRecord> results = response.contents().stream()
+            .map(s3Obj -> buildRecordFromS3(s3Obj, accountName, containerName))
+            .collect(Collectors.toList());
 
-                Map<String, String> metadata = head.metadata();
-
-                // Filter: blob_state = READY
-                int blobState = Integer.parseInt(
-                    metadata.getOrDefault("blob-state", "0"));
-                if (blobState != NamedBlobState.READY.ordinal()) {
-                    continue;
-                }
-
-                long now = System.currentTimeMillis();
-
-                // Filter: check TTL expiration (x-amz-meta-expiration-ms)
-                String expirationStr = metadata.get("expiration-ms");
-                if (expirationStr != null && !expirationStr.isEmpty() && !"-1".equals(expirationStr)) {
-                    long expirationMs = Long.parseLong(expirationStr);
-                    if (expirationMs <= now) {
-                        continue;  // Blob has expired
-                    }
-                }
-
-                // Filter: check soft delete (x-amz-meta-deleted-ts)
-                String deletedTsStr = metadata.get("deleted-ts");
-                if (deletedTsStr != null && !deletedTsStr.isEmpty()) {
-                    long deletedTs = Long.parseLong(deletedTsStr);
-                    if (deletedTs <= now) {
-                        continue;  // Blob has been soft-deleted
-                    }
-                }
-
-                // Build record from metadata
-                results.add(buildRecordFromS3(accountName, containerName, s3Obj, metadata));
-
-                if (results.size() >= maxKeys + 1) {
-                    break;
-                }
-            }
-
-            if (!response.isTruncated()) {
-                break;  // No more objects
-            }
-            currentToken = extractBlobName(response.contents().get(
-                response.contents().size() - 1).key());
-        }
-
-        // Handle pagination token (maxKeys + 1 pattern)
         String nextToken = null;
         if (results.size() > maxKeys) {
             nextToken = results.remove(maxKeys).getBlobName();
@@ -454,73 +415,32 @@ public CompletableFuture<Page<NamedBlobRecord>> list(
         return new Page<>(results, nextToken);
     });
 }
-```
 
-### 6.3 Performance Implications
-
-**Problem**: Client-side filtering requires `HeadObject` call for each S3 object to retrieve metadata.
-
-**Mitigation Strategies**:
-
-1. **Batch HeadObject requests**: Use S3 Batch Operations or parallel async calls
-2. **Over-fetch**: Request `maxKeys * filterRatio` objects where `filterRatio` is estimated based on typical filter rates
-3. **Caching**: Cache metadata for recently listed objects (with appropriate TTL)
-
-**Alternative Considered**: Store state in object tags and use S3 Select.
-
-**Rejected**: S3 Select does not support filtering by tags during list operations.[^4]
-
-[^4]: S3 Object Tags can be used with S3 Inventory for offline filtering, but not for real-time list operations.
-
-### 6.4 HeadObject Parallelization Strategy
-
-**Decision**: Use parallel async HeadObject calls with bounded concurrency.
-
-**Implementation**:
-```java
-private static final int HEAD_OBJECT_CONCURRENCY = 50;  // Max parallel HeadObject calls
-
-private CompletableFuture<List<NamedBlobRecord>> fetchAndFilterBatch(
-        List<S3Object> s3Objects, String accountName, String containerName) {
-
-    ExecutorService executor = Executors.newFixedThreadPool(HEAD_OBJECT_CONCURRENCY);
-
-    List<CompletableFuture<Optional<NamedBlobRecord>>> futures = s3Objects.stream()
-        .map(s3Obj -> CompletableFuture.supplyAsync(() -> {
-            try {
-                HeadObjectResponse head = s3Client.headObject(
-                    HeadObjectRequest.builder()
-                        .bucket(bucket)
-                        .key(s3Obj.key())
-                        .build());
-
-                Map<String, String> metadata = head.metadata();
-                if (passesFilters(metadata)) {
-                    return Optional.of(buildRecordFromS3(accountName, containerName, s3Obj, metadata));
-                }
-                return Optional.<NamedBlobRecord>empty();
-            } catch (NoSuchKeyException e) {
-                // Object deleted between list and head - skip
-                return Optional.<NamedBlobRecord>empty();
-            }
-        }, executor))
-        .collect(Collectors.toList());
-
-    return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-        .thenApply(v -> futures.stream()
-            .map(CompletableFuture::join)
-            .filter(Optional::isPresent)
-            .map(Optional::get)
-            .sorted(Comparator.comparing(NamedBlobRecord::getBlobName))  // Restore order
-            .collect(Collectors.toList()));
+private NamedBlobRecord buildRecordFromS3(S3Object s3Obj,
+        String accountName, String containerName) {
+    return new NamedBlobRecord(
+        accountName,
+        containerName,
+        extractBlobName(s3Obj.key()),
+        "",   // blobId - not available from ListObjectsV2, not in client response
+        -1L,  // expirationTimeMs - not available, use -1 (permanent)
+        0L,   // version - not available from ListObjectsV2, not in client response
+        s3Obj.size(),
+        s3Obj.lastModified().toEpochMilli(),
+        false
+    );
 }
 ```
 
-**Key Points**:
-1. **Bounded concurrency**: Limit to 50 parallel calls to avoid overwhelming S3 or exhausting connections
-2. **Async completion**: Use `CompletableFuture.allOf()` to wait for all HeadObject calls
-3. **Handle race conditions**: Objects may be deleted between ListObjectsV2 and HeadObject
-4. **Restore ordering**: Parallel execution loses ordering; sort results by blob name
+### 6.4 Fields Not Available from ListObjectsV2
+
+| Field | ListObjectsV2 | NamedBlobRecord Value | Client Impact |
+|-------|---------------|----------------------|---------------|
+| `blobId` | Not available | Empty string `""` | Not in JSON response |
+| `version` | Not available | `0L` | Not in JSON response |
+| `expirationTimeMs` | Not available | `-1L` (permanent) | Shown as non-expiring |
+
+**Note**: `blobId` and `version` are internal fields not exposed in the HTTP response JSON. The placeholder values do not affect clients.
 
 ---
 
@@ -815,93 +735,103 @@ The S3NamedBlobDb implementation requires the following S3 permissions:
 
 ## 13. Error Handling
 
-### 13.1 Missing Metadata Behavior
-
-**Scenario**: An S3 object exists but is missing required metadata fields (e.g., `x-amz-meta-blob-id`).
-
-This can occur due to:
-- Objects created outside S3NamedBlobDb (e.g., manual upload)
-- Partial write failures during PUT
-- Metadata corruption
-
-**Decision**: Skip objects with missing required metadata and log a warning.
-
-**Implementation**:
-```java
-private Optional<NamedBlobRecord> buildRecordFromS3(
-        String accountName, String containerName,
-        S3Object s3Obj, Map<String, String> metadata) {
-
-    String blobId = metadata.get("blob-id");
-    String versionStr = metadata.get("version");
-
-    // Required fields
-    if (blobId == null || blobId.isEmpty()) {
-        log.warn("Skipping S3 object {} - missing blob-id metadata", s3Obj.key());
-        metrics.missingMetadataCount.inc();
-        return Optional.empty();
-    }
-
-    if (versionStr == null || versionStr.isEmpty()) {
-        log.warn("Skipping S3 object {} - missing version metadata", s3Obj.key());
-        metrics.missingMetadataCount.inc();
-        return Optional.empty();
-    }
-
-    // Optional fields with defaults
-    String expirationStr = metadata.getOrDefault("expiration-ms", "-1");
-    String modifiedStr = metadata.getOrDefault("modified-ms",
-        String.valueOf(s3Obj.lastModified().toEpochMilli()));
-
-    try {
-        return Optional.of(new NamedBlobRecord(
-            accountName, containerName,
-            extractBlobName(s3Obj.key()),
-            blobId,
-            Long.parseLong(expirationStr),
-            Long.parseLong(versionStr),
-            s3Obj.size(),
-            Long.parseLong(modifiedStr),
-            false  // isDirectory
-        ));
-    } catch (NumberFormatException e) {
-        log.warn("Skipping S3 object {} - malformed metadata: {}",
-            s3Obj.key(), e.getMessage());
-        metrics.malformedMetadataCount.inc();
-        return Optional.empty();
-    }
-}
-```
-
-**Behavior Summary**:
-
-| Missing Field | Behavior |
-|---------------|----------|
-| `blob-id` | Skip object, log warning |
-| `version` | Skip object, log warning |
-| `blob-state` | Assume IN_PROGRESS (ordinal 0), filter out |
-| `expiration-ms` | Default to -1 (permanent) |
-| `deleted-ts` | Default to empty (not deleted) |
-| `modified-ms` | Use S3 LastModified |
-
-### 13.2 S3 API Errors
+### 13.1 S3 API Errors
 
 | Error | Handling |
 |-------|----------|
-| `NoSuchKey` (404) | Object deleted between list and head - skip silently |
-| `AccessDenied` (403) | Log error, fail the request (permissions issue) |
+| `NoSuchBucket` | Fail request, log error (configuration issue) |
+| `AccessDenied` (403) | Fail request, log error (permissions issue) |
 | `ServiceUnavailable` (503) | Retry with exponential backoff |
-| `SlowDown` (503) | Reduce parallelism, retry with backoff |
+| `SlowDown` (503) | Retry with exponential backoff |
+
+### 13.2 Account/Container Resolution Errors
+
+| Scenario | Handling |
+|----------|----------|
+| Account not found | Return empty page (no objects exist for unknown account) |
+| Container not found | Return empty page (no objects exist for unknown container) |
 
 ---
 
-## 14. Open Questions
+## 14. Behavioral Differences: S3 vs MySQL
 
-1. **HeadObject Rate Limiting**: What is the expected QPS for list operations? May need to implement rate limiting or caching for HeadObject calls.
+This section documents all known behavioral differences between `S3NamedBlobDb.list()` and `MySqlNamedBlobDb.list()`. Clients migrating to S3 backend should be aware of these differences.
 
-2. **Large Container Performance**: For containers with millions of objects where most are filtered out, pagination may require many S3 requests. Consider maintaining a separate "live objects" index.
+### 14.1 Filtering Differences
 
-3. **Consistency Window**: S3 provides strong read-after-write consistency, but there may be edge cases during high-write scenarios. Document acceptable consistency guarantees.
+| Behavior | MySQL | S3 | Client Impact |
+|----------|-------|-----|---------------|
+| IN_PROGRESS blobs | Excluded | Included | Client sees blob in list, but GET fails |
+| Soft-deleted blobs | Excluded | Included | Client sees blob in list, but GET returns 404 or deleted status |
+| Expired blobs | Excluded | Included | Client sees blob in list, but GET may fail |
+
+**Recommendation**: Clients should handle GET failures gracefully after list results. This is already good practice for eventually-consistent systems.
+
+### 14.2 Response Field Differences
+
+| Field | MySQL | S3 | Client-Visible |
+|-------|-------|-----|----------------|
+| `blobName` | From DB | From S3 key | Yes - identical |
+| `blobSize` | From DB | From S3 Size | Yes - identical |
+| `modifiedTimeMs` | From DB (ms precision) | From S3 LastModified (s precision) | Yes - **may differ by up to 999ms** |
+| `expirationTimeMs` | From DB | Always `-1` | Yes - **always shows as permanent** |
+| `blobId` | From DB | Placeholder `""` | No - not in JSON |
+| `version` | From DB | Placeholder `0` | No - not in JSON |
+
+### 14.3 Timestamp Precision
+
+**MySQL**: Stores `modified_ts` with millisecond precision.
+
+**S3**: `LastModified` has second precision only.
+
+**Impact**: `modifiedTimeMs` values may differ by up to 999 milliseconds between MySQL and S3 for the same blob.
+
+### 14.4 Expiration Time Display
+
+**MySQL**: Returns actual `expirationTimeMs` for blobs with TTL.
+
+**S3**: Always returns `-1` (permanent) because expiration is stored in metadata, not accessible via ListObjectsV2.
+
+**Impact**: Clients cannot determine blob TTL from S3 list results. The `expirationTimeMs` field will be omitted from JSON response (as it is for permanent blobs).
+
+### 14.5 Ordering
+
+**MySQL**: Lexicographic order using MySQL collation (typically `utf8mb4_general_ci`).
+
+**S3**: UTF-8 binary sort order.
+
+**Impact**: For ASCII blob names, ordering is identical. For Unicode blob names, ordering may differ. Example:
+- MySQL: `a`, `A`, `b`, `B` (case-insensitive collation)
+- S3: `A`, `B`, `a`, `b` (binary sort, uppercase first)
+
+### 14.6 Consistency During Migration
+
+During dual-write migration phase:
+- A blob may exist in MySQL but not yet in S3 (or vice versa)
+- List results may differ between backends
+- Use `CompositeNamedBlobDb` verification mode to detect discrepancies
+
+### 14.7 Summary for Client Developers
+
+If your application is migrating from MySQL to S3 backend:
+
+1. **Expect more results**: S3 list may return blobs that MySQL would filter out
+2. **Handle GET failures**: A blob appearing in list doesn't guarantee GET success
+3. **Don't rely on expirationTimeMs**: S3 list always shows `-1` for this field
+4. **Expect timestamp variance**: `modifiedTimeMs` may differ by up to 1 second
+5. **ASCII blob names recommended**: Ordering is only guaranteed identical for ASCII
+
+---
+
+## 15. Open Questions
+
+1. **Large Container Performance**: For containers with millions of objects, S3 list may be slow. Consider pagination limits and client-side handling.
+
+2. **Cleanup Job Implementation**: Who is responsible for implementing the cleanup job that hard-deletes expired and soft-deleted objects from S3?
+
+3. **Migration Verification**: What metrics should be collected during dual-write phase to verify S3 list matches MySQL list (accounting for documented differences)?
+
+4. **Client Communication**: How will existing Ambry clients be notified of the behavioral differences documented in Section 14?
 
 ---
 
