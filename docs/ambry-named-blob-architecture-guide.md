@@ -251,9 +251,7 @@ Content: <blob bytes>
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ NamedBlobPutHandler.handle()                                            │
 │                                                                         │
-│   Two-Phase Commit Pattern:                                             │
-│                                                                         │
-│   Phase 1: Store blob content                                           │
+│   Step 1: Store blob content via Router                                 │
 │   ┌─────────────────────────────────────────────────────────────────┐   │
 │   │ router.putBlob(blobProperties, userMetadata, channel, options)  │   │
 │   │                                                                 │   │
@@ -261,20 +259,41 @@ Content: <blob bytes>
 │   └─────────────────────────────────────────────────────────────────┘   │
 │                               │                                         │
 │                               ▼                                         │
-│   Phase 2: Store name→ID mapping                                        │
+│   Step 2: Convert ID (triggers metadata storage)                        │
 │   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │ namedBlobDb.put(NamedBlobRecord, NamedBlobState.IN_PROGRESS)    │   │
+│   │ idConverter.convert(restRequest, blobId, blobProperties)        │   │
 │   │                                                                 │   │
-│   │ Record contains:                                                │   │
-│   │ • accountName, containerName, blobName                          │   │
-│   │ • blobId (from router.putBlob result)                           │   │
-│   │ • expirationTimeMs, blobSize                                    │   │
+│   │ NOTE: IdConverter internally calls namedBlobDb.put()            │   │
+│   │ See AmbryIdConverterFactory.java:226-230                        │   │
 │   └─────────────────────────────────────────────────────────────────┘   │
-│                               │                                         │
-│                               ▼                                         │
-│   Phase 3: Finalize (mark as READY)                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ AmbryIdConverter.convertId()                  [AmbryIdConverterFactory] │
+│                                                                         │
+│   State Selection Logic (line 221-225):                                 │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │ NamedBlobState state = NamedBlobState.READY;  // DEFAULT        │   │
+│   │ if (blobProperties.getTimeToLiveInSeconds() == Infinite_Time) { │   │
+│   │     // Only permanent blobs use two-phase commit                │   │
+│   │     state = NamedBlobState.IN_PROGRESS;                         │   │
+│   │ }                                                               │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│   Metadata Storage (line 226-230):                                      │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │ namedBlobDb.put(record, state, isUpsert)                        │   │
+│   │                                                                 │   │
+│   │ • TTL blobs: stored as READY immediately (single phase)         │   │
+│   │ • Permanent blobs: stored as IN_PROGRESS (two-phase)            │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│   [Permanent blobs only] Phase 2: Finalize after TTL update             │
 │   ┌─────────────────────────────────────────────────────────────────┐   │
 │   │ namedBlobDb.updateBlobTtlAndStateToReady(record)                │   │
+│   │                                                                 │   │
+│   │ Called from routerTtlUpdateCallback after router.updateBlobTtl()│   │
 │   └─────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -385,13 +404,45 @@ DELETE /named/{account}/{container}/{blobName}
 ```
 
 **S3 Migration Points**:
-1. `NamedBlobDb.delete()` - Update S3 object metadata OR delete object
-2. `Router.deleteBlob()` - S3 DeleteObject (if hard delete)
+1. `NamedBlobDb.delete()` - Update S3 object metadata (soft delete)
+2. `Router.deleteBlob()` - S3 DeleteObject (hard delete, if used)
 
-**S3 Consideration**: S3 doesn't have native soft delete. Options:
-- Store `deleted_ts` in metadata (matches MySQL behavior)
-- Use S3 versioning with delete markers
-- Immediate hard delete (behavior change)
+**S3 Soft Delete Implementation**:
+
+S3 doesn't have native soft delete. **Decision**: Use metadata update via copy-replace pattern.
+
+When `S3NamedBlobDb.delete()` is called:
+1. **Read** current object metadata via HeadObject
+2. **Copy** object to itself with updated metadata (`x-amz-meta-deleted-ts` = current time)
+3. **No actual deletion** - object remains but is filtered from list results
+
+```java
+public CompletableFuture<DeleteResult> delete(
+        String accountName, String containerName, String blobName) {
+    return CompletableFuture.supplyAsync(() -> {
+        String s3Key = buildS3Key(accountName, containerName, blobName);
+
+        // Get current metadata
+        HeadObjectResponse head = s3Client.headObject(
+            HeadObjectRequest.builder().bucket(bucket).key(s3Key).build());
+
+        Map<String, String> newMetadata = new HashMap<>(head.metadata());
+        newMetadata.put("deleted-ts", String.valueOf(System.currentTimeMillis()));
+
+        // Copy object to itself with new metadata
+        s3Client.copyObject(CopyObjectRequest.builder()
+            .sourceBucket(bucket).sourceKey(s3Key)
+            .destinationBucket(bucket).destinationKey(s3Key)
+            .metadata(newMetadata)
+            .metadataDirective(MetadataDirective.REPLACE)
+            .build());
+
+        return new DeleteResult(List.of(head.metadata().get("blob-id")));
+    });
+}
+```
+
+**Rationale**: Matches MySQL soft delete semantics. Allows potential "undelete" by clearing `deleted-ts` metadata.
 
 ---
 

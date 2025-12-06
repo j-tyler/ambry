@@ -174,7 +174,27 @@ ListObjectsV2Request.builder()
 101/501/images/photo.jpg
 ```
 
-### 3.2 Rationale
+### 3.2 Decision: Use IDs, Not Names
+
+**Decision**: Use numeric `accountId` and `containerId` (shorts) instead of string names.
+
+**Rationale**:
+1. **MySQL Consistency**: The MySQL schema uses `account_id` (short) and `container_id` (short) as the primary key components. Using IDs maintains consistency.
+
+2. **Name Changes**: Account/container names can theoretically change without affecting the underlying ID. Using IDs avoids key migration if names change.
+
+3. **Key Length**: IDs are shorter than names (max 5 digits vs. potentially long strings), leaving more space for blob names within S3's 1024-byte key limit.
+
+4. **Lookup Direction**: The `list()` method receives `accountName` and `containerName` as parameters. Use `AccountService` to resolve these to IDs before constructing S3 keys:
+   ```java
+   Account account = accountService.getAccountByName(accountName);
+   Container container = account.getContainerByName(containerName);
+   short accountId = account.getId();
+   short containerId = container.getId();
+   String s3Prefix = accountId + "/" + containerId + "/";
+   ```
+
+### 3.3 Rationale for Key Structure
 
 1. **Prefix Filtering**: S3 `ListObjectsV2` prefix parameter maps directly to `{accountId}/{containerId}/{blobNamePrefix}`
 
@@ -184,7 +204,7 @@ ListObjectsV2Request.builder()
 
 4. **No Encoding Required**: Blob names are used as-is (S3 keys support UTF-8)
 
-### 3.3 Alternatives Considered
+### 3.4 Alternatives Considered
 
 #### Alternative A: Include Metadata in Key
 
@@ -226,9 +246,25 @@ Each S3 object must store the following user metadata:
 | `x-amz-meta-blob-id` | String | `NamedBlobRecord.blobId` | Ambry blob ID (Base64URL encoded) |
 | `x-amz-meta-version` | String (long) | `NamedBlobRecord.version` | Named blob version number |
 | `x-amz-meta-blob-state` | String (int) | `NamedBlobState.ordinal()` | 0=IN_PROGRESS, 1=READY |
-| `x-amz-meta-deleted-ts` | String (long) | Deletion timestamp | Epoch millis, or empty if not deleted |
-| `x-amz-meta-expiration-ms` | String (long) | `NamedBlobRecord.expirationTimeMs` | Epoch millis, or "-1" for permanent |
+| `x-amz-meta-deleted-ts` | String (long) | Soft delete timestamp | Epoch millis when blob was deleted, empty if active |
+| `x-amz-meta-expiration-ms` | String (long) | TTL expiration | Epoch millis when blob expires, or "-1" for permanent |
 | `x-amz-meta-modified-ms` | String (long) | `NamedBlobRecord.modifiedTimeMs` | Epoch millis (see Section 5.1) |
+
+**Important - MySQL `deleted_ts` Column Dual-Use**:
+
+In MySQL, the `deleted_ts` column serves **two distinct purposes**:
+1. **TTL Expiration**: When a blob is created with a TTL, `deleted_ts` stores the future timestamp when the blob expires
+2. **Soft Delete**: When a blob is explicitly deleted, `deleted_ts` is set to the deletion time
+
+The MySQL query filters both cases with: `deleted_ts IS NULL OR deleted_ts > UTC_TIMESTAMP()`
+- `NULL` means permanent blob that hasn't been deleted
+- Future timestamp means either TTL expiration or scheduled deletion
+
+**S3 Implementation Decision**: Store these as **separate metadata fields**:
+- `x-amz-meta-expiration-ms`: The original TTL expiration (from blob creation)
+- `x-amz-meta-deleted-ts`: The soft delete timestamp (only set when DELETE is called)
+
+This separation allows S3NamedBlobDb to correctly filter blobs by checking both conditions independently.
 
 ### 4.2 Metadata Example
 
@@ -266,6 +302,43 @@ The `blobSize` field can be obtained directly from S3 `ListObjectsV2` response (
 **S3**: Has native versioning, but semantics differ.
 
 **Decision**: Store Ambry version in metadata. Do not rely on S3 versioning for this purpose.
+
+### 5.2.1 Overwrite Handling (Same Blob Name PUT)
+
+When a blob is PUT with the same name as an existing blob:
+
+**MySQL Behavior**:
+- New row is inserted with a higher `version` value
+- Old version remains in the database but is excluded from queries by the `MAX(version)` subquery
+- List returns only the latest version
+
+**S3 Implementation Decision**:
+- **Option A (Recommended)**: Overwrite the existing S3 object with new content and metadata
+  - Simpler implementation
+  - No orphaned objects
+  - Matches S3 native behavior
+  - Version number in metadata always reflects the "current" version
+
+- **Option B**: Use S3 versioning to maintain history
+  - Requires S3 bucket versioning enabled
+  - More complex list filtering (must filter by latest version)
+  - Higher storage costs
+
+**Decision**: Use **Option A** (overwrite). The `list()` operation returns only the current version, so maintaining version history in S3 is unnecessary for API compatibility. Version history in MySQL is a side-effect of the insert-only schema, not a required feature.
+
+**Implication**: During migration, if an implementer needs to verify version matching:
+```java
+// In CompositeNamedBlobDb verification
+NamedBlobRecord mysqlRecord = mysqlDb.get(account, container, blobName).join();
+NamedBlobRecord s3Record = s3Db.get(account, container, blobName).join();
+
+// Version may differ if writes happened only to one backend
+// This is expected during migration
+if (mysqlRecord.getVersion() != s3Record.getVersion()) {
+    log.warn("Version mismatch for {}: mysql={}, s3={}",
+        blobName, mysqlRecord.getVersion(), s3Record.getVersion());
+}
+```
 
 ### 5.3 Null Expiration
 
@@ -337,12 +410,23 @@ public CompletableFuture<Page<NamedBlobRecord>> list(
                     continue;
                 }
 
-                // Filter: not deleted or deletion in future
+                long now = System.currentTimeMillis();
+
+                // Filter: check TTL expiration (x-amz-meta-expiration-ms)
+                String expirationStr = metadata.get("expiration-ms");
+                if (expirationStr != null && !expirationStr.isEmpty() && !"-1".equals(expirationStr)) {
+                    long expirationMs = Long.parseLong(expirationStr);
+                    if (expirationMs <= now) {
+                        continue;  // Blob has expired
+                    }
+                }
+
+                // Filter: check soft delete (x-amz-meta-deleted-ts)
                 String deletedTsStr = metadata.get("deleted-ts");
                 if (deletedTsStr != null && !deletedTsStr.isEmpty()) {
                     long deletedTs = Long.parseLong(deletedTsStr);
-                    if (deletedTs <= System.currentTimeMillis()) {
-                        continue;
+                    if (deletedTs <= now) {
+                        continue;  // Blob has been soft-deleted
                     }
                 }
 
@@ -387,6 +471,56 @@ public CompletableFuture<Page<NamedBlobRecord>> list(
 **Rejected**: S3 Select does not support filtering by tags during list operations.[^4]
 
 [^4]: S3 Object Tags can be used with S3 Inventory for offline filtering, but not for real-time list operations.
+
+### 6.4 HeadObject Parallelization Strategy
+
+**Decision**: Use parallel async HeadObject calls with bounded concurrency.
+
+**Implementation**:
+```java
+private static final int HEAD_OBJECT_CONCURRENCY = 50;  // Max parallel HeadObject calls
+
+private CompletableFuture<List<NamedBlobRecord>> fetchAndFilterBatch(
+        List<S3Object> s3Objects, String accountName, String containerName) {
+
+    ExecutorService executor = Executors.newFixedThreadPool(HEAD_OBJECT_CONCURRENCY);
+
+    List<CompletableFuture<Optional<NamedBlobRecord>>> futures = s3Objects.stream()
+        .map(s3Obj -> CompletableFuture.supplyAsync(() -> {
+            try {
+                HeadObjectResponse head = s3Client.headObject(
+                    HeadObjectRequest.builder()
+                        .bucket(bucket)
+                        .key(s3Obj.key())
+                        .build());
+
+                Map<String, String> metadata = head.metadata();
+                if (passesFilters(metadata)) {
+                    return Optional.of(buildRecordFromS3(accountName, containerName, s3Obj, metadata));
+                }
+                return Optional.<NamedBlobRecord>empty();
+            } catch (NoSuchKeyException e) {
+                // Object deleted between list and head - skip
+                return Optional.<NamedBlobRecord>empty();
+            }
+        }, executor))
+        .collect(Collectors.toList());
+
+    return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+        .thenApply(v -> futures.stream()
+            .map(CompletableFuture::join)
+            .filter(Optional::isPresent)
+            .map(Optional::get)
+            .sorted(Comparator.comparing(NamedBlobRecord::getBlobName))  // Restore order
+            .collect(Collectors.toList()));
+}
+```
+
+**Key Points**:
+1. **Bounded concurrency**: Limit to 50 parallel calls to avoid overwhelming S3 or exhausting connections
+2. **Async completion**: Use `CompletableFuture.allOf()` to wait for all HeadObject calls
+3. **Handle race conditions**: Objects may be deleted between ListObjectsV2 and HeadObject
+4. **Restore ordering**: Parallel execution loses ordering; sort results by blob name
 
 ---
 
@@ -459,11 +593,13 @@ Each list entry returns a `NamedBlobRecord` with:
 | `containerName` | String | Input parameter | Input parameter |
 | `blobName` | String | `blob_name` column | Key suffix after `{acctId}/{contId}/` |
 | `blobId` | String | `blob_id` (Base64) | `x-amz-meta-blob-id` |
-| `expirationTimeMs` | long | `deleted_ts` column | `x-amz-meta-expiration-ms` |
+| `expirationTimeMs` | long | `deleted_ts` column (see note below) | `x-amz-meta-expiration-ms` |
 | `version` | long | `version` column | `x-amz-meta-version` |
 | `blobSize` | long | `blob_size` column | `S3Object.size()` |
 | `modifiedTimeMs` | long | `modified_ts` column | `x-amz-meta-modified-ms` |
-| `isDirectory` | boolean | `false` (hardcoded) | `false` (hardcoded)[^5] |
+| `isDirectory` | boolean | `false` (hardcoded) | `false` (hardcoded)[^5]
+
+**Note on expirationTimeMs**: In MySQL, this is read from `deleted_ts` which stores both TTL expiration and soft delete times (see Section 4.1). In S3, we use the separate `x-amz-meta-expiration-ms` field for clarity.
 
 [^5]: Directory entries (`isDirectory=true`) are created by `NamedBlobListHandler.extractDirectory()`, not by `NamedBlobDb.list()`. The database layer always returns `isDirectory=false`.
 
@@ -588,7 +724,85 @@ public class CompositeNamedBlobDb implements NamedBlobDb {
 
 ---
 
-## 11. Migration Phases
+## 11. S3 Bucket Configuration
+
+### 11.1 Required Bucket Settings
+
+| Setting | Value | Rationale |
+|---------|-------|-----------|
+| **Versioning** | Disabled | Not needed (we track version in metadata); reduces storage costs |
+| **Object Lock** | Disabled | Ambry handles deletion/TTL logic; object lock would interfere |
+| **Default Encryption** | SSE-S3 or SSE-KMS | Encrypt data at rest |
+| **Block Public Access** | All blocked | Security best practice |
+| **Access Logging** | Enabled (recommended) | Audit trail for troubleshooting |
+
+### 11.2 Bucket Naming Convention
+
+**Recommendation**: `ambry-namedblob-{environment}-{region}`
+
+**Example**: `ambry-namedblob-prod-us-west-2`
+
+### 11.3 Lifecycle Rules
+
+**Decision**: Do NOT use S3 lifecycle rules for TTL expiration.
+
+**Rationale**:
+- Ambry TTL is tracked in metadata (`x-amz-meta-expiration-ms`)
+- S3 lifecycle operates on object creation date, not custom metadata
+- List filtering already excludes expired blobs
+- A separate cleanup job should be implemented to hard-delete expired objects
+
+**Recommended Cleanup Job**:
+```java
+// Run periodically (e.g., daily) to hard-delete expired/soft-deleted objects
+public void cleanupExpiredObjects() {
+    ListObjectsV2Response response = s3Client.listObjectsV2(...);
+    for (S3Object obj : response.contents()) {
+        HeadObjectResponse head = s3Client.headObject(...);
+        Map<String, String> metadata = head.metadata();
+
+        long now = System.currentTimeMillis();
+        long expiration = parseLong(metadata.get("expiration-ms"), -1);
+        long deletedTs = parseLong(metadata.get("deleted-ts"), Long.MAX_VALUE);
+
+        // Hard delete if expired more than 7 days ago OR soft-deleted more than 30 days ago
+        if ((expiration > 0 && expiration < now - DAYS_7) ||
+            (deletedTs < now - DAYS_30)) {
+            s3Client.deleteObject(...);
+        }
+    }
+}
+```
+
+### 11.4 IAM Permissions Required
+
+The S3NamedBlobDb implementation requires the following S3 permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:HeadObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::ambry-namedblob-*",
+        "arn:aws:s3:::ambry-namedblob-*/*"
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## 12. Migration Phases
 
 | Phase | List Source | Verification | Notes |
 |-------|-------------|--------------|-------|
@@ -599,7 +813,89 @@ public class CompositeNamedBlobDb implements NamedBlobDb {
 
 ---
 
-## 12. Open Questions
+## 13. Error Handling
+
+### 13.1 Missing Metadata Behavior
+
+**Scenario**: An S3 object exists but is missing required metadata fields (e.g., `x-amz-meta-blob-id`).
+
+This can occur due to:
+- Objects created outside S3NamedBlobDb (e.g., manual upload)
+- Partial write failures during PUT
+- Metadata corruption
+
+**Decision**: Skip objects with missing required metadata and log a warning.
+
+**Implementation**:
+```java
+private Optional<NamedBlobRecord> buildRecordFromS3(
+        String accountName, String containerName,
+        S3Object s3Obj, Map<String, String> metadata) {
+
+    String blobId = metadata.get("blob-id");
+    String versionStr = metadata.get("version");
+
+    // Required fields
+    if (blobId == null || blobId.isEmpty()) {
+        log.warn("Skipping S3 object {} - missing blob-id metadata", s3Obj.key());
+        metrics.missingMetadataCount.inc();
+        return Optional.empty();
+    }
+
+    if (versionStr == null || versionStr.isEmpty()) {
+        log.warn("Skipping S3 object {} - missing version metadata", s3Obj.key());
+        metrics.missingMetadataCount.inc();
+        return Optional.empty();
+    }
+
+    // Optional fields with defaults
+    String expirationStr = metadata.getOrDefault("expiration-ms", "-1");
+    String modifiedStr = metadata.getOrDefault("modified-ms",
+        String.valueOf(s3Obj.lastModified().toEpochMilli()));
+
+    try {
+        return Optional.of(new NamedBlobRecord(
+            accountName, containerName,
+            extractBlobName(s3Obj.key()),
+            blobId,
+            Long.parseLong(expirationStr),
+            Long.parseLong(versionStr),
+            s3Obj.size(),
+            Long.parseLong(modifiedStr),
+            false  // isDirectory
+        ));
+    } catch (NumberFormatException e) {
+        log.warn("Skipping S3 object {} - malformed metadata: {}",
+            s3Obj.key(), e.getMessage());
+        metrics.malformedMetadataCount.inc();
+        return Optional.empty();
+    }
+}
+```
+
+**Behavior Summary**:
+
+| Missing Field | Behavior |
+|---------------|----------|
+| `blob-id` | Skip object, log warning |
+| `version` | Skip object, log warning |
+| `blob-state` | Assume IN_PROGRESS (ordinal 0), filter out |
+| `expiration-ms` | Default to -1 (permanent) |
+| `deleted-ts` | Default to empty (not deleted) |
+| `modified-ms` | Use S3 LastModified |
+
+### 13.2 S3 API Errors
+
+| Error | Handling |
+|-------|----------|
+| `NoSuchKey` (404) | Object deleted between list and head - skip silently |
+| `AccessDenied` (403) | Log error, fail the request (permissions issue) |
+| `ServiceUnavailable` (503) | Retry with exponential backoff |
+| `SlowDown` (503) | Reduce parallelism, retry with backoff |
+
+---
+
+## 14. Open Questions
 
 1. **HeadObject Rate Limiting**: What is the expected QPS for list operations? May need to implement rate limiting or caching for HeadObject calls.
 
