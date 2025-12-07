@@ -277,17 +277,17 @@ MySQL stores and returns `modifiedTimeMs` with **millisecond precision**:
 }
 ```
 
-### Why S3 Can't Easily Support This
+### The Problem
 
 S3's `LastModified` field has only **second precision**. The milliseconds are always `.000`.
 
-We store the original millisecond timestamp in metadata (`x-amz-meta-modified-ms`), but this is not available in `ListObjectsV2`.
+If we use S3's `LastModified` directly, `modifiedTimeMs` values will lose millisecond precision.
 
 ### Options
 
-#### Option A: Use S3 LastModified (Second Precision)
+#### Option A: Accept Loss of Precision
 
-**Description**: Return S3's `LastModified` converted to milliseconds. Values will always end in `000`.
+**Description**: Use S3's `LastModified` converted to milliseconds. Values will always end in `000`.
 
 **API Change**:
 - `modifiedTimeMs` values will always end in `000`
@@ -295,42 +295,34 @@ We store the original millisecond timestamp in metadata (`x-amz-meta-modified-ms
 
 **Pros**:
 - Simple implementation
-- No additional API calls
+- No additional storage or API calls
 
 **Cons**:
 - Precision loss from milliseconds to seconds
 
-#### Option B: Fetch True Timestamp from Metadata
+#### Option B: Store Timestamp in S3 User Metadata
 
-**Description**: Call HeadObject for each listed object to retrieve `x-amz-meta-modified-ms`.
+**Description**: Store the original millisecond timestamp in S3 user metadata (e.g., `x-amz-meta-modified-ms`).
 
-**Pros**:
-- Millisecond precision preserved
-
-**Cons**:
-- 1000+ additional API calls per page
-- Unacceptable latency
-
-#### Option C: Accept and Document Precision Difference
-
-**Description**: Same as Option A, but explicitly document that timestamp precision differs between backends.
-
-**Migration verification**: Compare timestamps at second precision only (truncate milliseconds).
+**Implications**:
+- User metadata is NOT returned by `ListObjectsV2`
+- To return millisecond precision in list, would need `HeadObject` per object (expensive)
+- Metadata can be read when fetching individual objects via `GET` or `HEAD`
 
 **Pros**:
-- Clear expectations
-- Simple implementation
+- Millisecond precision preserved in S3
+- Can be retrieved for individual blobs
 
 **Cons**:
-- Same as Option A
+- Cannot efficiently return in list results
+- HeadObject per listed object is too expensive
 
 ### Team Decision Required
 
-**Question**: Is millisecond timestamp precision required?
+**Question**: Is millisecond timestamp precision required in list results?
 
-- [ ] **Option A**: Use S3 second precision, accept differences
-- [ ] **Option B**: Fetch metadata for exact timestamps (not recommended)
-- [ ] **Option C**: Accept and explicitly document precision difference
+- [ ] **Option A**: Accept loss of precision (use S3 `LastModified`)
+- [ ] **Option B**: Store in metadata (precision available for individual blobs, not list)
 - [ ] Other: _____________
 
 ---
