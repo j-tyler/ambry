@@ -128,7 +128,7 @@ GET /named/{accountName}/{containerName}?prefix={prefix}
 GET /s3/{accountName}/{containerName}?list-type=2
 ```
 
-MySQL list returns `expirationTimeMs` for each blob, allowing clients to see when blobs will expire:
+MySQL list returns `expirationTimeMs` for each blob:
 
 ```json
 {
@@ -137,8 +137,6 @@ MySQL list returns `expirationTimeMs` for each blob, allowing clients to see whe
   "blobSize": 1024
 }
 ```
-
-Clients use this to display TTL information or make decisions about blob lifecycle.
 
 ### Why S3 Can't Easily Support This
 
@@ -150,17 +148,16 @@ Expiration time is stored in S3 user metadata (`x-amz-meta-expiration-ms`), whic
 
 **Description**: S3 list always returns `expirationTimeMs = -1`, which is omitted from JSON per existing behavior.
 
-**Client Impact**:
-- Clients cannot determine blob TTL from list results
-- All blobs appear as "permanent" in list
-- Clients must call `GET` or `HEAD` on individual blobs to see true expiration
+**API Change**:
+- `expirationTimeMs` field will always be `-1` (omitted from JSON response)
+- To retrieve true expiration, call `GET` or `HEAD` on individual blobs
 
 **Pros**:
 - Simple implementation
 - No additional API calls
 
 **Cons**:
-- Loss of functionality for clients that rely on expiration in list
+- `expirationTimeMs` no longer available in list response
 
 #### Option B: Fetch Expiration for First N Results
 
@@ -172,7 +169,6 @@ Expiration time is stored in S3 user metadata (`x-amz-meta-expiration-ms`), whic
 
 **Cons**:
 - Inconsistent behavior within same response
-- Confusing UX
 - Arbitrary cutoff
 
 #### Option C: Add Expiration Lookup Endpoint
@@ -235,18 +231,16 @@ We store the original millisecond timestamp in metadata (`x-amz-meta-modified-ms
 
 **Description**: Return S3's `LastModified` converted to milliseconds. Values will always end in `000`.
 
-**Client Impact**:
-- `modifiedTimeMs` may differ by up to 999ms from MySQL
-- Sorting by modification time is still correct (second-level)
-- Clients doing exact timestamp matching will see differences
+**API Change**:
+- `modifiedTimeMs` values will always end in `000`
+- Values may differ by up to 999ms from MySQL for the same blob
 
 **Pros**:
 - Simple implementation
 - No additional API calls
 
 **Cons**:
-- Precision loss
-- Verification during migration will show timestamp "mismatches"
+- Precision loss from milliseconds to seconds
 
 #### Option B: Fetch True Timestamp from Metadata
 
@@ -270,7 +264,7 @@ We store the original millisecond timestamp in metadata (`x-amz-meta-modified-ms
 - Simple implementation
 
 **Cons**:
-- Clients with strict timestamp requirements may be affected
+- Same as Option A
 
 ### Team Decision Required
 
