@@ -796,13 +796,15 @@ This section documents all known behavioral differences between `S3NamedBlobDb.l
 
 ### 14.5 Ordering
 
-**MySQL**: Lexicographic order using MySQL collation (typically `utf8mb4_general_ci`).
+**MySQL**: Lexicographic order using `utf8mb4_bin` collation (binary/case-sensitive).
 
 **S3**: UTF-8 binary sort order.
 
-**Impact**: For ASCII blob names, ordering is identical. For Unicode blob names, ordering may differ. Example:
-- MySQL: `a`, `A`, `b`, `B` (case-insensitive collation)
-- S3: `A`, `B`, `a`, `b` (binary sort, uppercase first)
+**Impact**: Ordering is **identical** for both MySQL and S3. Both use binary/case-sensitive ordering. Example:
+- MySQL: `A`, `B`, `a`, `b` (binary collation)
+- S3: `A`, `B`, `a`, `b` (binary sort)
+
+No ordering differences expected.
 
 ### 14.6 Consistency During Migration
 
@@ -815,15 +817,17 @@ During dual-write migration phase:
 
 If your application is migrating from MySQL to S3 backend:
 
-1. **Expect more results**: S3 list may return blobs that MySQL would filter out
+1. **Expect more results**: S3 list may return blobs that MySQL would filter out (IN_PROGRESS, soft-deleted, expired)
 2. **Handle GET failures**: A blob appearing in list doesn't guarantee GET success
-3. **Don't rely on expirationTimeMs**: S3 list always shows `-1` for this field
+3. **Don't rely on expirationTimeMs**: S3 list always returns `-1` (field omitted from response)
 4. **Expect timestamp variance**: `modifiedTimeMs` may differ by up to 1 second
-5. **ASCII blob names recommended**: Ordering is only guaranteed identical for ASCII
+5. **Ordering is preserved**: Both MySQL and S3 use binary/case-sensitive ordering
 
 ---
 
 ## 15. Open Questions
+
+### 15.1 Implementation Questions
 
 1. **Large Container Performance**: For containers with millions of objects, S3 list may be slow. Consider pagination limits and client-side handling.
 
@@ -832,6 +836,222 @@ If your application is migrating from MySQL to S3 backend:
 3. **Migration Verification**: What metrics should be collected during dual-write phase to verify S3 list matches MySQL list (accounting for documented differences)?
 
 4. **Client Communication**: How will existing Ambry clients be notified of the behavioral differences documented in Section 14?
+
+### 15.2 Edge Case Behavior Questions
+
+The following questions must be answered to ensure S3 implementation matches MySQL behavior where possible:
+
+#### Q1: Empty String vs Null Prefix
+
+**Question**: Is `prefix=""` equivalent to `prefix=null`? Should both return all blobs?
+
+**Answer from codebase** (`MySqlNamedBlobDb.java:622`):
+```java
+String queryStatement = blobNamePrefix == null ? LIST_ALL_QUERY : LIST_WITH_PREFIX_SQL;
+```
+
+- `null` → Uses `LIST_ALL_QUERY` (no LIKE clause)
+- `""` → Uses `LIST_WITH_PREFIX_SQL` with pattern `"%"` (matches all)
+
+**S3 Implementation Options**:
+- **Option A**: Treat `""` same as `null` - use empty prefix in ListObjectsV2
+- **Option B**: Treat `""` literally - prefix with empty string (same result in S3)
+
+**Decision**: **Option A** - both `null` and `""` result in listing all blobs. Functionally equivalent.
+
+---
+
+#### Q2: Case Sensitivity
+
+**Question**: Is blob name matching case-sensitive? If MySQL uses case-insensitive collation and S3 is case-sensitive, is this a breaking change?
+
+**Answer from codebase** (`NamedBlobsSchema.ddl:17`):
+```sql
+COLLATE=utf8mb4_bin
+```
+
+MySQL uses **binary collation** which is **case-sensitive**. S3 is also case-sensitive.
+
+**Decision**: No breaking change. Both MySQL and S3 are case-sensitive. `Foo.txt` and `foo.txt` are different blobs.
+
+---
+
+#### Q3: Special Characters in Blob Names
+
+**Question**: What characters are valid in blob names? Can they contain `/`, `\0`, or other special characters?
+
+**Answer from codebase** (`NamedBlobsSchema.ddl:5`):
+```sql
+blob_name varchar(350) NOT NULL
+```
+
+MySQL `varchar` with `utf8mb4` charset accepts any UTF-8 characters except null byte (`\0`).
+
+**S3 Restrictions**: S3 keys can contain any UTF-8 characters. Some characters require URL encoding in the API but are stored as-is.
+
+**S3 Implementation Options**:
+- **Option A**: Accept same characters as MySQL - any UTF-8 except `\0`
+- **Option B**: Add validation to reject S3-problematic characters (none significant)
+
+**Decision**: **Option A** - Accept any valid UTF-8 characters. The `/` character is valid and commonly used for virtual directories.
+
+---
+
+#### Q4: Maximum Blob Name Length
+
+**Question**: What is the maximum blob name length?
+
+**Answer from codebase** (`NamedBlobsSchema.ddl:5`):
+```sql
+blob_name varchar(350) NOT NULL
+```
+
+- **MySQL**: 350 characters (not bytes)
+- **S3**: 1024 bytes total key length, minus `{accountId}/{containerId}/` prefix (~12 bytes max)
+
+**S3 Implementation Options**:
+- **Option A**: Enforce 350-character limit (MySQL compatibility)
+- **Option B**: Allow up to ~1012 bytes (S3 limit minus prefix)
+
+**Decision**: **Option A** - Enforce 350-character limit to match MySQL. Blobs created in MySQL must be retrievable from S3.
+
+---
+
+#### Q5: Account/Container Not Found
+
+**Question**: If account or container doesn't exist, what should list return?
+
+**Answer from codebase** (`AccountAndContainerInjector.java`):
+- Invalid account → `RestServiceErrorCode.InvalidAccount` (HTTP 400)
+- Invalid container → `RestServiceErrorCode.InvalidContainer` (HTTP 400)
+
+The validation happens in `accountAndContainerInjector.injectAccountContainerForNamedBlob()` before reaching `NamedBlobDb.list()`.
+
+**S3 Implementation Options**:
+- **Option A**: Return error (match current behavior)
+- **Option B**: Return empty page (S3 would return empty for non-existent prefix)
+
+**Decision**: **Option A** - The handler validates account/container before calling `list()`. S3NamedBlobDb can assume valid account/container. If validation is bypassed, return empty page.
+
+---
+
+#### Q6: Invalid Page Token
+
+**Question**: If a client passes a malformed or non-existent page token, what happens?
+
+**Answer from codebase** (`MySqlNamedBlobDb.java:678-679`):
+```java
+statement.setString(3, pageToken);
+statement.setString(4, pageToken);
+// Used in: WHERE blob_name >= ?
+```
+
+Page token is used directly in `WHERE blob_name >= ?`. A non-existent token simply starts listing from that lexicographic position.
+
+**S3 Implementation Options**:
+- **Option A**: Use token as `StartAfter` parameter (same behavior)
+- **Option B**: Validate token exists before using
+
+**Decision**: **Option A** - Use token directly in `StartAfter`. Invalid/non-existent tokens start listing from that position. This matches MySQL behavior.
+
+---
+
+#### Q7: maxKeys Edge Cases
+
+**Question**: What happens when `maxKeys=0`, `maxKeys=null`, `maxKeys<0`, or `maxKeys>10000`?
+
+**Answer from codebase**:
+- `FrontendConfig.java:385`: `getIntInRange(LIST_MAX_RESULTS, DEFAULT_MAX_KEY_VALUE, 1, Integer.MAX_VALUE)`
+- `RestUtils.java:74`: `DEFAULT_MAX_KEY_VALUE = 1000`
+- `MySqlNamedBlobDb.java:623`: `maxKeys == null ? config.listMaxResults : maxKeys`
+
+Client-provided `maxKeys` is parsed as integer but not bounds-checked at handler level.
+
+**S3 Implementation Options**:
+- **Option A**: Accept any positive integer, cap at S3's max (1000 per request), paginate internally
+- **Option B**: Validate and reject invalid values
+
+**Decision**: **Option A** - Accept any integer. Use default (1000) for `null`. For values ≤ 0, use default. For large values, internally paginate S3 requests (S3 max is 1000 per ListObjectsV2).
+
+---
+
+#### Q8: Concurrent Modification During Pagination
+
+**Question**: If blobs are created/deleted between paginated list calls, what consistency guarantees exist?
+
+**Answer from codebase**: No explicit consistency guarantees documented.
+
+**MySQL behavior**: Each page is a separate query. Blobs created after page 1 may appear in page 2 if their name sorts after the token. Deleted blobs won't appear.
+
+**S3 behavior**: S3 provides strong read-after-write consistency. Same behavior as MySQL.
+
+**S3 Implementation Options**:
+- **Option A**: Document "no consistency guarantees during pagination"
+- **Option B**: Implement snapshot isolation (complex, not in MySQL)
+
+**Decision**: **Option A** - No special consistency guarantees. Clients should expect that concurrent modifications may result in a blob appearing in multiple pages or not appearing at all. This matches MySQL behavior.
+
+---
+
+#### Q9: Utils.Infinite_Time Value
+
+**Question**: What is the actual value of `Utils.Infinite_Time`?
+
+**Answer from codebase** (`Utils.java`):
+```java
+public static final long Infinite_Time = -1;
+```
+
+**Decision**: Use `-1` to represent "no expiration" / "permanent" in S3NamedBlobDb.
+
+---
+
+#### Q10: Future Soft Delete Timestamp
+
+**Question**: Can a blob be soft-deleted with a future `deleted_ts` (scheduled deletion)? If so, should it appear in list until that time?
+
+**Answer from codebase** (`LIST_ALL_QUERY`):
+```sql
+AND (deleted_ts IS NULL OR deleted_ts > UTC_TIMESTAMP())
+```
+
+A blob with `deleted_ts` in the future **will appear** in list results. It becomes invisible only after that timestamp passes.
+
+**S3 Implementation**: This is a filtering difference. S3 list cannot filter by metadata, so:
+- Blobs with future `deleted_ts` will appear (correct, matches MySQL)
+- Blobs with past `deleted_ts` will also appear (different from MySQL)
+
+**Decision**: Documented in Section 14.1 as a behavioral difference.
+
+---
+
+#### Q11: Response Field Omission Rules
+
+**Question**: Which fields can be omitted from JSON response?
+
+**Answer from codebase** (`NamedBlobListEntry.java:106-114`):
+```java
+public JSONObject toJson() {
+    JSONObject jsonObject = new JSONObject().put(BLOB_NAME_KEY, blobName);
+    if (expirationTimeMs != Utils.Infinite_Time) {
+      jsonObject.put(EXPIRATION_TIME_MS_KEY, expirationTimeMs);
+    }
+    jsonObject.put(BLOB_SIZE_KEY, blobSize);
+    jsonObject.put(MODIFIED_TIME_MS_KEY, modifiedTimeMs);
+    jsonObject.put(IS_DIRECTORY_KEY, isDirectory);
+    return jsonObject;
+}
+```
+
+| Field | Omission Rule |
+|-------|---------------|
+| `blobName` | Always included |
+| `expirationTimeMs` | Omitted if `-1` (permanent) |
+| `blobSize` | Always included |
+| `modifiedTimeMs` | Always included |
+| `isDirectory` | Always included |
+
+**Decision**: Only `expirationTimeMs` is conditionally omitted. Since S3 list always returns `-1` for this field, it will always be omitted from S3 list responses.
 
 ---
 
