@@ -353,14 +353,13 @@ photos/work/doc.pdf
 
 MySQL returns all matching blobs, and `NamedBlobListHandler` performs directory grouping in Java.
 
-### Why S3 Can't Easily Support This
+### S3 Capability
 
 S3 **does** support delimiter natively via `ListObjectsV2` with `delimiter` parameter. It returns `CommonPrefixes` for directories.
 
-However, S3's delimiter behavior may differ in edge cases:
+The question is whether to use S3's native delimiter support or replicate MySQL's Java-based grouping behavior. Potential differences in edge cases:
 - Empty directory markers
 - Blob names with consecutive delimiters (`photos//img.jpg`)
-- Interaction with filtering (which we can't do anyway)
 
 ### Options
 
@@ -526,11 +525,16 @@ AND (deleted_ts IS NULL OR deleted_ts > UTC_TIMESTAMP())
 
 No separate cleanup job needed—expired blobs simply stop appearing in queries.
 
-### Why S3 Can't Easily Support This
+### The Problem
 
-1. **List filtering**: S3 can't filter by expiration metadata (covered in Section 1)
-2. **S3 Lifecycle Rules**: Operate on object age from creation date, NOT custom metadata
-3. **Storage cost**: Expired blobs remain in S3 until explicitly deleted
+In MySQL, expired blobs are automatically excluded from queries via `deleted_ts > NOW()`. No cleanup is needed—they simply stop appearing.
+
+S3 has no equivalent mechanism:
+1. **S3 Lifecycle Rules**: Operate on object age from creation date, NOT custom expiration timestamps
+2. **Storage cost**: Objects remain in S3 until explicitly deleted
+3. **List results**: Expired objects continue appearing in list (if we accept behavioral differences from Section 1)
+
+**Note**: This section depends on decisions from Section 2 (where/whether expiration is stored in S3).
 
 ### Options
 
@@ -538,27 +542,20 @@ No separate cleanup job needed—expired blobs simply stop appearing in queries.
 
 **Description**: Separate background job scans S3 and deletes expired/soft-deleted objects.
 
-```java
-// Pseudo-code for cleanup job
-for each object in bucket:
-    metadata = HeadObject(object)
-    if isExpired(metadata) or isSoftDeleted(metadata):
-        if gracePeriodPassed(metadata):
-            DeleteObject(object)
-```
+**Depends on**: Expiration time being stored somewhere accessible (Section 2, Options B/C/D).
 
 **Parameters to decide**:
 - How often to run? (hourly, daily)
 - Grace period before hard delete? (7 days after expiration?)
-- Should deleted objects be recoverable?
+- How to identify expired objects? (depends on Section 2 decision)
 
 **Pros**:
 - Reduces storage costs
-- Clean S3 bucket
+- Keeps S3 bucket clean
 
 **Cons**:
 - Additional infrastructure to maintain
-- Cost of scanning (HeadObject per object)
+- Cost depends on how expiration is stored
 - Delay between expiration and deletion
 
 #### Option B: Use S3 Lifecycle with Object Tags
@@ -626,12 +623,7 @@ GET /named/{accountName}/{containerName}[?prefix=...&page=...&maxKeys=...&delimi
 GET /s3/{accountName}/{containerName}?list-type=2[&prefix=...&continuation-token=...&max-keys=...&delimiter=...]
 ```
 
-The S3 migration introduces behavioral differences that may affect clients:
-
-1. **More results in list**: IN_PROGRESS, soft-deleted, and expired blobs visible
-2. **Missing expiration info**: `expirationTimeMs` always omitted
-3. **Timestamp precision**: Milliseconds truncated to seconds
-4. **Potential ordering differences**: Unicode edge cases
+Depending on decisions made in Sections 1-6, the S3 migration may introduce behavioral differences. This section addresses how to communicate any such changes to clients.
 
 ### Options
 
@@ -717,35 +709,29 @@ Old `/named/` continues using MySQL indefinitely.
 
 ## Summary of Decisions Needed
 
-| # | Topic | Recommended | Decision |
-|---|-------|-------------|----------|
-| 1 | Internal state filtering | Option A: Accept behavioral differences | ☐ |
-| 2 | Expiration time storage & visibility | TBD (storage + list behavior) | ☐ |
-| 3 | Timestamp precision | Option C: Accept and document | ☐ |
-| 4 | Delimiter handling | Option C: Config flag (start with B) | ☐ |
-| 5 | Version history | Option A: Overwrite, no history | ☐ |
-| 6 | TTL cleanup | Option A: Implement cleanup job | ☐ |
-| 7 | Client communication | Option B or C | ☐ |
+| # | Topic | Options | Decision |
+|---|-------|---------|----------|
+| 1 | Internal state filtering | A: HeadObject filter, B: Change S3 client, C: Accept differences | ☐ |
+| 2 | Expiration time storage | A: Don't store, B: Metadata, C: Tags, D: In key | ☐ |
+| 2b | Expiration in list results | Return -1, or return actual (requires 2D) | ☐ |
+| 3 | Timestamp precision | A: Accept loss, B: Store in metadata | ☐ |
+| 4 | Delimiter handling | A: S3 native, B: Java grouping, C: Config flag | ☐ |
+| 5 | Version history | A: Overwrite, B: S3 versioning, C: Audit log | ☐ |
+| 6 | TTL cleanup | A: Cleanup job, B: Lifecycle+tags, C: No cleanup | ☐ |
+| 7 | Client communication | A: Release notes, B: Migration guide, C: Feature flags, D: Versioned API | ☐ |
 
 ---
 
-## Appendix: Quick Reference
+## Appendix: Potential Behavioral Differences
 
-### Behavioral Differences Summary
+The following differences may occur depending on decisions made above. This table should be updated once decisions are finalized.
 
-| Aspect | MySQL Behavior | S3 Behavior | Breaking Change? |
-|--------|---------------|-------------|------------------|
-| IN_PROGRESS blobs | Hidden | Visible | Yes |
-| Soft-deleted blobs | Hidden | Visible | Yes |
-| Expired blobs | Hidden | Visible | Yes |
-| `expirationTimeMs` | Actual value | Always -1 (omitted) | Yes |
-| `modifiedTimeMs` precision | Milliseconds | Seconds | Minor |
-| Version history | Retained in DB | Overwritten | No (not exposed in list) |
-| Sort order | Binary (case-sensitive) | Binary (case-sensitive) | No |
-
-### Client Compatibility Checklist
-
-Clients should verify they handle these scenarios:
-- [ ] GET after list returns 404 or error (blob was IN_PROGRESS/deleted/expired)
-- [ ] `expirationTimeMs` missing from response (blob appears permanent)
-- [ ] Timestamps may differ by up to 999ms when comparing with other sources
+| Aspect | MySQL Behavior | S3 Behavior (if...) | Depends On |
+|--------|---------------|---------------------|------------|
+| IN_PROGRESS blobs | Hidden | Visible (if Option 1C) | Section 1 |
+| Soft-deleted blobs | Hidden | Visible (if Option 1C) | Section 1 |
+| Expired blobs | Hidden | Visible (if Option 1C) | Section 1 |
+| `expirationTimeMs` | Actual value | -1 (if Options 2A/2B/2C) | Section 2 |
+| `modifiedTimeMs` precision | Milliseconds | Seconds (if Option 3A) | Section 3 |
+| Version history | Retained in DB | Overwritten (if Option 5A) | Section 5 |
+| Sort order | Binary (case-sensitive) | Binary (case-sensitive) | N/A - Same |
