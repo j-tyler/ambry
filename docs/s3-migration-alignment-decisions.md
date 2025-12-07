@@ -138,63 +138,121 @@ MySQL list returns `expirationTimeMs` for each blob:
 }
 ```
 
-### Why S3 Can't Easily Support This
+This value comes from the `deleted_ts` column in MySQL, which stores the expiration timestamp for blobs with TTL.
 
-Expiration time is stored in S3 user metadata (`x-amz-meta-expiration-ms`), which is NOT returned by `ListObjectsV2`. Without calling `HeadObject` per object, we cannot retrieve this value.
+### The Problem
+
+S3's `ListObjectsV2` API returns only:
+- Object key
+- Size
+- LastModified
+- ETag
+- Storage class
+
+There is no built-in field for expiration time. If we want to return `expirationTimeMs` in list results, we need to:
+1. Decide where to store expiration time in S3
+2. Decide how (or whether) to retrieve it during list operations
 
 ### Options
 
-#### Option A: Always Return -1 (Permanent) for Expiration
+#### Option A: Do Not Store Expiration Time in S3
 
-**Description**: S3 list always returns `expirationTimeMs = -1`, which is omitted from JSON per existing behavior.
+**Description**: S3 objects do not contain expiration information. List always returns `expirationTimeMs = -1`.
 
-**API Change**:
+**Implications**:
 - `expirationTimeMs` field will always be `-1` (omitted from JSON response)
-- To retrieve true expiration, call `GET` or `HEAD` on individual blobs
+- Expiration enforcement would need to happen elsewhere (e.g., MySQL remains source of truth for TTL, or a separate tracking system)
 
 **Pros**:
-- Simple implementation
-- No additional API calls
+- Simplest S3 implementation
 
 **Cons**:
-- `expirationTimeMs` no longer available in list response
+- Cannot enforce TTL from S3 alone
+- List behavior differs from MySQL
 
-#### Option B: Fetch Expiration for First N Results
+#### Option B: Store Expiration in S3 User Metadata
 
-**Description**: Call HeadObject for the first N results (e.g., 10) to populate expiration, leave rest as -1.
+**Description**: Store expiration as S3 user metadata (e.g., `x-amz-meta-expiration-ms`).
+
+**Implications**:
+- User metadata is NOT returned by `ListObjectsV2`
+- To return expiration in list, would need `HeadObject` per object (expensive)
+- Metadata can be read when fetching individual objects
 
 **Pros**:
-- Partial expiration visibility
-- Bounded additional latency
+- Expiration data exists in S3
+- Can be retrieved via `GET` or `HEAD` on individual blobs
 
 **Cons**:
-- Inconsistent behavior within same response
-- Arbitrary cutoff
+- Cannot efficiently return in list results
+- HeadObject per listed object is too expensive
 
-#### Option C: Add Expiration Lookup Endpoint
+#### Option C: Store Expiration in S3 Object Tags
 
-**Description**: Create new API endpoint for batch expiration lookup:
+**Description**: Store expiration as an S3 object tag.
 
-```
-POST /named/{account}/{container}/_expiration
-Body: {"blobNames": ["file1.txt", "file2.txt", ...]}
-```
+**Implications**:
+- Tags are also NOT returned by `ListObjectsV2`
+- Tags require separate `GetObjectTagging` call per object
+- Tags are limited to 10 per object
 
 **Pros**:
-- Clients can get expiration when needed
-- List stays fast
+- Tags can be used with S3 Lifecycle rules (limited)
+- Can be retrieved per object
 
 **Cons**:
-- New API to maintain
-- Extra client call required
+- Same retrieval problem as metadata
+- Limited to 10 tags per object
+
+#### Option D: Encode Expiration in Object Key
+
+**Description**: Include expiration timestamp in the S3 key structure.
+
+**Example**: `{accountId}/{containerId}/exp-1704067200000/{blobName}`
+
+**Implications**:
+- Expiration visible in list results (parseable from key)
+- Changing expiration requires copy+delete (new key)
+- Complicates prefix queries
+
+**Pros**:
+- Expiration available in list without additional calls
+
+**Cons**:
+- TTL updates are expensive (copy+delete)
+- More complex key parsing
+- May break prefix-based queries
+
+#### Option E: Accept That List Cannot Return Expiration
+
+**Description**: Store expiration in metadata (Option B), but accept that list returns `-1`. Document as behavioral difference.
+
+**Implications**:
+- List response differs from MySQL
+- Expiration available via `GET`/`HEAD` on individual blobs
+
+**Pros**:
+- Expiration data stored in S3
+- Simple list implementation
+- Individual blob retrieval still has expiration
+
+**Cons**:
+- List behavior differs from MySQL
 
 ### Team Decision Required
 
-**Question**: How important is expiration visibility in list results?
+**Question**: Where should expiration time be stored, and should list return it?
 
-- [ ] **Option A**: Accept that expiration is not visible in S3 list
-- [ ] **Option B**: Partial expiration (first N results)
-- [ ] **Option C**: Add separate batch lookup endpoint
+Storage decision:
+- [ ] **Option A**: Do not store expiration in S3
+- [ ] **Option B**: Store in S3 user metadata
+- [ ] **Option C**: Store in S3 object tags
+- [ ] **Option D**: Encode in object key
+- [ ] Other: _____________
+
+List behavior decision:
+- [ ] List returns `-1` (expiration not available in list)
+- [ ] List returns actual expiration (requires Option D or expensive per-object calls)
 - [ ] Other: _____________
 
 ---
@@ -670,7 +728,7 @@ Old `/named/` continues using MySQL indefinitely.
 | # | Topic | Recommended | Decision |
 |---|-------|-------------|----------|
 | 1 | Internal state filtering | Option A: Accept behavioral differences | ☐ |
-| 2 | Expiration visibility | Option A: Always return -1 | ☐ |
+| 2 | Expiration time storage & visibility | TBD (storage + list behavior) | ☐ |
 | 3 | Timestamp precision | Option C: Accept and document | ☐ |
 | 4 | Delimiter handling | Option C: Config flag (start with B) | ☐ |
 | 5 | Version history | Option A: Overwrite, no history | ☐ |
