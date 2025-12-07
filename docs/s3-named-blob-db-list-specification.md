@@ -829,13 +829,145 @@ If your application is migrating from MySQL to S3 backend:
 
 ### 15.1 Implementation Questions
 
-1. **Large Container Performance**: For containers with millions of objects, S3 list may be slow. Consider pagination limits and client-side handling.
+#### 1. Large Container Performance
 
-2. **Cleanup Job Implementation**: Who is responsible for implementing the cleanup job that hard-deletes expired and soft-deleted objects from S3?
+**Question**: For containers with millions of objects, S3 list may be slow.
 
-3. **Migration Verification**: What metrics should be collected during dual-write phase to verify S3 list matches MySQL list (accounting for documented differences)?
+**Decision**: S3 implementation should match or exceed MySQL performance. Measure and monitor latency, but do not change client expectations. If S3 is slower, that's an implementation issue to fix, not a specification change.
 
-4. **Client Communication**: How will existing Ambry clients be notified of the behavioral differences documented in Section 14?
+**Metrics to collect**:
+- `s3_list_latency_p50_ms`
+- `s3_list_latency_p99_ms`
+- `s3_list_objects_returned`
+
+---
+
+#### 2. Cleanup Job Implementation
+
+**Question**: Who is responsible for implementing the cleanup job that hard-deletes expired and soft-deleted objects from S3?
+
+**Status**: Out of scope for this specification. Requires separate design document.
+
+---
+
+#### 3. Migration Verification
+
+**Question**: What metrics should be collected during dual-write phase?
+
+**Decision**: Time-based sampling with full comparison on async thread.
+
+**Sampling Strategy**:
+- Compare at most once per `VERIFICATION_INTERVAL_MS` (configurable, e.g., 60000ms)
+- Use token bucket or time-based gate to prevent system strain
+- Verification runs on separate thread, does not block response
+
+**Comparison Fields** (fields guaranteed to match):
+
+| Field | Compare | Rationale |
+|-------|---------|-----------|
+| `blobName` | ✓ Yes | Derived from S3 key, must match |
+| `blobSize` | ✓ Yes | S3 Size matches MySQL blob_size |
+| `blobId` | ✗ No | Not available from ListObjectsV2 |
+| `version` | ✗ No | Not available from ListObjectsV2 |
+| `expirationTimeMs` | ✗ No | Not available from ListObjectsV2 |
+| `modifiedTimeMs` | ✗ No | Precision differs (ms vs s) |
+
+**Expected Differences** (not failures):
+- S3 may include extra entries (IN_PROGRESS, soft-deleted, expired blobs)
+- These are documented behavioral differences, not comparison failures
+
+**Implementation**:
+```java
+public class ListVerificationService {
+    private final AtomicLong lastVerificationTime = new AtomicLong(0);
+    private final long verificationIntervalMs;
+    private final ExecutorService verificationExecutor;
+
+    public void maybeVerifyAsync(Page<NamedBlobRecord> mysqlPage,
+                                  Supplier<Page<NamedBlobRecord>> s3PageSupplier,
+                                  String accountName, String containerName) {
+        long now = System.currentTimeMillis();
+        long last = lastVerificationTime.get();
+
+        if (now - last < verificationIntervalMs) {
+            return;  // Too soon since last verification
+        }
+
+        if (!lastVerificationTime.compareAndSet(last, now)) {
+            return;  // Another thread started verification
+        }
+
+        verificationExecutor.submit(() -> {
+            try {
+                Page<NamedBlobRecord> s3Page = s3PageSupplier.get();
+                comparePages(mysqlPage, s3Page, accountName, containerName);
+            } catch (Exception e) {
+                metrics.verificationErrorCount.inc();
+                log.warn("Verification failed for {}/{}", accountName, containerName, e);
+            }
+        });
+    }
+
+    private void comparePages(Page<NamedBlobRecord> mysql, Page<NamedBlobRecord> s3,
+                              String accountName, String containerName) {
+        Set<String> mysqlNames = mysql.getEntries().stream()
+            .map(NamedBlobRecord::getBlobName)
+            .collect(Collectors.toSet());
+
+        Set<String> s3Names = s3.getEntries().stream()
+            .map(NamedBlobRecord::getBlobName)
+            .collect(Collectors.toSet());
+
+        // Missing in S3 = potential sync issue
+        Set<String> missingInS3 = new HashSet<>(mysqlNames);
+        missingInS3.removeAll(s3Names);
+
+        // Extra in S3 = expected (IN_PROGRESS, deleted, expired)
+        Set<String> extraInS3 = new HashSet<>(s3Names);
+        extraInS3.removeAll(mysqlNames);
+
+        metrics.verificationCount.inc();
+        metrics.missingInS3Count.inc(missingInS3.size());
+        metrics.extraInS3Count.inc(extraInS3.size());
+
+        if (!missingInS3.isEmpty()) {
+            log.warn("Verification: {} blobs missing in S3 for {}/{}",
+                missingInS3.size(), accountName, containerName);
+        }
+
+        // Compare sizes for matching blobs
+        Map<String, Long> mysqlSizes = mysql.getEntries().stream()
+            .collect(Collectors.toMap(NamedBlobRecord::getBlobName, NamedBlobRecord::getBlobSize));
+
+        for (NamedBlobRecord s3Record : s3.getEntries()) {
+            Long mysqlSize = mysqlSizes.get(s3Record.getBlobName());
+            if (mysqlSize != null && !mysqlSize.equals(s3Record.getBlobSize())) {
+                metrics.sizeMismatchCount.inc();
+                log.warn("Size mismatch for {}: mysql={}, s3={}",
+                    s3Record.getBlobName(), mysqlSize, s3Record.getBlobSize());
+            }
+        }
+    }
+}
+```
+
+**Metrics**:
+- `verification_count` - Total verifications performed
+- `missing_in_s3_count` - Blobs in MySQL but not S3 (potential issue)
+- `extra_in_s3_count` - Blobs in S3 but not MySQL (expected)
+- `size_mismatch_count` - Blobs with different sizes (error)
+- `verification_error_count` - Verification failures
+
+---
+
+#### 4. Client Communication
+
+**Question**: How will existing Ambry clients be notified of behavioral differences?
+
+**Status**: Requires product decision. Options:
+- **Option A**: Release notes only
+- **Option B**: Migration guide document
+- **Option C**: Both A and B
 
 ### 15.2 Edge Case Behavior Questions
 
