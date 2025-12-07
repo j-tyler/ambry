@@ -43,11 +43,11 @@ This means clients only see blobs in a valid, retrievable state. Blobs that are:
 
 ...are automatically excluded from list results.
 
-### Why S3 Can't Easily Support This
+### S3 Limitation
 
-The question is whether the S3 client implementation only stores and exposes objects in the READY state that are not soft-deleted or expired.
+S3's `ListObjectsV2` returns all objects matching the prefix. It cannot filter by object metadata.
 
-If S3 contains only valid objects, `ListObjectsV2` would naturally return correct results. However, if S3 contains objects in all states (IN_PROGRESS, soft-deleted, expired), then list results will include objects that MySQL would have filtered out.
+If S3 contains objects in all states (IN_PROGRESS, soft-deleted, expired), then list results will include objects that MySQL would have filtered out.
 
 ### Options
 
@@ -525,9 +525,7 @@ AND (deleted_ts IS NULL OR deleted_ts > UTC_TIMESTAMP())
 
 No separate cleanup job needed—expired blobs simply stop appearing in queries.
 
-### The Problem
-
-In MySQL, expired blobs are automatically excluded from queries via `deleted_ts > NOW()`. No cleanup is needed—they simply stop appearing.
+### S3 Limitation
 
 S3 has no equivalent mechanism:
 1. **S3 Lifecycle Rules**: Operate on object age from creation date, NOT custom expiration timestamps
