@@ -1,0 +1,671 @@
+# S3 Migration: Alignment Decisions
+
+**Purpose**: This document identifies key tradeoffs in migrating Ambry's list operation from MySQL to S3. Each section explains the Ambry functionality, why S3 can't easily support it, and presents options for the team to decide.
+
+**Status**: Draft - Requires team alignment
+
+---
+
+## Table of Contents
+
+1. [Metadata-Based Filtering](#1-metadata-based-filtering)
+2. [Expiration Time Visibility](#2-expiration-time-visibility)
+3. [Timestamp Precision](#3-timestamp-precision)
+4. [Directory Delimiter Handling](#4-directory-delimiter-handling)
+5. [Version History Retention](#5-version-history-retention)
+6. [TTL Enforcement and Cleanup](#6-ttl-enforcement-and-cleanup)
+7. [Client Communication Strategy](#7-client-communication-strategy)
+
+---
+
+## 1. Metadata-Based Filtering
+
+### Ambry Functionality
+
+MySQL filters list results based on blob metadata:
+
+```sql
+WHERE blob_state = 1                                    -- Only READY blobs
+  AND (deleted_ts IS NULL OR deleted_ts > NOW())        -- Exclude soft-deleted
+  -- Implicitly: expired blobs excluded by deleted_ts check
+```
+
+This ensures clients only see blobs they can successfully retrieve.
+
+### Why S3 Can't Easily Support This
+
+S3's `ListObjectsV2` API returns only:
+- Object key (blob name)
+- Size
+- LastModified timestamp
+- ETag
+- Storage class
+
+**User metadata is NOT returned.** To filter by `blob_state`, `deleted_ts`, or `expiration_ms`, we would need to call `HeadObject` for every object listed. For a page of 1000 objects, this means 1000+ additional API calls—unacceptable latency and cost.
+
+**Alternative approaches considered:**
+
+| Approach | Why It Doesn't Work |
+|----------|---------------------|
+| S3 Object Tags | Tags are NOT returned in ListObjectsV2 either; requires GetObjectTagging per object |
+| AWS S3 Metadata (new 2025 feature) | Indexes tags not user metadata; minute-scale latency; designed for analytics not real-time API |
+| Encode state in key prefix | State changes require copy+delete (expensive); doesn't work for time-based expiration |
+| External index (DynamoDB) | Defeats purpose of eliminating MySQL dependency |
+
+### Options
+
+#### Option A: Accept Behavioral Differences (Recommended)
+
+**Description**: S3 list returns all objects regardless of state. Clients may see blobs they cannot access.
+
+**Behavioral Changes**:
+| Scenario | MySQL | S3 |
+|----------|-------|-----|
+| IN_PROGRESS blobs | Hidden | Visible |
+| Soft-deleted blobs | Hidden | Visible |
+| Expired blobs (TTL passed) | Hidden | Visible |
+
+**Client Impact**:
+- List may return more results than before
+- `GET` or `DELETE` on filtered objects will fail with appropriate errors
+- Clients should already handle this for eventually-consistent systems
+
+**Pros**:
+- Simple implementation
+- No additional API calls
+- Low latency
+
+**Cons**:
+- Breaking change in list behavior
+- Clients may need updates
+
+#### Option B: Client-Side Filter Flag
+
+**Description**: Add optional parameter `?strict=true` that fetches metadata and filters server-side.
+
+```
+GET /named/{account}/{container}?strict=true
+```
+
+**Implementation**: When `strict=true`, fetch HeadObject for each listed item and filter.
+
+**Pros**:
+- Opt-in strictness for clients that need it
+- Backwards compatible for clients that don't
+
+**Cons**:
+- High latency when enabled (1000+ API calls per page)
+- Higher S3 costs
+- Complexity in implementation
+
+#### Option C: Batch HeadObject with Reduced Page Size
+
+**Description**: Reduce default page size (e.g., 50 instead of 1000) and fetch metadata for that smaller batch.
+
+**Pros**:
+- Maintains filtering behavior
+- Bounded latency per request
+
+**Cons**:
+- Many more paginated requests to list full container
+- Still significant latency overhead
+- API behavior change (smaller pages)
+
+### Team Decision Required
+
+**Question**: Should we accept that S3 list returns unfiltered results?
+
+- [ ] **Option A**: Accept behavioral differences, document for clients
+- [ ] **Option B**: Provide opt-in strict mode
+- [ ] **Option C**: Reduce page size and fetch metadata
+- [ ] Other: _____________
+
+---
+
+## 2. Expiration Time Visibility
+
+### Ambry Functionality
+
+MySQL list returns `expirationTimeMs` for each blob, allowing clients to see when blobs will expire:
+
+```json
+{
+  "blobName": "temp-file.txt",
+  "expirationTimeMs": 1704067200000,
+  "blobSize": 1024
+}
+```
+
+Clients use this to display TTL information or make decisions about blob lifecycle.
+
+### Why S3 Can't Easily Support This
+
+Expiration time is stored in S3 user metadata (`x-amz-meta-expiration-ms`), which is NOT returned by `ListObjectsV2`. Without calling `HeadObject` per object, we cannot retrieve this value.
+
+### Options
+
+#### Option A: Always Return -1 (Permanent) for Expiration
+
+**Description**: S3 list always returns `expirationTimeMs = -1`, which is omitted from JSON per existing behavior.
+
+**Client Impact**:
+- Clients cannot determine blob TTL from list results
+- All blobs appear as "permanent" in list
+- Clients must call `GET` or `HEAD` on individual blobs to see true expiration
+
+**Pros**:
+- Simple implementation
+- No additional API calls
+
+**Cons**:
+- Loss of functionality for clients that rely on expiration in list
+
+#### Option B: Fetch Expiration for First N Results
+
+**Description**: Call HeadObject for the first N results (e.g., 10) to populate expiration, leave rest as -1.
+
+**Pros**:
+- Partial expiration visibility
+- Bounded additional latency
+
+**Cons**:
+- Inconsistent behavior within same response
+- Confusing UX
+- Arbitrary cutoff
+
+#### Option C: Add Expiration Lookup Endpoint
+
+**Description**: Create new API endpoint for batch expiration lookup:
+
+```
+POST /named/{account}/{container}/_expiration
+Body: {"blobNames": ["file1.txt", "file2.txt", ...]}
+```
+
+**Pros**:
+- Clients can get expiration when needed
+- List stays fast
+
+**Cons**:
+- New API to maintain
+- Extra client call required
+
+### Team Decision Required
+
+**Question**: How important is expiration visibility in list results?
+
+- [ ] **Option A**: Accept that expiration is not visible in S3 list
+- [ ] **Option B**: Partial expiration (first N results)
+- [ ] **Option C**: Add separate batch lookup endpoint
+- [ ] Other: _____________
+
+---
+
+## 3. Timestamp Precision
+
+### Ambry Functionality
+
+MySQL stores and returns `modifiedTimeMs` with **millisecond precision**:
+
+```json
+{
+  "blobName": "file.txt",
+  "modifiedTimeMs": 1702012800123
+}
+```
+
+### Why S3 Can't Easily Support This
+
+S3's `LastModified` field has only **second precision**. The milliseconds are always `.000`.
+
+We store the original millisecond timestamp in metadata (`x-amz-meta-modified-ms`), but this is not available in `ListObjectsV2`.
+
+### Options
+
+#### Option A: Use S3 LastModified (Second Precision)
+
+**Description**: Return S3's `LastModified` converted to milliseconds. Values will always end in `000`.
+
+**Client Impact**:
+- `modifiedTimeMs` may differ by up to 999ms from MySQL
+- Sorting by modification time is still correct (second-level)
+- Clients doing exact timestamp matching will see differences
+
+**Pros**:
+- Simple implementation
+- No additional API calls
+
+**Cons**:
+- Precision loss
+- Verification during migration will show timestamp "mismatches"
+
+#### Option B: Fetch True Timestamp from Metadata
+
+**Description**: Call HeadObject for each listed object to retrieve `x-amz-meta-modified-ms`.
+
+**Pros**:
+- Millisecond precision preserved
+
+**Cons**:
+- 1000+ additional API calls per page
+- Unacceptable latency
+
+#### Option C: Accept and Document Precision Difference
+
+**Description**: Same as Option A, but explicitly document that timestamp precision differs between backends.
+
+**Migration verification**: Compare timestamps at second precision only (truncate milliseconds).
+
+**Pros**:
+- Clear expectations
+- Simple implementation
+
+**Cons**:
+- Clients with strict timestamp requirements may be affected
+
+### Team Decision Required
+
+**Question**: Is millisecond timestamp precision required?
+
+- [ ] **Option A**: Use S3 second precision, accept differences
+- [ ] **Option B**: Fetch metadata for exact timestamps (not recommended)
+- [ ] **Option C**: Accept and explicitly document precision difference
+- [ ] Other: _____________
+
+---
+
+## 4. Directory Delimiter Handling
+
+### Ambry Functionality
+
+When `delimiter=/` is specified, Ambry groups blobs into virtual directories:
+
+```
+# Blobs:
+photos/vacation/img1.jpg
+photos/vacation/img2.jpg
+photos/work/doc.pdf
+
+# List with delimiter=/ and prefix=photos/
+→ photos/vacation/  (directory)
+→ photos/work/      (directory)
+```
+
+MySQL returns all matching blobs, and `NamedBlobListHandler` performs directory grouping in Java.
+
+### Why S3 Can't Easily Support This
+
+S3 **does** support delimiter natively via `ListObjectsV2` with `delimiter` parameter. It returns `CommonPrefixes` for directories.
+
+However, S3's delimiter behavior may differ in edge cases:
+- Empty directory markers
+- Blob names with consecutive delimiters (`photos//img.jpg`)
+- Interaction with filtering (which we can't do anyway)
+
+### Options
+
+#### Option A: Use S3 Native Delimiter (More Efficient)
+
+**Description**: Pass `delimiter` to S3 ListObjectsV2, map `CommonPrefixes` to directory entries.
+
+**Pros**:
+- Efficient - S3 does the grouping
+- Fewer objects transferred
+- Native S3 behavior
+
+**Cons**:
+- May have subtle behavioral differences in edge cases
+- Harder to verify against MySQL
+
+#### Option B: Fetch All, Filter in Java (MySQL Compatible)
+
+**Description**: Ignore S3 delimiter support. Fetch all blobs, let handler do directory grouping.
+
+**Pros**:
+- Identical behavior to MySQL
+- Easier migration verification
+
+**Cons**:
+- Less efficient - fetches more data
+- More client-side processing
+
+#### Option C: Configuration Flag
+
+**Description**: Make delimiter handling configurable:
+
+```yaml
+s3.list.useNativeDelimiter: false  # Default: match MySQL
+```
+
+Start with Option B for migration, switch to Option A post-migration.
+
+**Pros**:
+- Safe migration path
+- Can optimize later
+
+**Cons**:
+- Configuration complexity
+
+### Team Decision Required
+
+**Question**: Should we use S3's native delimiter support?
+
+- [ ] **Option A**: Use S3 native delimiter (more efficient)
+- [ ] **Option B**: Match MySQL behavior exactly (fetch all, filter in Java)
+- [ ] **Option C**: Configuration flag to switch between modes
+- [ ] Other: _____________
+
+---
+
+## 5. Version History Retention
+
+### Ambry Functionality
+
+MySQL keeps all blob versions:
+
+```sql
+-- Multiple rows for same blob_name with different versions
+blob_name     | version           | blob_state
+--------------|-------------------|------------
+file.txt      | 1702012800000001  | READY
+file.txt      | 1702012800000002  | READY  ← latest, returned by list
+```
+
+When a blob is overwritten, the old version remains in the database. List returns only the latest (`MAX(version)`).
+
+### Why S3 Can't Easily Support This
+
+S3 has native versioning, but:
+1. It must be enabled at bucket level
+2. Listing versions requires different API (`ListObjectVersions`)
+3. Filtering to "latest version only" is not built-in
+4. Increases storage costs
+
+### Options
+
+#### Option A: Overwrite in S3 (No Version History)
+
+**Description**: PUT to same key overwrites the existing object. Only current version exists.
+
+**Impact**:
+- List naturally returns only current version (no filtering needed)
+- Version history is lost in S3
+
+**Pros**:
+- Simple implementation
+- Lower storage costs
+- List behavior is correct
+
+**Cons**:
+- Cannot recover previous versions from S3
+- Different from MySQL's implicit history
+
+#### Option B: Enable S3 Versioning
+
+**Description**: Enable bucket versioning. Each PUT creates a new version.
+
+**List Implementation**: Must filter to latest version only, either by:
+- Using `ListObjectVersions` and filtering
+- Maintaining "latest" marker in metadata
+
+**Pros**:
+- Version history preserved
+- Can recover previous versions
+
+**Cons**:
+- Higher storage costs
+- More complex list implementation
+- Need lifecycle rules to clean old versions
+
+#### Option C: Hybrid - Overwrite but Log to Audit
+
+**Description**: Overwrite in S3 (Option A), but log version changes to separate audit system.
+
+**Pros**:
+- Simple S3 implementation
+- Audit trail if needed
+
+**Cons**:
+- Additional infrastructure
+- Audit log is separate from S3
+
+### Team Decision Required
+
+**Question**: Do we need to preserve blob version history in S3?
+
+- [ ] **Option A**: Overwrite - no version history in S3
+- [ ] **Option B**: Enable S3 versioning
+- [ ] **Option C**: Overwrite with separate audit logging
+- [ ] Other: _____________
+
+---
+
+## 6. TTL Enforcement and Cleanup
+
+### Ambry Functionality
+
+MySQL excludes expired blobs automatically via query:
+
+```sql
+AND (deleted_ts IS NULL OR deleted_ts > UTC_TIMESTAMP())
+```
+
+No separate cleanup job needed—expired blobs simply stop appearing in queries.
+
+### Why S3 Can't Easily Support This
+
+1. **List filtering**: S3 can't filter by expiration metadata (covered in Section 1)
+2. **S3 Lifecycle Rules**: Operate on object age from creation date, NOT custom metadata
+3. **Storage cost**: Expired blobs remain in S3 until explicitly deleted
+
+### Options
+
+#### Option A: Implement Cleanup Job
+
+**Description**: Separate background job scans S3 and deletes expired/soft-deleted objects.
+
+```java
+// Pseudo-code for cleanup job
+for each object in bucket:
+    metadata = HeadObject(object)
+    if isExpired(metadata) or isSoftDeleted(metadata):
+        if gracePeriodPassed(metadata):
+            DeleteObject(object)
+```
+
+**Parameters to decide**:
+- How often to run? (hourly, daily)
+- Grace period before hard delete? (7 days after expiration?)
+- Should deleted objects be recoverable?
+
+**Pros**:
+- Reduces storage costs
+- Clean S3 bucket
+
+**Cons**:
+- Additional infrastructure to maintain
+- Cost of scanning (HeadObject per object)
+- Delay between expiration and deletion
+
+#### Option B: Use S3 Lifecycle with Object Tags
+
+**Description**: Write expiration as S3 object tag (not metadata), configure lifecycle rule.
+
+```xml
+<LifecycleRule>
+    <Filter>
+        <Tag>
+            <Key>expiration-bucket</Key>
+            <Value>2024-01</Value>
+        </Tag>
+    </Filter>
+    <Expiration>
+        <Days>0</Days>
+    </Expiration>
+</LifecycleRule>
+```
+
+**Pros**:
+- Native S3 cleanup
+- No custom job needed
+
+**Cons**:
+- Requires changing write path to use tags
+- Limited granularity (tag-based buckets, not exact timestamps)
+- Tags limited to 10 per object
+
+#### Option C: Accept Storage Cost, No Cleanup
+
+**Description**: Let expired objects remain in S3 indefinitely.
+
+**Pros**:
+- Simple - no cleanup infrastructure
+- Objects recoverable if needed
+
+**Cons**:
+- Ever-growing storage costs
+- S3 list includes expired objects forever
+
+### Team Decision Required
+
+**Question**: How should expired and soft-deleted blobs be cleaned up from S3?
+
+- [ ] **Option A**: Implement cleanup job (parameters TBD)
+- [ ] **Option B**: Use S3 lifecycle with object tags
+- [ ] **Option C**: No cleanup - accept storage cost
+- [ ] Other: _____________
+
+If Option A, additional decisions:
+- Cleanup frequency: _____________ (e.g., daily)
+- Grace period after expiration: _____________ (e.g., 7 days)
+- Grace period after soft delete: _____________ (e.g., 30 days)
+
+---
+
+## 7. Client Communication Strategy
+
+### Context
+
+The S3 migration introduces behavioral differences that may affect clients:
+
+1. **More results in list**: IN_PROGRESS, soft-deleted, and expired blobs visible
+2. **Missing expiration info**: `expirationTimeMs` always omitted
+3. **Timestamp precision**: Milliseconds truncated to seconds
+4. **Potential ordering differences**: Unicode edge cases
+
+### Options
+
+#### Option A: Release Notes Only
+
+**Description**: Document changes in release notes. No proactive outreach.
+
+**Pros**:
+- Minimal effort
+- Standard practice for minor changes
+
+**Cons**:
+- Clients may be surprised by changes
+- Support burden when issues arise
+
+#### Option B: Migration Guide Document
+
+**Description**: Create detailed migration guide covering:
+- What's changing
+- How to test compatibility
+- Code changes clients may need
+- Timeline
+
+**Pros**:
+- Clear communication
+- Reduces support burden
+- Professional approach for breaking changes
+
+**Cons**:
+- Effort to create and maintain
+- May alarm clients unnecessarily
+
+#### Option C: Feature Flag Rollout
+
+**Description**: Add configuration to switch list source per account/container:
+
+```yaml
+list.source.default: mysql
+list.source.override:
+  account-123: s3
+  account-456: s3
+```
+
+Migrate accounts gradually with direct communication.
+
+**Pros**:
+- Controlled rollout
+- Can revert problematic accounts
+
+**Cons**:
+- Longer migration timeline
+- Operational complexity
+
+#### Option D: Versioned API
+
+**Description**: Introduce API version for S3-backed behavior:
+
+```
+GET /v2/named/{account}/{container}
+```
+
+Old `/named/` continues using MySQL indefinitely.
+
+**Pros**:
+- No breaking changes to existing clients
+- Clients opt-in to new behavior
+
+**Cons**:
+- Maintain two implementations
+- MySQL never deprecated
+
+### Team Decision Required
+
+**Question**: How should we communicate S3 migration changes to clients?
+
+- [ ] **Option A**: Release notes only
+- [ ] **Option B**: Migration guide document
+- [ ] **Option C**: Feature flag rollout per account
+- [ ] **Option D**: Versioned API
+- [ ] Combination: _____________
+
+---
+
+## Summary of Decisions Needed
+
+| # | Topic | Recommended | Decision |
+|---|-------|-------------|----------|
+| 1 | Metadata filtering | Option A: Accept behavioral differences | ☐ |
+| 2 | Expiration visibility | Option A: Always return -1 | ☐ |
+| 3 | Timestamp precision | Option C: Accept and document | ☐ |
+| 4 | Delimiter handling | Option C: Config flag (start with B) | ☐ |
+| 5 | Version history | Option A: Overwrite, no history | ☐ |
+| 6 | TTL cleanup | Option A: Implement cleanup job | ☐ |
+| 7 | Client communication | Option B or C | ☐ |
+
+---
+
+## Appendix: Quick Reference
+
+### Behavioral Differences Summary
+
+| Aspect | MySQL Behavior | S3 Behavior | Breaking Change? |
+|--------|---------------|-------------|------------------|
+| IN_PROGRESS blobs | Hidden | Visible | Yes |
+| Soft-deleted blobs | Hidden | Visible | Yes |
+| Expired blobs | Hidden | Visible | Yes |
+| `expirationTimeMs` | Actual value | Always -1 (omitted) | Yes |
+| `modifiedTimeMs` precision | Milliseconds | Seconds | Minor |
+| Version history | Retained in DB | Overwritten | No (not exposed in list) |
+| Sort order | Binary (case-sensitive) | Binary (case-sensitive) | No |
+
+### Client Compatibility Checklist
+
+Clients should verify they handle these scenarios:
+- [ ] GET after list returns 404 or error (blob was IN_PROGRESS/deleted/expired)
+- [ ] `expirationTimeMs` missing from response (blob appears permanent)
+- [ ] Timestamps may differ by up to 999ms when comparing with other sources
