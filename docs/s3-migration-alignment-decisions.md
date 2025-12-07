@@ -11,10 +11,9 @@
 1. [Internal State Filtering](#1-internal-state-filtering)
 2. [Expiration Time Visibility](#2-expiration-time-visibility)
 3. [Timestamp Precision](#3-timestamp-precision)
-4. [Directory Delimiter Handling](#4-directory-delimiter-handling)
-5. [Version History Retention](#5-version-history-retention)
-6. [TTL Enforcement and Cleanup](#6-ttl-enforcement-and-cleanup)
-7. [Client Communication Strategy](#7-client-communication-strategy)
+4. [Version History Retention](#4-version-history-retention)
+5. [TTL Enforcement and Cleanup](#5-ttl-enforcement-and-cleanup)
+6. [Client Communication Strategy](#6-client-communication-strategy)
 
 ---
 
@@ -327,96 +326,7 @@ If we use S3's `LastModified` directly, `modifiedTimeMs` values will lose millis
 
 ---
 
-## 4. Directory Delimiter Handling
-
-### Ambry Functionality
-
-**API Calls Affected:**
-```
-GET /named/{accountName}/{containerName}?delimiter=/
-GET /named/{accountName}/{containerName}?prefix={prefix}&delimiter=/
-GET /s3/{accountName}/{containerName}?list-type=2&delimiter=/
-```
-
-When `delimiter=/` is specified, Ambry groups blobs into virtual directories:
-
-```
-# Blobs:
-photos/vacation/img1.jpg
-photos/vacation/img2.jpg
-photos/work/doc.pdf
-
-# List with delimiter=/ and prefix=photos/
-→ photos/vacation/  (directory)
-→ photos/work/      (directory)
-```
-
-MySQL returns all matching blobs, and `NamedBlobListHandler` performs directory grouping in Java.
-
-### S3 Capability
-
-S3 **does** support delimiter natively via `ListObjectsV2` with `delimiter` parameter. It returns `CommonPrefixes` for directories.
-
-The question is whether to use S3's native delimiter support or replicate MySQL's Java-based grouping behavior. Potential differences in edge cases:
-- Empty directory markers
-- Blob names with consecutive delimiters (`photos//img.jpg`)
-
-### Options
-
-#### Option A: Use S3 Native Delimiter (More Efficient)
-
-**Description**: Pass `delimiter` to S3 ListObjectsV2, map `CommonPrefixes` to directory entries.
-
-**Pros**:
-- Efficient - S3 does the grouping
-- Fewer objects transferred
-- Native S3 behavior
-
-**Cons**:
-- May have subtle behavioral differences in edge cases
-- Harder to verify against MySQL
-
-#### Option B: Fetch All, Filter in Java (MySQL Compatible)
-
-**Description**: Ignore S3 delimiter support. Fetch all blobs, let handler do directory grouping.
-
-**Pros**:
-- Identical behavior to MySQL
-- Easier migration verification
-
-**Cons**:
-- Less efficient - fetches more data
-- More client-side processing
-
-#### Option C: Configuration Flag
-
-**Description**: Make delimiter handling configurable:
-
-```yaml
-s3.list.useNativeDelimiter: false  # Default: match MySQL
-```
-
-Start with Option B for migration, switch to Option A post-migration.
-
-**Pros**:
-- Safe migration path
-- Can optimize later
-
-**Cons**:
-- Configuration complexity
-
-### Team Decision Required
-
-**Question**: Should we use S3's native delimiter support?
-
-- [ ] **Option A**: Use S3 native delimiter (more efficient)
-- [ ] **Option B**: Match MySQL behavior exactly (fetch all, filter in Java)
-- [ ] **Option C**: Configuration flag to switch between modes
-- [ ] Other: _____________
-
----
-
-## 5. Version History Retention
+## 4. Version History Retention
 
 ### Ambry Functionality
 
@@ -505,7 +415,7 @@ S3 has native versioning, but:
 
 ---
 
-## 6. TTL Enforcement and Cleanup
+## 5. TTL Enforcement and Cleanup
 
 ### Ambry Functionality
 
@@ -611,7 +521,7 @@ If Option A, additional decisions:
 
 ---
 
-## 7. Client Communication Strategy
+## 6. Client Communication Strategy
 
 ### Context
 
@@ -713,10 +623,9 @@ Old `/named/` continues using MySQL indefinitely.
 | 2 | Expiration time storage | A: Don't store, B: Metadata, C: Tags, D: In key | ☐ |
 | 2b | Expiration in list results | Return -1, or return actual (requires 2D) | ☐ |
 | 3 | Timestamp precision | A: Accept loss, B: Store in metadata | ☐ |
-| 4 | Delimiter handling | A: S3 native, B: Java grouping, C: Config flag | ☐ |
-| 5 | Version history | A: Overwrite, B: S3 versioning, C: Audit log | ☐ |
-| 6 | TTL cleanup | A: Cleanup job, B: Lifecycle+tags, C: No cleanup | ☐ |
-| 7 | Client communication | A: Release notes, B: Migration guide, C: Feature flags, D: Versioned API | ☐ |
+| 4 | Version history | A: Overwrite, B: S3 versioning, C: Audit log | ☐ |
+| 5 | TTL cleanup | A: Cleanup job, B: Lifecycle+tags, C: No cleanup | ☐ |
+| 6 | Client communication | A: Release notes, B: Migration guide, C: Feature flags, D: Versioned API | ☐ |
 
 ---
 
