@@ -45,24 +45,44 @@ This means clients only see blobs in a valid, retrievable state. Blobs that are:
 
 ### Why S3 Can't Easily Support This
 
-S3's `ListObjectsV2` returns all objects matching the prefix. There is no way to filter by object metadata during the list operation.
+The question is whether the S3 client implementation only stores and exposes objects in the READY state that are not soft-deleted or expired.
 
-To replicate MySQL's filtering, we would need to call `HeadObject` for every listed object to check its metadata, then exclude non-READY/deleted/expired objects. For a page of 1000 objects, this means 1000+ additional API calls—unacceptable latency and cost.
-
-**Alternative approaches considered:**
-
-| Approach | Why It Doesn't Work |
-|----------|---------------------|
-| S3 Object Tags | Tags are NOT returned in ListObjectsV2; requires GetObjectTagging per object |
-| AWS S3 Metadata (2025 feature) | Indexes tags not user metadata; minute-scale latency; designed for analytics not real-time API |
-| Encode state in key prefix | State changes require copy+delete (expensive); doesn't work for time-based expiration |
-| External index (DynamoDB) | Defeats purpose of eliminating MySQL dependency |
-
-**The result**: S3 list will return objects that MySQL list would have filtered out. Clients may see blobs in the list that they cannot successfully GET.
+If S3 contains only valid objects, `ListObjectsV2` would naturally return correct results. However, if S3 contains objects in all states (IN_PROGRESS, soft-deleted, expired), then list results will include objects that MySQL would have filtered out.
 
 ### Options
 
-#### Option A: Accept Behavioral Differences (Recommended)
+#### Option A: Store Metadata and Filter via HeadObject
+
+**Description**: Store blob state in S3 object metadata. On list, call `HeadObject` for each object to check state, then filter results.
+
+**Pros**:
+- Matches MySQL behavior exactly
+
+**Cons**:
+- Extremely expensive: 1000+ API calls per page
+- Unacceptable latency
+- Higher S3 costs
+
+#### Option B: Change S3 Client Implementation
+
+**Description**: Ensure the S3 client only writes objects when they reach READY state, and deletes objects immediately on soft-delete or expiration.
+
+**Considerations**:
+- How does the current implementation handle IN_PROGRESS uploads?
+- When is an object written to S3 relative to its state transition?
+- Can we guarantee deletion happens synchronously with soft-delete?
+- How do we handle TTL expiration (background job to delete expired objects)?
+
+**Pros**:
+- ListObjectsV2 naturally returns correct results
+- No per-object API calls needed
+
+**Cons**:
+- May require changes to write/delete paths
+- TTL expiration requires background cleanup job
+- Need to understand current S3 client behavior
+
+#### Option C: Accept Behavioral Differences
 
 **Description**: S3 list returns all objects regardless of state. Clients may see blobs they cannot access.
 
@@ -75,57 +95,24 @@ To replicate MySQL's filtering, we would need to call `HeadObject` for every lis
 
 **Client Impact**:
 - List may return more results than before
-- `GET` or `DELETE` on filtered objects will fail with appropriate errors
-- Clients should already handle this for eventually-consistent systems
+- `GET` or `DELETE` on these objects will fail with appropriate errors
 
 **Pros**:
-- Simple implementation
+- Simple list implementation
 - No additional API calls
 - Low latency
 
 **Cons**:
 - Breaking change in list behavior
-- Clients may need updates
-
-#### Option B: Client-Side Filter Flag
-
-**Description**: Add optional parameter `?strict=true` that fetches metadata and filters server-side.
-
-```
-GET /named/{account}/{container}?strict=true
-```
-
-**Implementation**: When `strict=true`, fetch HeadObject for each listed item and filter.
-
-**Pros**:
-- Opt-in strictness for clients that need it
-- Backwards compatible for clients that don't
-
-**Cons**:
-- High latency when enabled (1000+ API calls per page)
-- Higher S3 costs
-- Complexity in implementation
-
-#### Option C: Batch HeadObject with Reduced Page Size
-
-**Description**: Reduce default page size (e.g., 50 instead of 1000) and fetch metadata for that smaller batch.
-
-**Pros**:
-- Maintains filtering behavior
-- Bounded latency per request
-
-**Cons**:
-- Many more paginated requests to list full container
-- Still significant latency overhead
-- API behavior change (smaller pages)
+- Clients may need updates to handle GET failures after list
 
 ### Team Decision Required
 
-**Question**: Should we accept that S3 list returns unfiltered results?
+**Question**: How should the S3 implementation handle blob state filtering?
 
-- [ ] **Option A**: Accept behavioral differences, document for clients
-- [ ] **Option B**: Provide opt-in strict mode
-- [ ] **Option C**: Reduce page size and fetch metadata
+- [ ] **Option A**: Store metadata and filter via HeadObject (expensive, not recommended)
+- [ ] **Option B**: Change S3 client to only store/expose valid objects
+- [ ] **Option C**: Accept behavioral differences, document for clients
 - [ ] Other: _____________
 
 ---
