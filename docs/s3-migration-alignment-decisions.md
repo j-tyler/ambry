@@ -8,7 +8,7 @@
 
 ## Table of Contents
 
-1. [Metadata-Based Filtering](#1-metadata-based-filtering)
+1. [Internal State Filtering](#1-internal-state-filtering)
 2. [Expiration Time Visibility](#2-expiration-time-visibility)
 3. [Timestamp Precision](#3-timestamp-precision)
 4. [Directory Delimiter Handling](#4-directory-delimiter-handling)
@@ -18,7 +18,7 @@
 
 ---
 
-## 1. Metadata-Based Filtering
+## 1. Internal State Filtering
 
 ### Ambry Functionality
 
@@ -29,35 +29,36 @@ GET /named/{accountName}/{containerName}?prefix={prefix}&page={token}&maxKeys={n
 GET /s3/{accountName}/{containerName}?list-type=2&prefix={prefix}
 ```
 
-MySQL filters list results based on blob metadata:
+These APIs do not expose any filtering parameters for blob state. However, MySQL applies internal filters before returning results:
 
 ```sql
 WHERE blob_state = 1                                    -- Only READY blobs
-  AND (deleted_ts IS NULL OR deleted_ts > NOW())        -- Exclude soft-deleted
-  -- Implicitly: expired blobs excluded by deleted_ts check
+  AND (deleted_ts IS NULL OR deleted_ts > NOW())        -- Exclude soft-deleted/expired
 ```
 
-This ensures clients only see blobs they can successfully retrieve.
+This means clients only see blobs in a valid, retrievable state. Blobs that are:
+- **IN_PROGRESS** (upload not yet complete)
+- **Soft-deleted** (DELETE called but not yet purged)
+- **Expired** (TTL has passed)
+
+...are automatically excluded from list results.
 
 ### Why S3 Can't Easily Support This
 
-S3's `ListObjectsV2` API returns only:
-- Object key (blob name)
-- Size
-- LastModified timestamp
-- ETag
-- Storage class
+S3's `ListObjectsV2` returns all objects matching the prefix. There is no way to filter by object metadata during the list operation.
 
-**User metadata is NOT returned.** To filter by `blob_state`, `deleted_ts`, or `expiration_ms`, we would need to call `HeadObject` for every object listed. For a page of 1000 objects, this means 1000+ additional API calls—unacceptable latency and cost.
+To replicate MySQL's filtering, we would need to call `HeadObject` for every listed object to check its metadata, then exclude non-READY/deleted/expired objects. For a page of 1000 objects, this means 1000+ additional API calls—unacceptable latency and cost.
 
 **Alternative approaches considered:**
 
 | Approach | Why It Doesn't Work |
 |----------|---------------------|
-| S3 Object Tags | Tags are NOT returned in ListObjectsV2 either; requires GetObjectTagging per object |
-| AWS S3 Metadata (new 2025 feature) | Indexes tags not user metadata; minute-scale latency; designed for analytics not real-time API |
+| S3 Object Tags | Tags are NOT returned in ListObjectsV2; requires GetObjectTagging per object |
+| AWS S3 Metadata (2025 feature) | Indexes tags not user metadata; minute-scale latency; designed for analytics not real-time API |
 | Encode state in key prefix | State changes require copy+delete (expensive); doesn't work for time-based expiration |
 | External index (DynamoDB) | Defeats purpose of eliminating MySQL dependency |
+
+**The result**: S3 list will return objects that MySQL list would have filtered out. Clients may see blobs in the list that they cannot successfully GET.
 
 ### Options
 
@@ -687,7 +688,7 @@ Old `/named/` continues using MySQL indefinitely.
 
 | # | Topic | Recommended | Decision |
 |---|-------|-------------|----------|
-| 1 | Metadata filtering | Option A: Accept behavioral differences | ☐ |
+| 1 | Internal state filtering | Option A: Accept behavioral differences | ☐ |
 | 2 | Expiration visibility | Option A: Always return -1 | ☐ |
 | 3 | Timestamp precision | Option C: Accept and document | ☐ |
 | 4 | Delimiter handling | Option C: Config flag (start with B) | ☐ |
