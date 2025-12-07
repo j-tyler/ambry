@@ -22,6 +22,15 @@
 
 ### Ambry Functionality
 
+**API Calls Affected:**
+```
+GET /named/{accountName}/{containerName}
+GET /named/{accountName}/{containerName}?prefix={prefix}&page={token}&maxKeys={n}
+GET /s3/{accountName}/{containerName}?list-type=2&prefix={prefix}
+```
+
+**Use Case**: Any client listing blobs in a container—file browsers, backup tools, data pipelines enumerating objects.
+
 MySQL filters list results based on blob metadata:
 
 ```sql
@@ -126,6 +135,15 @@ GET /named/{account}/{container}?strict=true
 
 ### Ambry Functionality
 
+**API Calls Affected:**
+```
+GET /named/{accountName}/{containerName}
+GET /named/{accountName}/{containerName}?prefix={prefix}
+GET /s3/{accountName}/{containerName}?list-type=2
+```
+
+**Use Case**: Clients displaying blob TTL in UI dashboards, automation tools deciding whether to refresh expiring blobs, compliance tools auditing data retention.
+
 MySQL list returns `expirationTimeMs` for each blob, allowing clients to see when blobs will expire:
 
 ```json
@@ -205,6 +223,15 @@ Body: {"blobNames": ["file1.txt", "file2.txt", ...]}
 
 ### Ambry Functionality
 
+**API Calls Affected:**
+```
+GET /named/{accountName}/{containerName}
+GET /named/{accountName}/{containerName}?prefix={prefix}
+GET /s3/{accountName}/{containerName}?list-type=2
+```
+
+**Use Case**: Clients sorting by modification time, change detection systems comparing timestamps to identify updates, cache invalidation based on modification time.
+
 MySQL stores and returns `modifiedTimeMs` with **millisecond precision**:
 
 ```json
@@ -277,6 +304,15 @@ We store the original millisecond timestamp in metadata (`x-amz-meta-modified-ms
 ## 4. Directory Delimiter Handling
 
 ### Ambry Functionality
+
+**API Calls Affected:**
+```
+GET /named/{accountName}/{containerName}?delimiter=/
+GET /named/{accountName}/{containerName}?prefix={prefix}&delimiter=/
+GET /s3/{accountName}/{containerName}?list-type=2&delimiter=/
+```
+
+**Use Case**: File browser UIs showing folder hierarchy, S3-compatible clients expecting directory-style navigation, tools that need to list "top-level folders" without fetching all nested objects.
 
 When `delimiter=/` is specified, Ambry groups blobs into virtual directories:
 
@@ -361,6 +397,14 @@ Start with Option B for migration, switch to Option A post-migration.
 
 ### Ambry Functionality
 
+**API Calls Affected:**
+```
+PUT /named/{accountName}/{containerName}/{blobName}  (overwrite existing blob)
+GET /named/{accountName}/{containerName}             (list returns only latest version)
+```
+
+**Use Case**: Applications that update blobs in place (config files, state snapshots), workflows where blob names are reused for different content versions.
+
 MySQL keeps all blob versions:
 
 ```sql
@@ -443,6 +487,16 @@ S3 has native versioning, but:
 ## 6. TTL Enforcement and Cleanup
 
 ### Ambry Functionality
+
+**API Calls Affected:**
+```
+PUT /named/{accountName}/{containerName}/{blobName}   (with x-ambry-blob-ttl header)
+GET /named/{accountName}/{containerName}              (list excludes expired blobs)
+GET /named/{accountName}/{containerName}/{blobName}   (GET fails for expired blobs)
+DELETE /named/{accountName}/{containerName}/{blobName} (soft delete sets deleted_ts)
+```
+
+**Use Case**: Temporary file storage with automatic expiration, compliance-driven data retention policies, soft delete with recovery window before permanent deletion.
 
 MySQL excludes expired blobs automatically via query:
 
@@ -545,6 +599,14 @@ If Option A, additional decisions:
 ## 7. Client Communication Strategy
 
 ### Context
+
+**All List API Calls Affected:**
+```
+GET /named/{accountName}/{containerName}[?prefix=...&page=...&maxKeys=...&delimiter=...]
+GET /s3/{accountName}/{containerName}?list-type=2[&prefix=...&continuation-token=...&max-keys=...&delimiter=...]
+```
+
+**Use Case**: All clients using the list operation—this decision affects how we communicate breaking changes to every team relying on blob enumeration.
 
 The S3 migration introduces behavioral differences that may affect clients:
 
