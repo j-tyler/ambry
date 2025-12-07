@@ -2,6 +2,35 @@
 
 This document details the class/method path from the HTTP router through service logic for a list blob request in Ambry.
 
+## Architecture Overview
+
+All list requests flow through a **single path** to a `CompositeNamedBlobDb`. The composite internally decides whether to read from MySQL, S3, or both based on the migration phase. This design ensures:
+- Consistent API behavior regardless of backend
+- Centralized migration logic
+- Async verification without external coordination
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        API Layer                                     │
+│  FrontendRestRequestService → NamedBlobListHandler → CallbackChain  │
+└─────────────────────────────────┬───────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     NamedBlobDb Interface                            │
+│                              │                                       │
+│                              ▼                                       │
+│                   CompositeNamedBlobDb                               │
+│         ┌────────────────────┼────────────────────┐                 │
+│         │                    │                    │                 │
+│         ▼                    ▼                    ▼                 │
+│   MySqlNamedBlobDb    S3NamedBlobDb    VerificationService          │
+│         │                    │                    │                 │
+│         ▼                    ▼                    │                 │
+│      MySQL DB            S3 Bucket         (async comparison)       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ## Mermaid Sequence Diagram
 
 ```mermaid
@@ -13,9 +42,11 @@ sequenceDiagram
     participant NamedBlobListHandler
     participant CallbackChain
     participant SecurityService
-    participant NamedBlobDb
+    participant CompositeNamedBlobDb
     participant MySqlNamedBlobDb
+    participant S3NamedBlobDb
     participant Database
+    participant S3
     participant Page
     participant NamedBlobListEntry
 
@@ -24,86 +55,88 @@ sequenceDiagram
 
     %% Routing Decision
     FrontendRestRequestService->>FrontendRestRequestService: handleGet(restRequest, restResponseChannel)
-    Note over FrontendRestRequestService: Line 304-350
 
     FrontendRestRequestService->>NamedBlobPath: parse(requestPath, args)
     Note over NamedBlobPath: Extracts accountName, containerName,<br/>blobNamePrefix, pageToken
     NamedBlobPath-->>FrontendRestRequestService: namedBlobPath (with blobName == null)
 
-    Note over FrontendRestRequestService: Route condition (line 335-338):<br/>matchesOperation("named") &&<br/>blobName == null → list request
+    Note over FrontendRestRequestService: Route condition:<br/>matchesOperation("named") &&<br/>blobName == null → list request
 
     %% Handler Invocation
     FrontendRestRequestService->>NamedBlobListHandler: handle(restRequest, restResponseChannel, callback)
-    Note over NamedBlobListHandler: Line 80-83
 
     NamedBlobListHandler->>CallbackChain: new CallbackChain(...)
     CallbackChain->>CallbackChain: start()
-    Note over CallbackChain: Line 110-125:<br/>- Inject metrics<br/>- Inject account/container<br/>- Check namedBlobDb != null
+    Note over CallbackChain: - Inject metrics<br/>- Inject account/container<br/>- Check namedBlobDb != null
 
     %% Security Processing
     CallbackChain->>SecurityService: processRequest(restRequest, callback)
     SecurityService-->>CallbackChain: securityProcessRequestCallback()
-    Note over CallbackChain: Line 132-136
 
     CallbackChain->>SecurityService: postProcessRequest(restRequest, callback)
     SecurityService-->>CallbackChain: securityPostProcessRequestCallback()
-    Note over CallbackChain: Line 142-156
 
     %% Parse Parameters & Start List
     CallbackChain->>NamedBlobPath: parse(requestPath, args)
     NamedBlobPath-->>CallbackChain: accountName, containerName, prefix, pageToken
 
-    CallbackChain->>CallbackChain: listRecursively(accountName, containerName, prefix, pageToken, maxKey, groupDirs)
-    Note over CallbackChain: Line 190-198: Top-level recursive aggregation
+    CallbackChain->>CallbackChain: listRecursively(...)
+    Note over CallbackChain: Top-level recursive aggregation
 
-    %% Recursive List Internal
+    %% Single Path to Composite DB
     rect rgb(240, 248, 255)
-        Note over CallbackChain,MySqlNamedBlobDb: Recursive Pagination Loop
+        Note over CallbackChain,S3: Single Path Through CompositeNamedBlobDb
 
-        CallbackChain->>CallbackChain: listRecursivelyInternal(...)
-        Note over CallbackChain: Line 218-254
+        CallbackChain->>CompositeNamedBlobDb: list(accountName, containerName, prefix, pageToken, maxKey)
+        Note over CompositeNamedBlobDb: Implements NamedBlobDb interface
 
-        CallbackChain->>NamedBlobDb: list(accountName, containerName, prefix, pageToken, maxKey)
-        Note over NamedBlobDb: Interface method - Line 70
+        %% Migration Phase Decision
+        alt Migration Phase: MySQL Only (pre-migration)
+            CompositeNamedBlobDb->>MySqlNamedBlobDb: list(...)
+            MySqlNamedBlobDb->>Database: SQL Query
+            Database-->>MySqlNamedBlobDb: ResultSet
+            MySqlNamedBlobDb-->>CompositeNamedBlobDb: Page<NamedBlobRecord>
 
-        NamedBlobDb->>MySqlNamedBlobDb: list(...)
-        Note over MySqlNamedBlobDb: Line 312-322
+        else Migration Phase: Dual Read with Verification
+            par Read from both backends
+                CompositeNamedBlobDb->>MySqlNamedBlobDb: list(...)
+                MySqlNamedBlobDb->>Database: SQL Query
+                Database-->>MySqlNamedBlobDb: ResultSet
+                MySqlNamedBlobDb-->>CompositeNamedBlobDb: mysqlPage
+            and
+                CompositeNamedBlobDb->>S3NamedBlobDb: list(...)
+                S3NamedBlobDb->>S3: ListObjectsV2
+                S3-->>S3NamedBlobDb: ListObjectsV2Response
+                S3NamedBlobDb-->>CompositeNamedBlobDb: s3Page
+            end
 
-        MySqlNamedBlobDb->>MySqlNamedBlobDb: executeTransactionAsync(...)
+            Note over CompositeNamedBlobDb: Return MySQL result to caller<br/>(source of truth during migration)
 
-        MySqlNamedBlobDb->>MySqlNamedBlobDb: run_list_v2(...)
-        Note over MySqlNamedBlobDb: Line 619-662:<br/>Constructs SQL query
+            CompositeNamedBlobDb->>CompositeNamedBlobDb: scheduleAsyncVerification(mysqlPage, s3Page)
+            Note over CompositeNamedBlobDb: Async: Compare blobName, blobSize<br/>Log discrepancies, emit metrics
 
-        MySqlNamedBlobDb->>Database: PreparedStatement.executeQuery()
-        Note over Database: SQL filters by:<br/>- account_id, container_id<br/>- blob_state = READY<br/>- prefix LIKE pattern<br/>- not deleted/expired
-
-        Database-->>MySqlNamedBlobDb: ResultSet
-
-        loop For each row in ResultSet
-            MySqlNamedBlobDb->>MySqlNamedBlobDb: Build NamedBlobRecord
-            Note over MySqlNamedBlobDb: Line 641-655:<br/>blobName, blobId, version,<br/>deletionTime, blobSize, modifiedTime
+        else Migration Phase: S3 Only (post-migration)
+            CompositeNamedBlobDb->>S3NamedBlobDb: list(...)
+            S3NamedBlobDb->>S3: ListObjectsV2
+            S3-->>S3NamedBlobDb: ListObjectsV2Response
+            S3NamedBlobDb-->>CompositeNamedBlobDb: Page<NamedBlobRecord>
         end
 
-        MySqlNamedBlobDb->>Page: new Page(entries, nextContinuationToken)
-        Note over Page: Line 44-47
+        CompositeNamedBlobDb-->>CallbackChain: Page<NamedBlobRecord>
+    end
 
-        Page-->>MySqlNamedBlobDb: Page<NamedBlobRecord>
-        MySqlNamedBlobDb-->>NamedBlobDb: Page<NamedBlobRecord>
-        NamedBlobDb-->>CallbackChain: currentPage
+    %% Recursive aggregation continues if needed
+    CallbackChain->>CallbackChain: mergePageResults(aggregatedPage, currentPage, ...)
+    Note over CallbackChain: - Accumulates entries<br/>- Handles directory grouping<br/>- Sets nextPageToken
 
-        CallbackChain->>CallbackChain: mergePageResults(aggregatedPage, currentPage, ...)
-        Note over CallbackChain: Line 276-310:<br/>- Accumulates entries<br/>- Handles directory grouping<br/>- Sets nextPageToken
-
-        alt entries.size() < maxKey && tokenToUse != null
-            CallbackChain->>CallbackChain: listRecursivelyInternal(...) [recurse]
-        else entries.size() >= maxKey OR tokenToUse == null
-            CallbackChain-->>CallbackChain: Return aggregated Page
-        end
+    alt entries.size() < maxKey && tokenToUse != null
+        CallbackChain->>CallbackChain: listRecursivelyInternal(...) [recurse]
+    else entries.size() >= maxKey OR tokenToUse == null
+        CallbackChain-->>CallbackChain: Return aggregated Page
     end
 
     %% Response Serialization
     CallbackChain->>CallbackChain: listBlobsCallback()
-    Note over CallbackChain: Line 162-171
 
     rect rgb(255, 250, 205)
         Note over CallbackChain,Page: ★ INTROSPECTION POINT ★<br/>Page<NamedBlobRecord> is complete here<br/>and can be inspected before serialization
@@ -126,46 +159,80 @@ sequenceDiagram
     Note over Client: Response JSON:<br/>{"entries": [...], "nextPageToken": "..."}
 ```
 
+## CompositeNamedBlobDb Architecture
+
+The `CompositeNamedBlobDb` is the **central component** that implements the `NamedBlobDb` interface and encapsulates all migration logic.
+
+### Responsibilities
+
+| Responsibility | Description |
+|---------------|-------------|
+| Backend Selection | Decides which backend(s) to query based on migration phase configuration |
+| Result Routing | Returns results from the appropriate backend (MySQL during migration, S3 after) |
+| Async Verification | Schedules background comparison of MySQL vs S3 results |
+| Metric Emission | Tracks latency, discrepancies, and verification results |
+
+### Migration Phases
+
+```
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│  Phase 1: MySQL  │───▶│ Phase 2: Dual    │───▶│  Phase 3: S3     │
+│     Only         │    │ Read + Verify    │    │     Only         │
+└──────────────────┘    └──────────────────┘    └──────────────────┘
+       │                        │                        │
+       ▼                        ▼                        ▼
+  Read: MySQL             Read: Both               Read: S3
+  Return: MySQL           Return: MySQL            Return: S3
+  Verify: None            Verify: Async            Verify: None
+```
+
+### Verification Strategy
+
+During Phase 2 (Dual Read), the composite performs async verification:
+
+1. **Time-based sampling**: Verify at most N requests per time period
+2. **Field comparison**: Compare only `blobName` and `blobSize`
+3. **Non-blocking**: Verification runs in background thread
+4. **Metrics**: Emit counters for matches/mismatches
+
 ## Class/Method Reference Table
 
-| Step | File | Class | Method | Line |
-|------|------|-------|--------|------|
-| 1 | `ambry-frontend/.../FrontendRestRequestService.java` | `FrontendRestRequestService` | `handleGet()` | 304 |
-| 2 | `ambry-api/.../frontend/NamedBlobPath.java` | `NamedBlobPath` | `parse()` | 54 |
-| 3 | `ambry-frontend/.../NamedBlobListHandler.java` | `NamedBlobListHandler` | `handle()` | 80 |
-| 4 | `ambry-frontend/.../NamedBlobListHandler.java` | `CallbackChain` | `start()` | 110 |
-| 5 | `ambry-frontend/.../NamedBlobListHandler.java` | `CallbackChain` | `securityProcessRequestCallback()` | 132 |
-| 6 | `ambry-frontend/.../NamedBlobListHandler.java` | `CallbackChain` | `securityPostProcessRequestCallback()` | 142 |
-| 7 | `ambry-frontend/.../NamedBlobListHandler.java` | `CallbackChain` | `listRecursively()` | 190 |
-| 8 | `ambry-frontend/.../NamedBlobListHandler.java` | `CallbackChain` | `listRecursivelyInternal()` | 218 |
-| 9 | `ambry-api/.../named/NamedBlobDb.java` | `NamedBlobDb` | `list()` | 70 |
-| 10 | `ambry-named-mysql/.../MySqlNamedBlobDb.java` | `MySqlNamedBlobDb` | `list()` | 312 |
-| 11 | `ambry-named-mysql/.../MySqlNamedBlobDb.java` | `MySqlNamedBlobDb` | `run_list_v2()` | 619 |
-| 12 | `ambry-frontend/.../NamedBlobListHandler.java` | `CallbackChain` | `mergePageResults()` | 276 |
-| 13 | `ambry-frontend/.../NamedBlobListHandler.java` | `CallbackChain` | `listBlobsCallback()` | 162 |
-| 14 | `ambry-api/.../frontend/Page.java` | `Page<T>` | `toJson()` | 68 |
-| 15 | `ambry-api/.../frontend/NamedBlobListEntry.java` | `NamedBlobListEntry` | `toJson()` | ~106 |
+| Step | Class | Method | Description |
+|------|-------|--------|-------------|
+| 1 | `FrontendRestRequestService` | `handleGet()` | HTTP entry point |
+| 2 | `NamedBlobPath` | `parse()` | Extract request parameters |
+| 3 | `NamedBlobListHandler` | `handle()` | Handler invocation |
+| 4 | `CallbackChain` | `start()` | Initialize async chain |
+| 5 | `CallbackChain` | `securityProcessRequestCallback()` | Security pre-processing |
+| 6 | `CallbackChain` | `securityPostProcessRequestCallback()` | Security post-processing |
+| 7 | `CallbackChain` | `listRecursively()` | Start recursive aggregation |
+| 8 | `CompositeNamedBlobDb` | `list()` | **Single entry point** - routes to backend(s) |
+| 9 | `MySqlNamedBlobDb` | `list()` | MySQL implementation |
+| 10 | `S3NamedBlobDb` | `list()` | S3 implementation |
+| 11 | `CompositeNamedBlobDb` | `scheduleAsyncVerification()` | Background comparison |
+| 12 | `CallbackChain` | `mergePageResults()` | Aggregate pages |
+| 13 | `CallbackChain` | `listBlobsCallback()` | Serialize response |
+| 14 | `Page<T>` | `toJson()` | Convert to JSON |
+| 15 | `NamedBlobListEntry` | `toJson()` | Entry serialization |
 
 ## Detailed Flow Description
 
 ### 1. HTTP Entry Point (`FrontendRestRequestService.handleGet()`)
 
+The routing logic checks:
+- Request matches `/named/...` operation
+- `blobName` is `null` (indicating a list request, not a single blob fetch)
+
 ```java
-// Line 335-338 in FrontendRestRequestService.java
 } else if (requestPath.matchesOperation(Operations.NAMED_BLOB)
     && NamedBlobPath.parse(requestPath, restRequest.getArgs()).getBlobName() == null) {
   namedBlobListHandler.handle(restRequest, restResponseChannel, callback);
 }
 ```
 
-The routing logic checks:
-- Request matches `/named/...` operation
-- `blobName` is `null` (indicating a list request, not a single blob fetch)
-
 ### 2. Handler Initialization (`NamedBlobListHandler.handle()`)
 
 ```java
-// Line 80-83
 public void handle(RestRequest restRequest, RestResponseChannel restResponseChannel,
     Callback<ReadableStreamChannel> callback) {
   new CallbackChain(restRequest, restResponseChannel, callback).start();
@@ -176,14 +243,69 @@ public void handle(RestRequest restRequest, RestResponseChannel restResponseChan
 
 The `CallbackChain` inner class orchestrates the async processing:
 
-1. **`start()`** (line 110): Initializes metrics, injects account/container, validates namedBlobDb
-2. **`securityProcessRequestCallback()`** (line 132): Pre-processes security
-3. **`securityPostProcessRequestCallback()`** (line 142): Post-processes security, then initiates listing
+1. **`start()`**: Initializes metrics, injects account/container, validates namedBlobDb
+2. **`securityProcessRequestCallback()`**: Pre-processes security
+3. **`securityPostProcessRequestCallback()`**: Post-processes security, then initiates listing
 
-### 4. Recursive List Aggregation (`listRecursively()`)
+### 4. CompositeNamedBlobDb.list()
+
+The composite is the **single implementation** of `NamedBlobDb` injected into the handler. It encapsulates all backend routing:
 
 ```java
-// Line 190-198
+public class CompositeNamedBlobDb implements NamedBlobDb {
+    private final MySqlNamedBlobDb mysqlDb;
+    private final S3NamedBlobDb s3Db;
+    private final MigrationPhase phase;
+    private final VerificationService verificationService;
+
+    @Override
+    public CompletableFuture<Page<NamedBlobRecord>> list(
+            String accountName, String containerName,
+            String blobNamePrefix, String pageToken, Integer maxKeys) {
+
+        switch (phase) {
+            case MYSQL_ONLY:
+                return mysqlDb.list(accountName, containerName, blobNamePrefix, pageToken, maxKeys);
+
+            case DUAL_READ_VERIFY:
+                CompletableFuture<Page<NamedBlobRecord>> mysqlFuture =
+                    mysqlDb.list(accountName, containerName, blobNamePrefix, pageToken, maxKeys);
+                CompletableFuture<Page<NamedBlobRecord>> s3Future =
+                    s3Db.list(accountName, containerName, blobNamePrefix, pageToken, maxKeys);
+
+                return mysqlFuture.thenCompose(mysqlPage -> {
+                    s3Future.thenAccept(s3Page ->
+                        verificationService.scheduleAsyncVerification(mysqlPage, s3Page));
+                    return CompletableFuture.completedFuture(mysqlPage);
+                });
+
+            case S3_ONLY:
+                return s3Db.list(accountName, containerName, blobNamePrefix, pageToken, maxKeys);
+        }
+    }
+}
+```
+
+### 5. Backend Implementations
+
+#### MySqlNamedBlobDb.list()
+
+Queries MySQL with filters:
+- `account_id`, `container_id`
+- `blob_state = READY`
+- `blob_name LIKE prefix%`
+- `(deleted_ts IS NULL OR deleted_ts > NOW())`
+
+#### S3NamedBlobDb.list()
+
+Calls S3 ListObjectsV2:
+- Uses prefix: `{accountId}/{containerId}/{blobNamePrefix}`
+- Returns all objects (no metadata filtering possible)
+- See [S3 Named Blob DB Specification](s3-named-blob-db-list-specification.md) for behavioral differences
+
+### 6. Recursive Aggregation (`listRecursively()`)
+
+```java
 public CompletableFuture<Page<NamedBlobRecord>> listRecursively(
     String accountName, String containerName, String blobNamePrefix,
     String pageToken, Integer maxKey, boolean groupDirectories) {
@@ -198,37 +320,14 @@ This recursively fetches and merges pages until:
 - `maxKey` entries are accumulated, OR
 - No more pages exist (`nextPageToken == null`)
 
-### 5. Database Query (`MySqlNamedBlobDb.run_list_v2()`)
+### 7. Response Serialization (`listBlobsCallback()`)
 
 ```java
-// Line 619-662
-private Page<NamedBlobRecord> run_list_v2(...) {
-  // Constructs SQL query with filters:
-  // - account_id, container_id
-  // - blob_state = READY
-  // - blob_name LIKE prefix%
-  // - (deleted_ts IS NULL OR deleted_ts > NOW())
-
-  ResultSet resultSet = statement.executeQuery();
-  List<NamedBlobRecord> entries = new ArrayList<>();
-  while (resultSet.next()) {
-    // Build NamedBlobRecord from each row
-    entries.add(new NamedBlobRecord(...));
-  }
-  return new Page<>(entries, nextContinuationToken);
-}
-```
-
-### 6. Response Serialization (`listBlobsCallback()`)
-
-```java
-// Line 162-171
 private Callback<Page<NamedBlobRecord>> listBlobsCallback() {
   return buildCallback(frontendMetrics.listDbLookupMetrics, page -> {
     ReadableStreamChannel channel = serializeJsonToChannel(
         page.toJson(record -> new NamedBlobListEntry(record).toJson())
     );
-    // Set response headers and return
     finalCallback.onCompletion(channel, null);
   }, uri, LOGGER, finalCallback);
 }
@@ -240,7 +339,7 @@ private Callback<Page<NamedBlobRecord>> listBlobsCallback() {
 
 The **complete list is available for introspection** at the following point:
 
-### Location: `NamedBlobListHandler.java`, line 163
+### Location: `NamedBlobListHandler.java`, in `listBlobsCallback()`
 
 ```java
 private Callback<Page<NamedBlobRecord>> listBlobsCallback() {
@@ -287,11 +386,9 @@ Each `NamedBlobRecord` contains:
 
 ### Alternative Introspection Points
 
-1. **After `listRecursively()` completes** (line 150-154): The `CompletableFuture<Page<NamedBlobRecord>>` resolves with the complete page.
-
-2. **Inside `mergePageResults()`** (line 276-310): Observe the accumulation process and intermediate states.
-
-3. **After `run_list_v2()`** (line 656): Each individual database page before aggregation.
+1. **Inside `CompositeNamedBlobDb.list()`**: Observe backend selection and verification scheduling
+2. **After `listRecursively()` completes**: The `CompletableFuture<Page<NamedBlobRecord>>` resolves with the complete page
+3. **Inside `mergePageResults()`**: Observe the accumulation process and intermediate states
 
 ---
 
@@ -320,3 +417,10 @@ Each `NamedBlobRecord` contains:
 ```
 
 Where `nextPageToken` is `null` if no more pages exist.
+
+---
+
+## Related Documentation
+
+- [S3 Named Blob DB List Specification](s3-named-blob-db-list-specification.md) - Detailed spec for S3 implementation
+- [Ambry Named Blob Architecture Guide](ambry-named-blob-architecture-guide.md) - System architecture overview
