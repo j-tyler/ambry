@@ -98,7 +98,7 @@ LIMIT ?
 ListObjectsV2Request.builder()
     .bucket(bucket)
     .prefix("{accountId}/{containerId}/")
-    .startAfter(pageToken != null ? "{accountId}/{containerId}/" + pageToken : null)
+    .startAfter(pageToken != null && !pageToken.isEmpty() ? "{accountId}/{containerId}/" + pageToken : null)
     .maxKeys(maxKeys + 1)
     .build()
 ```
@@ -127,7 +127,7 @@ LIMIT ?
 ListObjectsV2Request.builder()
     .bucket(bucket)
     .prefix("{accountId}/{containerId}/" + blobNamePrefix)
-    .startAfter(pageToken != null ? "{accountId}/{containerId}/" + pageToken : null)
+    .startAfter(pageToken != null && !pageToken.isEmpty() ? "{accountId}/{containerId}/" + pageToken : null)
     .maxKeys(maxKeys + 1)
     .build()
 ```
@@ -542,7 +542,7 @@ public CompletableFuture<Page<NamedBlobRecord>> list(
             ListObjectsV2Request.builder()
                 .bucket(bucket)
                 .prefix(s3Prefix)
-                .startAfter(pageToken != null ? s3Prefix + pageToken : null)
+                .startAfter(pageToken != null && !pageToken.isEmpty() ? s3Prefix + pageToken : null)
                 .maxKeys(maxKeys + 1)
                 .build());
 
@@ -611,7 +611,7 @@ S3's `ContinuationToken` is an opaque string that cannot be used interchangeably
 ListObjectsV2Request.builder()
     .bucket(bucket)
     .prefix(s3Prefix)
-    .startAfter(pageToken != null ? s3Prefix + pageToken : null)
+    .startAfter(pageToken != null && !pageToken.isEmpty() ? s3Prefix + pageToken : null)
     .maxKeys(maxKeys + 1)
     .build()
 ```
