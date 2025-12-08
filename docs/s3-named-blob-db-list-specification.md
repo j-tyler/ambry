@@ -136,27 +136,170 @@ ListObjectsV2Request.builder()
 
 **Condition**: `delimiter == "/" && frontendConfig.enableDelimiter`
 
-**Note**: Directory grouping is handled at the `NamedBlobListHandler` layer, not in `NamedBlobDb.list()`. The handler calls `extractDirectory()` to convert blob names into virtual directory entries.
+**Note**: Directory grouping is handled at the `NamedBlobListHandler` layer, not in `NamedBlobDb.list()`. The handler calls `extractDirectory()` to convert blob names into virtual directory entries:
 
-**MySQL**: No change to query - filtering done in Java code.
+```java
+// NamedBlobListHandler.java - extractDirectory() logic
+private NamedBlobRecord extractDirectory(NamedBlobRecord blobRecord, int delimiterIndex) {
+    String directoryName = blobRecord.getBlobName().substring(0, delimiterIndex + 1);
+    return new NamedBlobRecord(
+        blobRecord.getAccountName(),
+        blobRecord.getContainerName(),
+        directoryName,
+        "", // blobId
+        Utils.Infinite_Time, // expirationTimeMs
+        0L, // version
+        0L, // blobSize (directories have 0 size)
+        0L, // modifiedTimeMs (directories have 0 modifiedTime)
+        true // isDirectory = true
+    );
+}
+```
 
-**S3 Implementation**: Two options:
+**MySQL**: No change to query - directory extraction done in Java code at the handler layer.
 
-- **Option A (Recommended)**: Use S3 native delimiter support
-  ```
-  ListObjectsV2Request.builder()
-      .prefix("{accountId}/{containerId}/" + blobNamePrefix)
-      .delimiter("/")
-      .build()
-  ```
-  Then map `CommonPrefixes` to directory `NamedBlobRecord` entries.
+**S3 Implementation**: Two options with different tradeoffs:
 
-- **Option B**: Match MySQL behavior exactly - fetch all, filter in Java.
-  This ensures byte-identical behavior but is less efficient.
+##### Option A: Native S3 Delimiter Support
 
-**Decision**: Use **Option B** for migration phase to ensure identical behavior. Option A can be enabled post-migration via configuration.[^1]
+Use S3's built-in delimiter capability:
 
-[^1]: Option A (native S3 delimiter) is more efficient but may have subtle behavioral differences in edge cases like empty directory markers or blob names containing consecutive delimiters.
+```java
+ListObjectsV2Request.builder()
+    .bucket(bucket)
+    .prefix("{accountId}/{containerId}/" + blobNamePrefix)
+    .delimiter("/")
+    .maxKeys(maxKeys + 1)
+    .build()
+```
+
+S3 returns two collections:
+- `Contents`: Objects that don't contain the delimiter after the prefix
+- `CommonPrefixes`: Unique prefixes up to and including the first delimiter occurrence
+
+**Mapping CommonPrefixes to NamedBlobRecord**:
+```java
+private List<NamedBlobRecord> mapCommonPrefixes(
+        List<CommonPrefix> commonPrefixes, String accountName, String containerName, String s3Prefix) {
+    return commonPrefixes.stream()
+        .map(cp -> {
+            String fullPrefix = cp.prefix();
+            String blobName = fullPrefix.substring(s3Prefix.length()); // Remove account/container prefix
+            return new NamedBlobRecord(
+                accountName,
+                containerName,
+                blobName,
+                "",   // blobId - not applicable for directories
+                Utils.Infinite_Time, // expirationTimeMs
+                0L,   // version
+                0L,   // blobSize = 0 for directories
+                0L,   // modifiedTimeMs = 0 for directories
+                true  // isDirectory = true
+            );
+        })
+        .collect(Collectors.toList());
+}
+```
+
+**Pros**:
+- More efficient: S3 aggregates results server-side
+- Reduced data transfer: Only returns unique prefixes, not all matching objects
+- Native S3 behavior: Matches what S3-native clients expect
+
+**Cons**:
+- Behavioral divergence from MySQL path:
+  - Handler's `extractDirectory()` is bypassed entirely
+  - Verification against MySQL is not possible at the `Page<NamedBlobRecord>` level
+  - Edge cases may differ (empty directory markers, consecutive delimiters)
+
+##### Option B: Flat List with Handler-Level Grouping
+
+Return flat list from `S3NamedBlobDb.list()` without delimiter processing:
+
+```java
+public class S3NamedBlobDb implements NamedBlobDb {
+
+    @Override
+    public CompletableFuture<Page<NamedBlobRecord>> list(
+            String accountName, String containerName,
+            String blobNamePrefix, String pageToken, Integer maxKeys) {
+
+        // Return flat list - NO delimiter handling in S3NamedBlobDb
+        // Handler's extractDirectory() will be applied (same as MySQL path)
+        ListObjectsV2Request request = ListObjectsV2Request.builder()
+            .bucket(bucket)
+            .prefix(buildS3Prefix(accountName, containerName, blobNamePrefix))
+            .startAfter(pageToken != null && !pageToken.isEmpty()
+                ? buildFullKey(accountName, containerName, pageToken)
+                : null)
+            .maxKeys(maxKeys + 1)
+            // NO .delimiter() - return all objects
+            .build();
+
+        // ... convert S3 response to Page<NamedBlobRecord>
+    }
+}
+```
+
+**Pros**:
+- Identical code path: Both MySQL and S3 records pass through `extractDirectory()`
+- Enables verification: `CompositeNamedBlobDb` can compare MySQL and S3 responses directly
+- Predictable behavior: No S3-specific edge cases to handle
+
+**Cons**:
+- Less efficient: Fetches all objects, groups client-side
+- More data transfer: Returns full object list even when only directory prefixes are needed
+
+##### Decision: Use Option B for Migration Phase
+
+**Decision**: Use **Option B** (flat list) during migration to enable response verification.
+
+**Rationale**:
+1. **Verification Capability**: During dual-write migration, we need to verify MySQL and S3 return equivalent results. With Option B, both backends return the same shape of data that goes through the same handler processing:
+
+   ```java
+   // In CompositeNamedBlobDb during migration verification
+   Page<NamedBlobRecord> mysqlPage = mysqlDb.list(account, container, prefix, token, maxKeys).join();
+   Page<NamedBlobRecord> s3Page = s3Db.list(account, container, prefix, token, maxKeys).join();
+
+   // Direct comparison - same shape, same handler processing
+   assertPagesEquivalent(mysqlPage, s3Page);
+   ```
+
+2. **Reduced Risk**: Matching MySQL behavior exactly eliminates a class of subtle bugs during migration.
+
+3. **Post-Migration Optimization**: After migration is complete and MySQL is decommissioned, add a configuration flag to enable Option A for better performance:
+
+   ```java
+   @Override
+   public CompletableFuture<Page<NamedBlobRecord>> list(...) {
+       if (config.useNativeS3Delimiter() && delimiter != null) {
+           // Option A - more efficient, used post-migration
+           return listWithNativeDelimiter(accountName, containerName, blobNamePrefix, delimiter, pageToken, maxKeys);
+       } else {
+           // Option B - verifiable, used during migration
+           return listFlat(accountName, containerName, blobNamePrefix, pageToken, maxKeys);
+       }
+   }
+   ```
+
+**Configuration Flag** (for future use):
+```java
+// S3NamedBlobDbConfig.java
+public class S3NamedBlobDbConfig {
+    /**
+     * When true, use S3's native delimiter support for directory listing.
+     * This is more efficient but prevents MySQL comparison verification.
+     * Should only be enabled after migration is complete.
+     * Default: false
+     */
+    @Config("s3.namedblobdb.use.native.delimiter")
+    @Default("false")
+    private boolean useNativeS3Delimiter;
+}
+```
+
+[^1]: Option A (native S3 delimiter) is more efficient but should only be enabled post-migration when MySQL verification is no longer needed.
 
 ---
 
