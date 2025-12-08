@@ -37,7 +37,7 @@ For S3 migration, both paths must be addressed with different integration points
 │  │                              │    │  │    NamedBlobPutHandler         │  │  │
 │  │                              │    │  └────────────────────────────────┘  │  │
 │  │                              │    │  ┌────────────────────────────────┐  │  │
-│  │                              │    │  │   NamedBlobDeleteHandler       │  │  │
+│  │                              │    │  │      DeleteBlobHandler         │  │  │
 │  │                              │    │  └────────────────────────────────┘  │  │
 │  └──────────────┬───────────────┘    └──────────────────┬───────────────────┘  │
 │                 │                                       │                       │
@@ -102,7 +102,8 @@ GET /named/{account}/{container}?prefix=...&page=...&maxKeys=...
 │ NamedBlobDb.list()                                │
 │                                                   │
 │   Returns: Page<NamedBlobRecord>                  │
-│   Implementations: MySqlNamedBlobDb, S3NamedBlobDb│
+│   Implementations: MySqlNamedBlobDb               │
+│   (S3NamedBlobDb is proposed, not yet implemented)│
 └───────────────────────────────────────────────────┘
 
                   ┌─────────────────┐
@@ -134,9 +135,10 @@ GET /named/{account}/{container}/{blobName}
 │ GetBlobHandler.handle()                           │
 │                                                   │
 │   1. Security checks                              │
-│   2. idConverter.convert() → resolves name to ID  │
-│      (internally calls NamedBlobDb.get())         │
-│   3. router.getBlob(blobId)                       │
+│   2. router.getBlob(restRequest, blobIdStr, ...)  │
+│      → Router internally calls idConverter        │
+│      → idConverter calls NamedBlobDb.get()        │
+│   3. Returns blob content via callback            │
 └───────────────────────────────────────────────────┘
                          │
           ┌──────────────┴──────────────┐
@@ -217,32 +219,50 @@ Content: <blob bytes>
 
 ### 2.4 DELETE Operation
 
-**Path**: Soft Delete Metadata + (Optional) Hard Delete Content
+**Path**: Soft Delete Metadata + Hard Delete Content
 
 ```
 DELETE /named/{account}/{container}/{blobName}
 
 ┌───────────────────────────────────────────────────┐
-│ NamedBlobDeleteHandler.handle()                   │
+│ FrontendRestRequestService.handleDelete()         │
 │                                                   │
-│   1. namedBlobDb.delete() → soft delete (sets     │
-│      deleted_ts, blob remains in DB)              │
-│   2. router.deleteBlob() → optional hard delete   │
+│   Routing: named blob path → DeleteBlobHandler    │
+└───────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌───────────────────────────────────────────────────┐
+│ DeleteBlobHandler.handle()                        │
+│                                                   │
+│   1. Security checks                              │
+│   2. router.deleteBlob(restRequest, null, ...)   │
+│      → Router detects named blob path             │
+│      → Router calls idConverter.convert()         │
+│      → idConverter calls namedBlobDb.delete()     │
+│         (soft delete + returns blob IDs)          │
+│      → Router deletes actual blob content         │
 └───────────────────────────────────────────────────┘
                          │
           ┌──────────────┴──────────────┐
           ▼                             ▼
 ┌──────────────────────┐   ┌────────────────────────┐
 │ NamedBlobDb.delete() │   │ Router.deleteBlob()    │
-│                      │   │ (optional/deferred)    │
-│ Soft delete:         │   │                        │
-│ • Sets deleted_ts    │   │ Hard delete:           │
-│ • Excluded from list │   │ • Removes from storage │
+│ (via IdConverter)    │   │                        │
+│                      │   │                        │
+│ Soft delete:         │   │ Hard delete:           │
+│ • Sets deleted_ts    │   │ • Removes from storage │
+│ • Returns blob IDs   │   │ • Uses IDs from delete │
+│ • Excluded from list │   │                        │
 └──────────────────────┘   └────────────────────────┘
 
               ┌────────────────────────────────┐
-              │  Router: OPTIONAL (deleteBlob) │
+              │  Router: YES (deleteBlob)      │
               │  NamedBlobDb: YES (delete)     │
+              │                                │
+              │  Sequence:                     │
+              │  1. NamedBlobDb.delete()       │
+              │     (via idConverter)          │
+              │  2. Router deletes content     │
               └────────────────────────────────┘
 ```
 
@@ -256,6 +276,9 @@ DELETE /named/{account}/{container}/{blobName}
 
 ```java
 // File: ambry-api/src/main/java/com/github/ambry/named/NamedBlobDb.java
+// Note: Only primary methods shown. Additional methods include:
+//   - pullStaleBlobs(Container, String) for cleanup operations
+//   - cleanupStaleData(List<StaleNamedBlob>) for garbage collection
 
 public interface NamedBlobDb extends Closeable {
 
@@ -282,6 +305,10 @@ public interface NamedBlobDb extends Closeable {
 
 ```java
 // File: ambry-api/src/main/java/com/github/ambry/router/Router.java
+// Note: Only primary methods shown. Additional methods include:
+//   - stitchBlob() for combining chunks into a single blob
+//   - undeleteBlob() for restoring deleted blobs
+//   - Various default convenience methods returning CompletableFuture
 
 public interface Router extends Closeable {
 
@@ -325,6 +352,8 @@ public class NamedBlobRecord {
 ### 4.2 NamedBlobState
 
 ```java
+// File: ambry-api/src/main/java/com/github/ambry/protocol/NamedBlobState.java
+
 public enum NamedBlobState {
     IN_PROGRESS,  // ordinal 0
     READY         // ordinal 1
@@ -343,6 +372,10 @@ public class Page<T> {
 ---
 
 ## 5. S3 Migration Strategy
+
+> **Note**: The S3 migration components described in this section (`S3NamedBlobDb`, `S3Router`,
+> `CompositeNamedBlobDb`, `CompositeRouter`) are **proposed implementations** and do not yet exist
+> in the codebase. This section describes the planned architecture for future migration work.
 
 ### 5.1 Component Mapping
 
@@ -422,7 +455,7 @@ public class Page<T> {
 | `NamedBlobListHandler` | `ambry-frontend/src/main/java/com/github/ambry/frontend/NamedBlobListHandler.java` |
 | `GetBlobHandler` | `ambry-frontend/src/main/java/com/github/ambry/frontend/GetBlobHandler.java` |
 | `NamedBlobPutHandler` | `ambry-frontend/src/main/java/com/github/ambry/frontend/NamedBlobPutHandler.java` |
-| `NamedBlobDeleteHandler` | `ambry-frontend/src/main/java/com/github/ambry/frontend/NamedBlobDeleteHandler.java` |
+| `DeleteBlobHandler` | `ambry-frontend/src/main/java/com/github/ambry/frontend/DeleteBlobHandler.java` |
 
 ### Tests
 
@@ -461,7 +494,7 @@ MySQL uses soft delete (`deleted_ts`). S3 lacks native equivalent. See specifica
 | `GET ?prefix=` | NamedBlobListHandler | `list()` | - |
 | `GET /{blob}` | GetBlobHandler | `get()` | `getBlob()` |
 | `PUT /{blob}` | NamedBlobPutHandler | `put()` | `putBlob()` |
-| `DELETE /{blob}` | NamedBlobDeleteHandler | `delete()` | `deleteBlob()` |
+| `DELETE /{blob}` | DeleteBlobHandler | `delete()` | `deleteBlob()` |
 
 ### Return Types
 
@@ -482,6 +515,7 @@ MySQL uses soft delete (`deleted_ts`). S3 lacks native equivalent. See specifica
 **Reviewer**: Claude (Opus 4)
 **Review Date**: 2025-12-08
 **Methodology**: Systematic verification of each claim against the Ambry codebase
+**Status**: ✅ All identified issues have been fixed in the sections above
 
 ---
 
@@ -721,17 +755,21 @@ All pitfalls are accurate and relevant:
 
 ---
 
-## Summary of Required Fixes
+## Summary of Applied Fixes
 
-1. **Critical**: Replace all references to `NamedBlobDeleteHandler` with `DeleteBlobHandler`
-   - Locations: Section 1 diagram, Section 2.4, Section 6 table, Appendix table
+The following issues were identified during review and have been corrected in the document:
 
-2. **Important**: Clarify that `S3NamedBlobDb`, `S3Router`, `CompositeNamedBlobDb`, and `CompositeRouter` are proposed implementations that don't exist yet
+1. ✅ **Critical**: Replaced all references to `NamedBlobDeleteHandler` with `DeleteBlobHandler`
+   - Fixed in: Section 1 diagram, Section 2.4, Section 6 table, Appendix table
 
-3. **Minor**: Add missing methods to interface contracts or note that only primary methods are shown:
-   - NamedBlobDb: `pullStaleBlobs()`, `cleanupStaleData()`
-   - Router: `stitchBlob()`, `undeleteBlob()`
+2. ✅ **Important**: Added notes clarifying that `S3NamedBlobDb`, `S3Router`, `CompositeNamedBlobDb`, and `CompositeRouter` are proposed implementations
+   - Fixed in: Section 2.1 LIST diagram, Section 5 header
 
-4. **Minor**: Correct NamedBlobState file path from `com/github/ambry/named/` to `com/github/ambry/protocol/`
+3. ✅ **Minor**: Added notes about additional interface methods
+   - Fixed in: Section 3.1 (NamedBlobDb), Section 3.2 (Router)
 
-5. **Clarification**: Update GET operation flow diagram to show that idConverter.convert() is called by Router, not directly by handler
+4. ✅ **Minor**: Added correct NamedBlobState file path `com/github/ambry/protocol/`
+   - Fixed in: Section 4.2
+
+5. ✅ **Clarification**: Updated GET operation flow to show Router calls idConverter internally
+   - Fixed in: Section 2.2
