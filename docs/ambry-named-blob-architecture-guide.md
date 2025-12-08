@@ -474,3 +474,264 @@ MySQL uses soft delete (`deleted_ts`). S3 lacks native equivalent. See specifica
 | `Router.getBlob()` | `GetBlobResult` |
 | `Router.putBlob()` | `String` (blobId) |
 | `Router.deleteBlob()` | `Void` |
+
+---
+
+## Architecture Review
+
+**Reviewer**: Claude (Opus 4)
+**Review Date**: 2025-12-08
+**Methodology**: Systematic verification of each claim against the Ambry codebase
+
+---
+
+### Executive Summary Review
+
+**Status**: ✅ **ACCEPT** (with clarification)
+
+**Claims verified**:
+1. ✅ Two distinct data paths exist: Router Path and NamedBlobDb Path
+2. ✅ Router handles blob content storage/retrieval via Ambry storage servers
+3. ✅ NamedBlobDb handles metadata (name→ID mappings) via database
+
+**Evidence**:
+- `NamedBlobDb` interface at `ambry-api/src/main/java/com/github/ambry/named/NamedBlobDb.java` (verified)
+- `Router` interface at `ambry-api/src/main/java/com/github/ambry/router/Router.java` (verified)
+- `MySqlNamedBlobDb` implementation exists at `ambry-named-mysql/src/main/java/com/github/ambry/named/MySqlNamedBlobDb.java` (verified)
+
+---
+
+### Section 1: System Architecture Overview
+
+**Status**: ⚠️ **PARTIAL REFUTE**
+
+**What is correct**:
+- ✅ `FrontendRestRequestService` handles HTTP routing with `handleGet()`, `handlePut()`, `handleDelete()`
+- ✅ `NamedBlobListHandler` exists at the specified path
+- ✅ `GetBlobHandler` exists at the specified path
+- ✅ `NamedBlobPutHandler` exists at the specified path
+- ✅ `NamedBlobDb` interface methods are correct (list, get, put, delete)
+- ✅ `Router` interface methods are correct (getBlob, putBlob, deleteBlob, updateBlobTtl)
+- ✅ `MySqlNamedBlobDb` and `NonBlockingRouter` implementations exist
+
+**What is INCORRECT**:
+- ❌ **`NamedBlobDeleteHandler` does NOT exist** as a class. The file `ambry-frontend/src/main/java/com/github/ambry/frontend/NamedBlobDeleteHandler.java` does not exist.
+  - **Actual behavior**: Named blob deletions are handled by `DeleteBlobHandler` (`ambry-frontend/src/main/java/com/github/ambry/frontend/DeleteBlobHandler.java`)
+  - Evidence: `FrontendRestRequestService.handleDelete()` at line 422 routes to `deleteBlobHandler.handle()`, not a separate `NamedBlobDeleteHandler`
+
+**Fix**: Replace `NamedBlobDeleteHandler` with `DeleteBlobHandler` in the architecture diagram.
+
+---
+
+### Section 2: Operation Flow Maps
+
+#### 2.1 LIST Operation
+**Status**: ✅ **ACCEPT** (with minor correction)
+
+**What is correct**:
+- ✅ LIST routes through `NamedBlobListHandler` when `blobName == null`
+- ✅ Handler calls `namedBlobDb.list()` directly
+- ✅ Returns `Page<NamedBlobRecord>` serialized to JSON
+- ✅ Router is NOT involved in LIST operations
+
+**Minor correction**:
+- ⚠️ The guide mentions `S3NamedBlobDb` as an implementation, but this class does **not exist** in the codebase. It is proposed for future S3 migration work.
+
+#### 2.2 GET Operation
+**Status**: ⚠️ **PARTIAL REFUTE**
+
+**What is correct**:
+- ✅ GET with blobName routes to `GetBlobHandler`
+- ✅ `NamedBlobDb.get()` is called to resolve name to ID
+- ✅ `Router.getBlob()` is called with the resolved blobId
+- ✅ The sequence is: NamedBlobDb.get() → Router.getBlob()
+
+**What needs clarification**:
+- ⚠️ The diagram shows `GetBlobHandler` directly calling `idConverter.convert()`. In reality:
+  - For named blob requests, `GetBlobHandler` calls `router.getBlob(restRequest, blobIdStr, ...)` (line 197-198)
+  - The **Router** (NonBlockingRouter) internally calls `idConverter.convert()` (line 323 in NonBlockingRouter.java)
+  - The IdConverter then calls `namedBlobDb.get()`
+
+**Fix**: Update the flow diagram to show that `idConverter.convert()` is called by the Router, not directly by the handler.
+
+#### 2.3 PUT Operation
+**Status**: ✅ **ACCEPT**
+
+**What is correct**:
+- ✅ PUT routes to `NamedBlobPutHandler`
+- ✅ `Router.putBlob()` is called first to store blob content
+- ✅ `NamedBlobDb.put()` is called after via `idConverter.convert()` to store metadata
+- ✅ The sequence is: Router.putBlob() → NamedBlobDb.put()
+
+**Evidence**: `NonBlockingRouter.createIdConverterCallbackForPutAndStitch()` (line 1000-1017) calls `idConverter.convert(restRequest, blobId, blobProperties, callback)` after putBlob succeeds.
+
+#### 2.4 DELETE Operation
+**Status**: ❌ **REFUTE**
+
+**What is INCORRECT**:
+- ❌ The handler is `DeleteBlobHandler`, NOT `NamedBlobDeleteHandler`
+- ❌ The flow description is inaccurate
+
+**Actual DELETE flow**:
+1. `FrontendRestRequestService.handleDelete()` routes to `DeleteBlobHandler.handle()`
+2. `DeleteBlobHandler` calls `router.deleteBlob(restRequest, null, serviceId, ...)` with `blobId = null`
+3. The Router detects a named blob path and internally calls `idConverter.convert()`
+4. `idConverter.convert()` calls `namedBlobDb.delete()` which performs soft delete AND returns blob IDs
+5. Router then calls actual blob deletion with the returned blob IDs
+
+**Evidence**: `AmbryIdConverterFactory.java` line 175-178:
+```java
+if (restRequest.getRestMethod() == RestMethod.DELETE) {
+    conversionFuture = getNamedBlobDb().delete(namedBlobPath.getAccountName(), namedBlobPath.getContainerName(),
+        namedBlobPath.getBlobName()).thenApply(DeleteResult::getBlobIds);
+```
+
+**Fix**: Rewrite Section 2.4 to use `DeleteBlobHandler` and show the correct flow where namedBlobDb.delete() happens during idConverter.convert().
+
+---
+
+### Section 3: Interface Contracts
+
+#### 3.1 NamedBlobDb Interface
+**Status**: ⚠️ **PARTIAL ACCEPT**
+
+**What is correct**:
+- ✅ `list()` signature is correct
+- ✅ `get()` signature is correct
+- ✅ `put()` signature is correct
+- ✅ `delete()` signature is correct
+- ✅ `updateBlobTtlAndStateToReady()` signature is correct
+
+**What is MISSING**:
+- ❌ The guide omits two additional methods in the interface:
+  - `CompletableFuture<StaleBlobsWithLatestBlobName> pullStaleBlobs(Container container, String blobName)`
+  - `CompletableFuture<Integer> cleanupStaleData(List<StaleNamedBlob> staleRecords)`
+
+**Fix**: Add the missing methods or note that only the primary methods are shown.
+
+#### 3.2 Router Interface
+**Status**: ⚠️ **PARTIAL ACCEPT**
+
+**What is correct**:
+- ✅ `getBlob()` signature is correct
+- ✅ `putBlob()` signature is correct
+- ✅ `deleteBlob()` signature is correct
+- ✅ `updateBlobTtl()` signature is correct
+
+**What is MISSING**:
+- ❌ The guide omits additional methods:
+  - `stitchBlob()` - for stitching multiple chunks
+  - `undeleteBlob()` - for undeleting blobs
+  - Default convenience methods that return `CompletableFuture`
+
+**Fix**: Add note that only primary methods are shown, or include the full interface.
+
+---
+
+### Section 4: Data Models
+
+#### 4.1 NamedBlobRecord
+**Status**: ✅ **ACCEPT**
+
+All fields verified at `ambry-api/src/main/java/com/github/ambry/named/NamedBlobRecord.java`:
+- ✅ `accountName`, `containerName`, `blobName`, `blobId` (String fields)
+- ✅ `expirationTimeMs`, `version`, `blobSize`, `modifiedTimeMs` (long fields)
+- ✅ `isDirectory` (boolean)
+
+#### 4.2 NamedBlobState
+**Status**: ✅ **ACCEPT**
+
+Verified at `ambry-api/src/main/java/com/github/ambry/protocol/NamedBlobState.java`:
+- ✅ `IN_PROGRESS` (ordinal 0)
+- ✅ `READY` (ordinal 1)
+
+**Note**: File path in guide says `com/github/ambry/named/` but actual path is `com/github/ambry/protocol/`
+
+#### 4.3 Page
+**Status**: ✅ **ACCEPT**
+
+Verified at `ambry-api/src/main/java/com/github/ambry/frontend/Page.java`:
+- ✅ `List<T> entries`
+- ✅ `String nextPageToken`
+
+---
+
+### Section 5: S3 Migration Strategy
+
+**Status**: ⚠️ **ACCEPT WITH CAVEATS**
+
+**What is correct**:
+- ✅ The component mapping table is conceptually correct
+- ✅ The migration architecture diagrams represent a valid approach
+- ✅ The implementation order is reasonable
+
+**Important caveat**:
+- ⚠️ `S3NamedBlobDb` and `S3Router` **do not exist** in the current codebase. These are proposed implementations for future migration work.
+- ⚠️ `CompositeNamedBlobDb` and `CompositeRouter` also do not exist yet
+
+**Recommendation**: Add a note clarifying these are proposed/planned implementations, not existing code.
+
+---
+
+### Section 6: Key Files Reference
+
+**Status**: ⚠️ **PARTIAL REFUTE**
+
+**Verified paths** (✅ = exists, ❌ = does not exist):
+- ✅ `NamedBlobDb`: `ambry-api/src/main/java/com/github/ambry/named/NamedBlobDb.java`
+- ✅ `Router`: `ambry-api/src/main/java/com/github/ambry/router/Router.java`
+- ✅ `MySqlNamedBlobDb`: `ambry-named-mysql/src/main/java/com/github/ambry/named/MySqlNamedBlobDb.java`
+- ✅ `NonBlockingRouter`: `ambry-router/src/main/java/com/github/ambry/router/NonBlockingRouter.java`
+- ✅ `NamedBlobListHandler`: `ambry-frontend/src/main/java/com/github/ambry/frontend/NamedBlobListHandler.java`
+- ✅ `GetBlobHandler`: `ambry-frontend/src/main/java/com/github/ambry/frontend/GetBlobHandler.java`
+- ✅ `NamedBlobPutHandler`: `ambry-frontend/src/main/java/com/github/ambry/frontend/NamedBlobPutHandler.java`
+- ❌ `NamedBlobDeleteHandler`: **DOES NOT EXIST** - Should be `DeleteBlobHandler` at `ambry-frontend/src/main/java/com/github/ambry/frontend/DeleteBlobHandler.java`
+- ✅ `MySqlNamedBlobDbIntegrationTest`: `ambry-named-mysql/src/integration-test/java/com/github/ambry/named/MySqlNamedBlobDbIntegrationTest.java`
+
+**Fix**: Replace `NamedBlobDeleteHandler` entry with:
+```
+| `DeleteBlobHandler` | `ambry-frontend/src/main/java/com/github/ambry/frontend/DeleteBlobHandler.java` |
+```
+
+---
+
+### Section 7: Common Pitfalls
+
+**Status**: ✅ **ACCEPT**
+
+All pitfalls are accurate and relevant:
+- ✅ 7.1 Async Handling - Correct about CompletableFuture usage
+- ✅ 7.2 Account/Container Resolution - Correct about name-to-ID mapping via AccountService
+- ✅ 7.3 Blob ID Format - Correct about Base64URL encoding
+- ✅ 7.4 Soft Delete vs Hard Delete - Correct about MySQL soft delete pattern
+
+---
+
+### Appendix: Quick Reference
+
+**Status**: ⚠️ **PARTIAL REFUTE**
+
+**Issues in Operation → Interface Mapping table**:
+- ❌ `DELETE /{blob}` handler should be `DeleteBlobHandler`, not `NamedBlobDeleteHandler`
+
+**Fix**: Update the DELETE row:
+```
+| `DELETE /{blob}` | DeleteBlobHandler | `delete()` | `deleteBlob()` |
+```
+
+---
+
+## Summary of Required Fixes
+
+1. **Critical**: Replace all references to `NamedBlobDeleteHandler` with `DeleteBlobHandler`
+   - Locations: Section 1 diagram, Section 2.4, Section 6 table, Appendix table
+
+2. **Important**: Clarify that `S3NamedBlobDb`, `S3Router`, `CompositeNamedBlobDb`, and `CompositeRouter` are proposed implementations that don't exist yet
+
+3. **Minor**: Add missing methods to interface contracts or note that only primary methods are shown:
+   - NamedBlobDb: `pullStaleBlobs()`, `cleanupStaleData()`
+   - Router: `stitchBlob()`, `undeleteBlob()`
+
+4. **Minor**: Correct NamedBlobState file path from `com/github/ambry/named/` to `com/github/ambry/protocol/`
+
+5. **Clarification**: Update GET operation flow diagram to show that idConverter.convert() is called by Router, not directly by handler
