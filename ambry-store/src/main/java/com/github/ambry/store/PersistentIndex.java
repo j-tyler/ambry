@@ -1544,7 +1544,9 @@ public class PersistentIndex implements LogSegmentSizeProvider {
     try {
       Offset logEndOffsetBeforeFind = log.getEndOffset();
       StoreFindToken storeToken = resetTokenIfRequired((StoreFindToken) token);
-      logger.trace("Time used to validate token: {}", (time.milliseconds() - startTimeInMs));
+      if (logger.isTraceEnabled()) {
+        logger.trace("Time used to validate token: {}", (time.milliseconds() - startTimeInMs));
+      }
       ConcurrentSkipListMap<Offset, IndexSegment> indexSegments = validIndexSegments;
       storeToken = revalidateStoreFindToken(storeToken, indexSegments, false);
 
@@ -1558,7 +1560,9 @@ public class PersistentIndex implements LogSegmentSizeProvider {
         logger.trace("Index : {} getting entries since {}", dataDir, offsetToStart);
         // check journal
         List<JournalEntry> entries = journal.getEntriesSince(offsetToStart, storeToken.getInclusive());
-        logger.trace("Journal based token, Time used to get entries: {}", (time.milliseconds() - startTimeInMs));
+        if (logger.isTraceEnabled()) {
+          logger.trace("Journal based token, Time used to get entries: {}", (time.milliseconds() - startTimeInMs));
+        }
         // we deliberately obtain a snapshot of the index segments AFTER fetching from the journal. This ensures that
         // any and all entries returned from the journal are guaranteed to be in the obtained snapshot of indexSegments.
         indexSegments = validIndexSegments;
@@ -1583,14 +1587,20 @@ public class PersistentIndex implements LogSegmentSizeProvider {
               break;
             }
           }
-          logger.trace("Journal based token, Time used to generate message entries: {}",
-              (time.milliseconds() - startTimeInMs));
+          if (logger.isTraceEnabled()) {
+            logger.trace("Journal based token, Time used to generate message entries: {}",
+                (time.milliseconds() - startTimeInMs));
+          }
 
           startTimeInMs = time.milliseconds();
-          logger.trace("Index : {} new offset from find info {}", dataDir, offsetEnd);
+          if (logger.isTraceEnabled()) {
+            logger.trace("Index : {} new offset from find info {}", dataDir, offsetEnd);
+          }
           eliminateDuplicates(messageEntries);
-          logger.trace("Journal based token, Time used to eliminate duplicates: {}",
-              (time.milliseconds() - startTimeInMs));
+          if (logger.isTraceEnabled()) {
+            logger.trace("Journal based token, Time used to eliminate duplicates: {}",
+                (time.milliseconds() - startTimeInMs));
+          }
           IndexSegment segmentOfToken = indexSegments.floorEntry(offsetEnd).getValue();
           StoreFindToken storeFindToken =
               new StoreFindToken(offsetEnd, sessionId, incarnationId, false, segmentOfToken.getResetKey(),
@@ -1616,21 +1626,27 @@ public class PersistentIndex implements LogSegmentSizeProvider {
             startTimeInMs = time.milliseconds();
             newToken = findEntriesFromSegmentStartOffset(entry.getKey(), null, messageEntries,
                 new FindEntriesCondition(maxTotalSizeOfEntries), indexSegments, storeToken.getInclusive());
-            logger.trace("Journal based to segment based token, Time used to find entries: {}",
-                (time.milliseconds() - startTimeInMs));
+            if (logger.isTraceEnabled()) {
+              logger.trace("Journal based to segment based token, Time used to find entries: {}",
+                  (time.milliseconds() - startTimeInMs));
+            }
 
             startTimeInMs = time.milliseconds();
             updateStateForMessages(messageEntries);
-            logger.trace("Journal based to segment based token, Time used to update state: {}",
-                (time.milliseconds() - startTimeInMs));
+            if (logger.isTraceEnabled()) {
+              logger.trace("Journal based to segment based token, Time used to update state: {}",
+                  (time.milliseconds() - startTimeInMs));
+            }
           } else {
             newToken = storeToken;
           }
           startTimeInMs = time.milliseconds();
           eliminateDuplicates(messageEntries);
-          logger.trace("Journal based to segment based token, Time used to eliminate duplicates: {}",
-              (time.milliseconds() - startTimeInMs));
-          logger.trace("Index [{}]: new FindInfo [{}]", dataDir, newToken);
+          if (logger.isTraceEnabled()) {
+            logger.trace("Journal based to segment based token, Time used to eliminate duplicates: {}",
+                (time.milliseconds() - startTimeInMs));
+            logger.trace("Index [{}]: new FindInfo [{}]", dataDir, newToken);
+          }
           long totalBytesRead = getTotalBytesRead(newToken, messageEntries, logEndOffsetBeforeFind, indexSegments);
           newToken.setBytesRead(totalBytesRead);
           return new FindInfo(messageEntries, newToken);
@@ -1650,16 +1666,22 @@ public class PersistentIndex implements LogSegmentSizeProvider {
           newToken = findEntriesFromSegmentStartOffset(storeToken.getOffset(), storeToken.getStoreKey(), messageEntries,
               new FindEntriesCondition(maxTotalSizeOfEntries), indexSegments, storeToken.getInclusive());
         }
-        logger.trace("Segment based token, Time used to find entries: {}", (time.milliseconds() - startTimeInMs));
+        if (logger.isTraceEnabled()) {
+          logger.trace("Segment based token, Time used to find entries: {}", (time.milliseconds() - startTimeInMs));
+        }
 
         startTimeInMs = time.milliseconds();
         updateStateForMessages(messageEntries);
-        logger.trace("Segment based token, Time used to update state: {}", (time.milliseconds() - startTimeInMs));
+        if (logger.isTraceEnabled()) {
+          logger.trace("Segment based token, Time used to update state: {}", (time.milliseconds() - startTimeInMs));
+        }
 
         startTimeInMs = time.milliseconds();
         eliminateDuplicates(messageEntries);
-        logger.trace("Segment based token, Time used to eliminate duplicates: {}",
-            (time.milliseconds() - startTimeInMs));
+        if (logger.isTraceEnabled()) {
+          logger.trace("Segment based token, Time used to eliminate duplicates: {}",
+              (time.milliseconds() - startTimeInMs));
+        }
 
         long totalBytesRead = getTotalBytesRead(newToken, messageEntries, logEndOffsetBeforeFind, indexSegments);
         newToken.setBytesRead(totalBytesRead);
