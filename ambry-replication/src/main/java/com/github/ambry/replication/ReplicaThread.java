@@ -1070,11 +1070,9 @@ public class ReplicaThread implements Runnable {
           exchangeMetadataResponseList.add(new ExchangeMetadataResponse(ServerErrorCode.TemporarilyDisabled));
         } else {
           try {
-            if (logger.isTraceEnabled()) {
-              logger.trace("Remote node: {} Thread name: {} Remote replica: {} Token from remote: {} Replica lag: {} ",
-                  remoteNode, threadName, remoteReplicaInfo.getReplicaId(), replicaMetadataResponseInfo.getFindToken(),
-                  replicaMetadataResponseInfo.getRemoteReplicaLagInBytes());
-            }
+            logger.trace("Remote node: {} Thread name: {} Remote replica: {} Token from remote: {} Replica lag: {} ",
+                remoteNode, threadName, remoteReplicaInfo.getReplicaId(), replicaMetadataResponseInfo.getFindToken(),
+                replicaMetadataResponseInfo.getRemoteReplicaLagInBytes());
             Set<MessageInfo> remoteMissingStoreMessages =
                 getMissingStoreMessages(replicaMetadataResponseInfo, remoteNode, remoteReplicaInfo);
             processReplicaMetadataResponse(remoteMissingStoreMessages, replicaMetadataResponseInfo, remoteReplicaInfo,
@@ -1200,10 +1198,8 @@ public class ReplicaThread implements Runnable {
               remoteReplicaInfo.getToken(), dataNodeId.getHostname(), getLocalReplicaPath(remoteReplicaInfo),
               remoteReplicaInfo.getReplicaId().getReplicaType(), replicationConfig.replicaMetadataRequestVersion);
       replicaMetadataRequestInfoList.add(replicaMetadataRequestInfo);
-      if (logger.isTraceEnabled()) {
-        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Token going to be sent to remote: {} ",
-            remoteNode, threadName, remoteReplicaInfo.getReplicaId(), remoteReplicaInfo.getToken());
-      }
+      logger.trace("Remote node: {} Thread name: {} Remote replica: {} Token going to be sent to remote: {} ",
+          remoteNode, threadName, remoteReplicaInfo.getReplicaId(), remoteReplicaInfo.getToken());
       if (remoteReplicaInfo.getLocalStore().getCurrentState() != ReplicaState.BOOTSTRAP) {
         allLocalStoreInBootstrap = false;
       }
@@ -1284,10 +1280,8 @@ public class ReplicaThread implements Runnable {
     Map<MessageInfo, StoreKey> remoteMessageToConvertedKeyNonNull = new HashMap<>();
     for (MessageInfo messageInfo : messageInfoList) {
       StoreKey storeKey = messageInfo.getStoreKey();
-      if (logger.isTraceEnabled()) {
-        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key from remote: {}", remoteNode, threadName,
-            remoteReplicaInfo.getReplicaId(), storeKey);
-      }
+      logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key from remote: {}", remoteNode, threadName,
+          remoteReplicaInfo.getReplicaId(), storeKey);
       StoreKey convertedKey = storeKeyConverter.getConverted(storeKey);
       if (skipPredicate == null) {
         logger.debug("SkipPredicate is null");
@@ -1302,11 +1296,9 @@ public class ReplicaThread implements Runnable {
     Set<MessageInfo> missingRemoteMessages = new HashSet<>();
     remoteMessageToConvertedKeyNonNull.forEach((messageInfo, convertedKey) -> {
       if (convertedMissingStoreKeys.contains(convertedKey)) {
-        if (logger.isTraceEnabled()) {
-          logger.trace(
-              "Remote node: {} Thread name: {} Remote replica: {} Key missing id (converted): {} Key missing id (remote): {}",
-              remoteNode, threadName, remoteReplicaInfo.getReplicaId(), convertedKey, messageInfo.getStoreKey());
-        }
+        logger.trace(
+            "Remote node: {} Thread name: {} Remote replica: {} Key missing id (converted): {} Key missing id (remote): {}",
+            remoteNode, threadName, remoteReplicaInfo.getReplicaId(), convertedKey, messageInfo.getStoreKey());
         missingRemoteMessages.add(messageInfo);
       }
     });
@@ -1354,10 +1346,8 @@ public class ReplicaThread implements Runnable {
       BlobId localKey = (BlobId) remoteKeyToLocalKeyMap.get(messageInfo.getStoreKey());
       if (localKey == null) {
         missingRemoteStoreMessages.remove(messageInfo);
-        if (logger.isTraceEnabled()) {
-          logger.trace("Remote node: {} Thread name: {} Remote replica: {} Remote key deprecated locally: {}", remoteNode,
-              threadName, remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
-        }
+        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Remote key deprecated locally: {}", remoteNode,
+            threadName, remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
       } else if (missingRemoteStoreMessages.contains(messageInfo)) {
         // The key is missing in the local store, we either send get request to fetch the content of this key, or does
         // nothing if the key is deleted or expired remotely.
@@ -1365,11 +1355,9 @@ public class ReplicaThread implements Runnable {
           // if the key is not present locally and if the remote replica has the message in deleted state,
           // it is not considered missing locally.
           missingRemoteStoreMessages.remove(messageInfo);
-          if (logger.isTraceEnabled()) {
-            logger.trace(
-                "Remote node: {} Thread name: {} Remote replica: {} Key in deleted state remotely: {} Local key: {}",
-                remoteNode, threadName, remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey(), localKey);
-          }
+          logger.trace(
+              "Remote node: {} Thread name: {} Remote replica: {} Key in deleted state remotely: {} Local key: {}",
+              remoteNode, threadName, remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey(), localKey);
           // A Repair event for Delete signifies that a Delete message was received from the remote and it is fired
           // as long as the Delete is guaranteed to have taken effect locally.
           if (notification != null) {
@@ -1380,10 +1368,8 @@ public class ReplicaThread implements Runnable {
           // if the key is not present locally and if the remote replica has the key as expired,
           // it is not considered missing locally.
           missingRemoteStoreMessages.remove(messageInfo);
-          if (logger.isTraceEnabled()) {
-            logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key in expired state remotely {}",
-                remoteNode, threadName, remoteReplicaInfo.getReplicaId(), localKey);
-          }
+          logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key in expired state remotely {}",
+              remoteNode, threadName, remoteReplicaInfo.getReplicaId(), localKey);
         }
       } else {
         // The key is present in the local store. Compare blob properties (ttl_update, delete, undelete fields) in
@@ -1714,10 +1700,8 @@ public class ReplicaThread implements Runnable {
                 advanceToken(remoteReplicaInfo, exchangeMetadataResponse);
               }
 
-              if (logger.isTraceEnabled()) {
-                logger.trace("Remote node: {} Thread name: {} Remote replica: {} Token after speaking to remote node: {}",
-                    remoteNode, threadName, remoteReplicaInfo.getReplicaId(), exchangeMetadataResponse.remoteToken);
-              }
+              logger.trace("Remote node: {} Thread name: {} Remote replica: {} Token after speaking to remote node: {}",
+                  remoteNode, threadName, remoteReplicaInfo.getReplicaId(), exchangeMetadataResponse.remoteToken);
             } catch (StoreException e) {
               if (e.getErrorCode() != StoreErrorCodes.AlreadyExist) {
                 replicationMetrics.updateLocalStoreError(remoteReplicaInfo.getReplicaId());
@@ -1727,10 +1711,8 @@ public class ReplicaThread implements Runnable {
             }
           } else if (partitionResponseInfo.getErrorCode() == ServerErrorCode.BlobDeleted) {
             replicationMetrics.blobDeletedOnGetCount.inc();
-            if (logger.isTraceEnabled()) {
-              logger.trace("One of the blobs to GET is deleted: Remote node: {} Thread name: {} Remote replica: {}",
-                  remoteNode, threadName, remoteReplicaInfo.getReplicaId());
-            }
+            logger.trace("One of the blobs to GET is deleted: Remote node: {} Thread name: {} Remote replica: {}",
+                remoteNode, threadName, remoteReplicaInfo.getReplicaId());
           } else if (partitionResponseInfo.getErrorCode() == ServerErrorCode.BlobAuthorizationFailure) {
             replicationMetrics.blobAuthorizationFailureCount.inc();
             logger.error(
@@ -1826,17 +1808,13 @@ public class ReplicaThread implements Runnable {
       // time). Won't happen if a server is being recreated.
       messageInfo = new MessageInfo.Builder(messageInfo).isTtlUpdated(true).build();
       remoteReplicaInfo.getLocalStore().updateTtl(Collections.singletonList(messageInfo));
-      if (logger.isTraceEnabled()) {
-        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key ttl updated id: {}", remoteNode, threadName,
-            remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
-      }
+      logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key ttl updated id: {}", remoteNode, threadName,
+          remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
     } catch (StoreException e) {
       // The blob may be deleted or updated which is alright
       if (e.getErrorCode() == StoreErrorCodes.IDDeleted || e.getErrorCode() == StoreErrorCodes.AlreadyUpdated) {
-        if (logger.isTraceEnabled()) {
-          logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key already updated: {}", remoteNode,
-              threadName, remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
-        }
+        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key already updated: {}", remoteNode,
+            threadName, remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
       } else {
         throw e;
       }
@@ -1860,17 +1838,13 @@ public class ReplicaThread implements Runnable {
     try {
       messageInfo = new MessageInfo.Builder(messageInfo).isUndeleted(true).isDeleted(false).build();
       remoteReplicaInfo.getLocalStore().undelete(messageInfo);
-      if (logger.isTraceEnabled()) {
-        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key undelete id: {}", remoteNode, threadName,
-            remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
-      }
+      logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key undelete id: {}", remoteNode, threadName,
+          remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
     } catch (StoreException e) {
       // The blob may be undeleted, which is alright
       if (e.getErrorCode() == StoreErrorCodes.LifeVersionConflict || e.getErrorCode() == StoreErrorCodes.IDUndeleted) {
-        if (logger.isTraceEnabled()) {
-          logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key {}: {}", remoteNode, threadName,
-              remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey(), e.getErrorCode().name());
-        }
+        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key {}: {}", remoteNode, threadName,
+            remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey(), e.getErrorCode().name());
       } else {
         throw e;
       }
@@ -1894,17 +1868,13 @@ public class ReplicaThread implements Runnable {
     try {
       messageInfo = new MessageInfo.Builder(messageInfo).isDeleted(true).isUndeleted(false).build();
       remoteReplicaInfo.getLocalStore().delete(Collections.singletonList(messageInfo));
-      if (logger.isTraceEnabled()) {
-        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key delete: {}", remoteNode, threadName,
-            remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
-      }
+      logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key delete: {}", remoteNode, threadName,
+          remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey());
     } catch (StoreException e) {
       // The blob may be deleted or updated which is alright
       if (e.getErrorCode() == StoreErrorCodes.IDDeleted || e.getErrorCode() == StoreErrorCodes.LifeVersionConflict) {
-        if (logger.isTraceEnabled()) {
-          logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key {}: {}", remoteNode, threadName,
-              remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey(), e.getErrorCode().name());
-        }
+        logger.trace("Remote node: {} Thread name: {} Remote replica: {} Key {}: {}", remoteNode, threadName,
+            remoteReplicaInfo.getReplicaId(), messageInfo.getStoreKey(), e.getErrorCode().name());
       } else {
         throw e;
       }

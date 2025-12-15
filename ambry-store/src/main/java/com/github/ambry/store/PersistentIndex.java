@@ -1593,9 +1593,7 @@ public class PersistentIndex implements LogSegmentSizeProvider {
           }
 
           startTimeInMs = time.milliseconds();
-          if (logger.isTraceEnabled()) {
-            logger.trace("Index : {} new offset from find info {}", dataDir, offsetEnd);
-          }
+          logger.trace("Index : {} new offset from find info {}", dataDir, offsetEnd);
           eliminateDuplicates(messageEntries);
           if (logger.isTraceEnabled()) {
             logger.trace("Journal based token, Time used to eliminate duplicates: {}",
@@ -1645,8 +1643,8 @@ public class PersistentIndex implements LogSegmentSizeProvider {
           if (logger.isTraceEnabled()) {
             logger.trace("Journal based to segment based token, Time used to eliminate duplicates: {}",
                 (time.milliseconds() - startTimeInMs));
-            logger.trace("Index [{}]: new FindInfo [{}]", dataDir, newToken);
           }
+          logger.trace("Index [{}]: new FindInfo [{}]", dataDir, newToken);
           long totalBytesRead = getTotalBytesRead(newToken, messageEntries, logEndOffsetBeforeFind, indexSegments);
           newToken.setBytesRead(totalBytesRead);
           return new FindInfo(messageEntries, newToken);

@@ -226,19 +226,15 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
     try {
       switch (handshakeStatus) {
         case NEED_TASK:
-          if (logger.isTraceEnabled()) {
-            logger.trace(
-                "SSLHandshake NEED_TASK channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
-                getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
-          }
+          logger.trace(
+              "SSLHandshake NEED_TASK channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
+              getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
           handshakeStatus = runDelegatedTasks();
           break;
         case NEED_WRAP:
-          if (logger.isTraceEnabled()) {
-            logger.trace(
-                "SSLHandshake NEED_WRAP channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
-                getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
-          }
+          logger.trace(
+              "SSLHandshake NEED_WRAP channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
+              getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
           do {
             handshakeResult = handshakeWrap(write);
             if (handshakeResult.getStatus() == Status.BUFFER_OVERFLOW) {
@@ -250,12 +246,10 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
           } else if (handshakeResult.getStatus() == Status.CLOSED) {
             throw new EOFException("SSL handshake status CLOSED during handshake WRAP");
           }
-          if (logger.isTraceEnabled()) {
-            logger.trace(
-                "SSLHandshake NEED_WRAP channelId {}, handshakeResult {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
-                getConnectionId(), handshakeResult, appReadBuffer.position(), netReadBuffer.position(),
-                netWriteBuffer.position());
-          }
+          logger.trace(
+              "SSLHandshake NEED_WRAP channelId {}, handshakeResult {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
+              getConnectionId(), handshakeResult, appReadBuffer.position(), netReadBuffer.position(),
+              netWriteBuffer.position());
           //if handshake status is not NEED_UNWRAP or unable to flush netWriteBuffer contents
           //we will break here otherwise we can do need_unwrap in the same call.
           if (handshakeStatus != HandshakeStatus.NEED_UNWRAP || !flush(netWriteBuffer)) {
@@ -263,11 +257,9 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
             break;
           }
         case NEED_UNWRAP:
-          if (logger.isTraceEnabled()) {
-            logger.trace(
-                "SSLHandshake NEED_UNWRAP channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
-                getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
-          }
+          logger.trace(
+              "SSLHandshake NEED_UNWRAP channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
+              getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
           do {
             handshakeResult = handshakeUnwrap(read);
             if (handshakeResult.getStatus() == Status.BUFFER_OVERFLOW) {
@@ -279,12 +271,10 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
           } else if (handshakeResult.getStatus() == Status.CLOSED) {
             throw new EOFException("SSL handshake status CLOSED during handshake UNWRAP");
           }
-          if (logger.isTraceEnabled()) {
-            logger.trace(
-                "SSLHandshake NEED_UNWRAP channelId {}, handshakeResult {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
-                getConnectionId(), handshakeResult, appReadBuffer.position(), netReadBuffer.position(),
-                netWriteBuffer.position());
-          }
+          logger.trace(
+              "SSLHandshake NEED_UNWRAP channelId {}, handshakeResult {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
+              getConnectionId(), handshakeResult, appReadBuffer.position(), netReadBuffer.position(),
+              netWriteBuffer.position());
 
           //if handshakeStatus completed than fall-through to finished status.
           //after handshake is finished there is no data left to read/write in socketChannel.
@@ -471,9 +461,7 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
         long startTimeMs = System.currentTimeMillis();
         SSLEngineResult unwrapResult = sslEngine.unwrap(netReadBuffer, appReadBuffer);
         long decryptionTimeMs = System.currentTimeMillis() - startTimeMs;
-        if (logger.isTraceEnabled()) {
-          logger.trace("SSL decryption time: {} ms for {} bytes", decryptionTimeMs, unwrapResult.bytesProduced());
-        }
+        logger.trace("SSL decryption time: {} ms for {} bytes", decryptionTimeMs, unwrapResult.bytesProduced());
         if (unwrapResult.bytesProduced() > 0) {
           metrics.sslDecryptionTimeInUsPerKB.mark(
               TimeUnit.MILLISECONDS.toMicros(decryptionTimeMs) * 1024 / unwrapResult.bytesProduced());
@@ -482,11 +470,9 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
         // handle ssl renegotiation.
         if (unwrapResult.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING
             && unwrapResult.getStatus() == Status.OK) {
-          if (logger.isTraceEnabled()) {
-            logger.trace(
-                "SSLChannel Read begin renegotiation getConnectionId() {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
-                getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
-          }
+          logger.trace(
+              "SSLChannel Read begin renegotiation getConnectionId() {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
+              getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
           handshake();
           metrics.sslRenegotiationCount.inc();
           break;
@@ -584,9 +570,7 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
       long startTimeNs = SystemTime.getInstance().nanoseconds();
       SSLEngineResult wrapResult = sslEngine.wrap(src, netWriteBuffer);
       long encryptionTimeNs = SystemTime.getInstance().nanoseconds() - startTimeNs;
-      if (logger.isTraceEnabled()) {
-        logger.trace("SSL encryption time: {} ns for {} bytes", encryptionTimeNs, wrapResult.bytesConsumed());
-      }
+      logger.trace("SSL encryption time: {} ns for {} bytes", encryptionTimeNs, wrapResult.bytesConsumed());
       if (wrapResult.bytesConsumed() > 0) {
         metrics.sslEncryptionTimeInUsPerKB.mark(encryptionTimeNs / wrapResult.bytesConsumed());
       }
